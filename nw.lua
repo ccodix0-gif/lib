@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.29"
+Interface.version = "2026.06.29.2"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2076,6 +2076,33 @@ function Window:deleteConfig(name)
     return ok
 end
 
+-- Auto load pointer: stored in its own file (not inside a config) so it can be
+-- read at startup before any config is loaded. setAutoLoad(nil) clears it.
+local function autoLoadPath()
+    return placeFolder() .. "/_autoload.txt"
+end
+function Window:setAutoLoad(name)
+    local ok = pcall(function()
+        ensureConfigDir()
+        if type(name) == "string" and name ~= "" then
+            if type(writefile) == "function" then writefile(autoLoadPath(), name) end
+        elseif type(delfile) == "function" and type(isfile) == "function" and isfile(autoLoadPath()) then
+            delfile(autoLoadPath())
+        end
+    end)
+    return ok
+end
+function Window:getAutoLoad()
+    local out = nil
+    pcall(function()
+        if type(isfile) == "function" and type(readfile) == "function" and isfile(autoLoadPath()) then
+            local s = readfile(autoLoadPath())
+            if type(s) == "string" and s ~= "" then out = s end
+        end
+    end)
+    return out
+end
+
 -- Toast notification, slides in at the bottom right and auto dismisses.
 -- Usage: window:notify({ title = "Aimbot", text = "Enabled", duration = 3, icon = "bolt" })
 function Window:notify(opts)
@@ -2683,3 +2710,4 @@ if _G.NewRealityShowcase ~= false then
 end
 
 return Interface
+
