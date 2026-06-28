@@ -1982,6 +1982,8 @@ end
 function Window:deleteConfig(name)
     pcall(function() if delfile and name then delfile(CONFIG_DIR .. name .. ".json") end end)
 end
+
+function Interface.new(opts)
     opts = opts or {}
     local self = setmetatable({ tabs = {}, groups = {}, _refresh = {}, flags = {} }, Window)
 
