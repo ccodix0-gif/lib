@@ -1957,19 +1957,21 @@ function Window:flag(key, default)
     return function() return self.flags[key] end, function(v) self.flags[key] = v end
 end
 
-local CONFIG_ROOT = "NewReality/configs/"
+local CONFIG_ROOT = "NewReality/configs"
 -- Configs are stored per game so one game's configs never appear in another.
-local function configDir()
-    return CONFIG_ROOT .. tostring(game.PlaceId) .. "/"
+local function placeFolder()
+    return CONFIG_ROOT .. "/" .. tostring(game.PlaceId)
+end
+local function configPath(name)
+    return placeFolder() .. "/" .. name .. ".json"
 end
 local function ensureConfigDir()
     pcall(function()
-        if makefolder and isfolder then
-            if not isfolder("NewReality") then makefolder("NewReality") end
-            if not isfolder(CONFIG_ROOT) then makefolder(CONFIG_ROOT) end
-            local d = configDir()
-            if not isfolder(d) then makefolder(d) end
-        end
+        if not (makefolder and isfolder) then return end
+        if not isfolder("NewReality") then makefolder("NewReality") end
+        if not isfolder(CONFIG_ROOT) then makefolder(CONFIG_ROOT) end
+        local d = placeFolder()
+        if not isfolder(d) then makefolder(d) end
     end)
 end
 
@@ -1978,9 +1980,13 @@ function Window:saveConfig(name)
     if type(writefile) ~= "function" then warn("[NewReality] executor has no writefile") return false end
     local ok, err = pcall(function()
         ensureConfigDir()
-        writefile(configDir() .. name .. ".json", HttpService:JSONEncode(self.flags))
+        writefile(configPath(name), HttpService:JSONEncode(self.flags))
     end)
-    if not ok then warn("[NewReality] saveConfig failed: " .. tostring(err)) end
+    if ok then
+        print("[NewReality] saved config: " .. configPath(name))
+    else
+        warn("[NewReality] saveConfig failed: " .. tostring(err))
+    end
     return ok
 end
 
@@ -1990,9 +1996,9 @@ function Window:loadConfig(name)
         warn("[NewReality] executor has no readfile/isfile")
         return false
     end
-    local path = configDir() .. name .. ".json"
+    local path = configPath(name)
     if not isfile(path) then
-        warn("[NewReality] config '" .. name .. "' does not exist")
+        warn("[NewReality] config '" .. name .. "' does not exist (" .. path .. ")")
         return false
     end
     local ok, data = pcall(function()
@@ -2005,6 +2011,7 @@ function Window:loadConfig(name)
     if type(data) == "table" then
         for k, v in pairs(data) do self.flags[k] = v end
         self:refreshAll()
+        print("[NewReality] loaded config: " .. path)
         return true
     end
     return false
@@ -2013,9 +2020,15 @@ end
 function Window:listConfigs()
     local out = {}
     pcall(function()
-        local dir = configDir()
-        if listfiles and isfolder and isfolder(dir) then
-            for _, f in ipairs(listfiles(dir)) do
+        local dir = placeFolder()
+        if type(listfiles) ~= "function" then return end
+        local files = nil
+        -- Some executors return isfolder == false even when the folder exists,
+        -- so try listfiles directly and fall back to the isfolder guard.
+        local ok, res = pcall(listfiles, dir)
+        if ok and type(res) == "table" then files = res end
+        if files then
+            for _, f in ipairs(files) do
                 local nm = string.match(f, "([^/\\]+)%.json$")
                 if nm then table.insert(out, nm) end
             end
@@ -2027,7 +2040,7 @@ end
 function Window:deleteConfig(name)
     if type(name) ~= "string" or name == "" then return false end
     if type(delfile) ~= "function" then warn("[NewReality] executor has no delfile") return false end
-    local ok, err = pcall(function() delfile(configDir() .. name .. ".json") end)
+    local ok, err = pcall(function() delfile(configPath(name)) end)
     if not ok then warn("[NewReality] deleteConfig failed: " .. tostring(err)) end
     return ok
 end
@@ -2179,7 +2192,8 @@ function Window:watermark(opts)
     if show.brand ~= false then
         local brand = textSeg("NewReality")
         brand.TextSize = 15
-        animateBrand(brand)
+        local rb = animateBrand(brand)
+        table.insert(self._refresh, rb)
     end
 
     local fpsLabel, timeLabel
@@ -2602,15 +2616,33 @@ function Interface.showcase()
         theme:button("Reset Theme", function() win:resetTheme() end)
 
         local cfg = s:card({ title = "Save Manager", icon = "device-floppy", subtitle = "Configurations", column = "right" })
-        local cfgName = "default"
-        cfg:dropdown("Config", { "default", "rage", "legit" }, function() return cfgName end, function(v) cfgName = v end, { search = true })
+        local cfgSel = "default"
+        local function cfgList()
+            local list = { "default" }
+            for _, n in ipairs(win:listConfigs()) do
+                if n ~= "default" then table.insert(list, n) end
+            end
+            return list
+        end
+        cfg:dropdown("Config", cfgList, function() return cfgSel end, function(v) cfgSel = v end, { search = true })
         local newName = ""
-        cfg:input("Name", "config name", function() return newName end, function(v) newName = v end)
-        cfg:button("Save", function() win:saveConfig(newName ~= "" and newName or cfgName) end)
-        cfg:button("Load", function() win:loadConfig(newName ~= "" and newName or cfgName) end)
-        cfg:button("Delete", function() win:deleteConfig(newName ~= "" and newName or cfgName) end)
+        cfg:input("Name", "new config name", function() return newName end, function(v) newName = v end)
+        cfg:button("Create", function()
+            if newName ~= "" and win:saveConfig(newName) then
+                cfgSel = newName
+                newName = ""
+                win:refreshAll()
+            end
+        end)
+        cfg:button("Save", function() win:saveConfig(cfgSel) end)
+        cfg:button("Load", function() win:loadConfig(cfgSel) end)
+        cfg:button("Delete", function()
+            if cfgSel ~= "default" and win:deleteConfig(cfgSel) then
+                cfgSel = "default"
+                win:refreshAll()
+            end
+        end)
         cfg:toggle("Auto Load Config", function() return false end, function() end)
-        cfg:button("Refresh List", function() end)
     end
     return win
 end
@@ -2620,3 +2652,4 @@ if _G.NewRealityShowcase ~= false then
 end
 
 return Interface
+
