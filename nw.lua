@@ -26,6 +26,9 @@ local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 local Interface = {}
+-- Bump this whenever interface.luau changes so the host build can be verified
+-- from the console (helps catch a stale nw.lua served from the GitHub CDN).
+Interface.version = "2026.06.29"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -1978,10 +1981,23 @@ end
 function Window:saveConfig(name)
     if type(name) ~= "string" or name == "" then return false end
     if type(writefile) ~= "function" then warn("[NewReality] executor has no writefile") return false end
+    -- Snapshot the current theme so colours are restored on load too.
+    local theme = {}
+    for key in pairs(DEFAULTS) do
+        local c = PALETTE[key]
+        theme[key] = { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) }
+    end
+    local payload = { flags = self.flags, theme = theme }
     local ok, err = pcall(function()
         ensureConfigDir()
-        writefile(configPath(name), HttpService:JSONEncode(self.flags))
+        writefile(configPath(name), HttpService:JSONEncode(payload))
     end)
+    -- Some executors sandbox writefile and silently drop the file without
+    -- raising an error, so verify the file is actually present afterwards.
+    if ok and type(isfile) == "function" and not isfile(configPath(name)) then
+        ok = false
+        err = "file missing after write (executor blocked writefile?)"
+    end
     if ok then
         print("[NewReality] saved config: " .. configPath(name))
     else
@@ -2008,13 +2024,28 @@ function Window:loadConfig(name)
         warn("[NewReality] loadConfig failed: " .. tostring(data))
         return false
     end
-    if type(data) == "table" then
-        for k, v in pairs(data) do self.flags[k] = v end
-        self:refreshAll()
-        print("[NewReality] loaded config: " .. path)
-        return true
+    if type(data) ~= "table" then return false end
+    -- New format is { flags = , theme = }; old format was just the flags table.
+    local flags = (type(data.flags) == "table") and data.flags or data
+    for k, v in pairs(flags) do self.flags[k] = v end
+    -- Restore the saved theme colours by re-tagging every themed element.
+    if type(data.theme) == "table" then
+        for key, rgb in pairs(data.theme) do
+            if DEFAULTS[key] and type(rgb) == "table" then
+                PALETTE[key] = colorOf(rgb)
+            end
+        end
+        for _, d in ipairs(self.screen:GetDescendants()) do
+            local k = d:GetAttribute("nrK")
+            if k and PALETTE[k] then
+                local prop = d:GetAttribute("nrP")
+                pcall(function() d[prop] = PALETTE[k] end)
+            end
+        end
     end
-    return false
+    self:refreshAll()
+    print("[NewReality] loaded config: " .. path)
+    return true
 end
 
 function Window:listConfigs()
