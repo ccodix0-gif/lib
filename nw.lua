@@ -1942,23 +1942,35 @@ local function ensureConfigDir()
 end
 
 function Window:saveConfig(name)
-    if not (writefile and name and name ~= "") then return false end
-    local ok = pcall(function()
+    if type(name) ~= "string" or name == "" then return false end
+    if type(writefile) ~= "function" then warn("[NewReality] executor has no writefile") return false end
+    local ok, err = pcall(function()
         ensureConfigDir()
         writefile(CONFIG_DIR .. name .. ".json", HttpService:JSONEncode(self.flags))
     end)
+    if not ok then warn("[NewReality] saveConfig failed: " .. tostring(err)) end
     return ok
 end
 
 function Window:loadConfig(name)
-    if not (readfile and isfile and name) then return false end
+    if type(name) ~= "string" or name == "" then return false end
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then
+        warn("[NewReality] executor has no readfile/isfile")
+        return false
+    end
+    local path = CONFIG_DIR .. name .. ".json"
+    if not isfile(path) then
+        warn("[NewReality] config '" .. name .. "' does not exist")
+        return false
+    end
     local ok, data = pcall(function()
-        local path = CONFIG_DIR .. name .. ".json"
-        if isfile(path) then
-            return HttpService:JSONDecode(readfile(path))
-        end
+        return HttpService:JSONDecode(readfile(path))
     end)
-    if ok and type(data) == "table" then
+    if not ok then
+        warn("[NewReality] loadConfig failed: " .. tostring(data))
+        return false
+    end
+    if type(data) == "table" then
         for k, v in pairs(data) do self.flags[k] = v end
         self:refreshAll()
         return true
@@ -1980,7 +1992,11 @@ function Window:listConfigs()
 end
 
 function Window:deleteConfig(name)
-    pcall(function() if delfile and name then delfile(CONFIG_DIR .. name .. ".json") end end)
+    if type(name) ~= "string" or name == "" then return false end
+    if type(delfile) ~= "function" then warn("[NewReality] executor has no delfile") return false end
+    local ok, err = pcall(function() delfile(CONFIG_DIR .. name .. ".json") end)
+    if not ok then warn("[NewReality] deleteConfig failed: " .. tostring(err)) end
+    return ok
 end
 
 -- Toast notification, slides in at the bottom right and auto dismisses.
