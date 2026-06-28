@@ -1983,6 +1983,92 @@ function Window:deleteConfig(name)
     pcall(function() if delfile and name then delfile(CONFIG_DIR .. name .. ".json") end end)
 end
 
+-- Toast notification, slides in at the bottom right and auto dismisses.
+-- Usage: window:notify({ title = "Aimbot", text = "Enabled", duration = 3, icon = "bolt" })
+function Window:notify(opts)
+    if type(opts) == "string" then opts = { title = opts } end
+    opts = opts or {}
+    if not self._toasts then
+        local holder = Instance.new("Frame")
+        holder.Name = "Toasts"
+        holder.AnchorPoint = Vector2.new(1, 1)
+        holder.Position = UDim2.new(1, -16, 1, -16)
+        holder.Size = UDim2.new(0, 290, 1, -32)
+        holder.BackgroundTransparency = 1
+        holder.ZIndex = 200
+        holder.Parent = self.screen
+        local l = Instance.new("UIListLayout")
+        l.VerticalAlignment = Enum.VerticalAlignment.Bottom
+        l.HorizontalAlignment = Enum.HorizontalAlignment.Right
+        l.Padding = UDim.new(0, 8)
+        l.SortOrder = Enum.SortOrder.LayoutOrder
+        l.Parent = holder
+        self._toasts = holder
+    end
+
+    local toast = Instance.new("CanvasGroup")
+    toast.Size = UDim2.new(0, 270, 0, opts.text and 56 or 40)
+    toast.BackgroundColor3 = PALETTE.card
+    toast.BorderSizePixel = 0
+    toast.GroupTransparency = 1
+    toast.ZIndex = 200
+    toast.Parent = self._toasts
+    corner(toast, 10)
+    stroke(toast, PALETTE.stroke, 1, 0.3)
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0, 4, 1, -16)
+    bar.Position = UDim2.new(0, 8, 0, 8)
+    bar.BackgroundColor3 = PALETTE.accent
+    bar.BorderSizePixel = 0
+    bar.Parent = toast
+    corner(bar, 2)
+
+    local textX = 22
+    if opts.icon then
+        local ic = makeIcon(toast, opts.icon, UDim2.new(0, 20, 0, 20), PALETTE.text)
+        ic.AnchorPoint = Vector2.new(0, 0.5)
+        ic.Position = UDim2.new(0, 22, 0.5, 0)
+        textX = 50
+    end
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, textX, 0, opts.text and 8 or 0)
+    title.Size = UDim2.new(1, -textX - 12, 0, opts.text and 18 or 40)
+    title.FontFace = FONT
+    title.TextSize = 15
+    title.TextColor3 = PALETTE.text
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextYAlignment = opts.text and Enum.TextYAlignment.Center or Enum.TextYAlignment.Center
+    title.Text = opts.title or "Notification"
+    title.Parent = toast
+
+    if opts.text then
+        local msg = Instance.new("TextLabel")
+        msg.BackgroundTransparency = 1
+        msg.Position = UDim2.new(0, textX, 0, 28)
+        msg.Size = UDim2.new(1, -textX - 12, 0, 18)
+        msg.FontFace = FONT
+        msg.TextSize = 13
+        msg.TextColor3 = PALETTE.subtext
+        msg.TextXAlignment = Enum.TextXAlignment.Left
+        msg.TextTruncate = Enum.TextTruncate.AtEnd
+        msg.Text = opts.text
+        msg.Parent = toast
+    end
+
+    tween(toast, 0.2, { GroupTransparency = 0 })
+    task.delay(opts.duration or 3, function()
+        if toast and toast.Parent then
+            tween(toast, 0.25, { GroupTransparency = 1 }).Completed:Once(function()
+                toast:Destroy()
+            end)
+        end
+    end)
+    return toast
+end
+
 function Interface.new(opts)
     opts = opts or {}
     local self = setmetatable({ tabs = {}, groups = {}, _refresh = {}, flags = {} }, Window)
