@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.2"
+Interface.version = "2026.06.30.3"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -1156,9 +1156,9 @@ end
 function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     local row = controlRow(parent, 30)
     rowLabel(row, text, 120)
-    -- Optional alpha: when opts.alpha is set, the value is { r, g, b, a } with a in 0..1
-    -- and an opacity slider is shown in the picker. Without it the value stays { r, g, b }.
-    local useAlpha = opts and opts.alpha == true
+    -- Alpha (opacity) is shown by default; pass opts.alpha = false to hide it. When
+    -- shown, the value is { r, g, b, a } with a in 0..1 (scripts reading r,g,b still work).
+    local useAlpha = not (opts and opts.alpha == false)
     local alpha = useAlpha and ((getRgb() or {})[4] or 1) or 1
 
     local function hexOf(rgb)
