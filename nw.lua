@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.13"
+Interface.version = "2026.06.30.14"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -1976,6 +1976,26 @@ function Window:tab(opts)
     label.Text = opts.name
     label.Parent = btn
 
+    -- Flowing brand gradient on the tab label. It runs constantly and is only shown
+    -- (Enabled) on the active tab, so the selected section keeps the moving gradient.
+    local labelGrad = Instance.new("UIGradient")
+    labelGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, PALETTE.accent),
+        ColorSequenceKeypoint.new(0.5, PALETTE.text),
+        ColorSequenceKeypoint.new(1, PALETTE.accent),
+    })
+    labelGrad.Enabled = false
+    labelGrad.Parent = label
+    task.spawn(function()
+        while label.Parent do
+            local e = 0
+            while e < 1 and label.Parent do
+                e += RunService.RenderStepped:Wait()
+                labelGrad.Offset = Vector2.new(-1 + e * 2, 0)
+            end
+        end
+    end)
+
     local tabPage = Instance.new("CanvasGroup")
     tabPage.Size = UDim2.new(1, 0, 1, 0)
     tabPage.BackgroundTransparency = 1
@@ -2005,7 +2025,7 @@ function Window:tab(opts)
     local tabObj = setmetatable({
         _ctx = self, _subBar = subBar, _subPages = subPages, _subs = {},
         name = opts.name, btn = btn, icon = icon, label = label, page = tabPage,
-        indicator = indicator,
+        indicator = indicator, labelGrad = labelGrad,
     }, Tab)
     table.insert(self.tabs, tabObj)
 
@@ -2014,6 +2034,7 @@ function Window:tab(opts)
             other.page.Visible = false
             tween(other.btn, 0.15, { BackgroundTransparency = 1 })
             tween(other.label, 0.15, { TextColor3 = PALETTE.subtext })
+            if other.labelGrad then other.labelGrad.Enabled = false end
             if other.indicator then
                 tween(other.indicator, 0.15, { Size = UDim2.new(0, 3, 0, 0) })
             end
@@ -2023,25 +2044,9 @@ function Window:tab(opts)
         tabPage.GroupTransparency = 1
         tabPage.Position = UDim2.new(0, 0, 0, 12)
         tween(tabPage, 0.22, { GroupTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
-        -- Brand gradient sweep across the page so switching sections has a transition.
-        local sweep = Instance.new("Frame")
-        sweep.Size = UDim2.new(1, 0, 1, 0)
-        sweep.BackgroundColor3 = PALETTE.accent
-        sweep.BorderSizePixel = 0
-        sweep.ZIndex = 50
-        sweep.Parent = tabPage
-        local sg = Instance.new("UIGradient")
-        sg.Color = ColorSequence.new(PALETTE.accent)
-        sg.Transparency = NumberSequence.new({
-            NumberSequenceKeypoint.new(0, 1),
-            NumberSequenceKeypoint.new(0.46, 0.72),
-            NumberSequenceKeypoint.new(0.54, 0.72),
-            NumberSequenceKeypoint.new(1, 1),
-        })
-        sg.Offset = Vector2.new(-1.2, 0)
-        sg.Parent = sweep
-        tween(sg, 0.45, { Offset = Vector2.new(1.2, 0) })
-        game:GetService("Debris"):AddItem(sweep, 0.5)
+        -- Show the flowing gradient on the now active tab label.
+        label.TextColor3 = PALETTE.text
+        labelGrad.Enabled = true
         tween(btn, 0.15, { BackgroundTransparency = 0 })
         tween(label, 0.15, { TextColor3 = PALETTE.text })
         tween(indicator, 0.2, { Size = UDim2.new(0, 3, 0, 20) }, Enum.EasingStyle.Back)
@@ -2811,16 +2816,21 @@ function Interface.new(opts)
 
     -- Keep a floating panel inside the window bounds given its offset and size.
     self.fitPanel = function(xOff, yBelow, w, h, yAbove)
-        local size = self.window.AbsoluteSize
-        local x = math.clamp(xOff, 8, math.max(8, size.X - w - 8))
-        local y = yBelow
-        -- Prefer opening below the control. If it would overflow the window bottom,
-        -- flip and open above the control instead so the panel never covers it.
-        if yBelow + h > size.Y - 8 then
-            local up = (yAbove or yBelow) - h - 6
-            y = (up >= 8) and up or math.clamp(yBelow, 8, math.max(8, size.Y - h - 8))
+        local winPos = self.window.AbsolutePosition
+        local cam = workspace.CurrentCamera
+        local vp = (cam and cam.ViewportSize) or self.window.AbsoluteSize
+        -- Work in screen space and clamp to the viewport, so a panel can sit outside
+        -- the window (e.g. above it when the window is low) but never off the screen.
+        local sx = winPos.X + xOff
+        local syBelow = winPos.Y + yBelow
+        local syAbove = winPos.Y + (yAbove or yBelow)
+        sx = math.clamp(sx, 8, math.max(8, vp.X - w - 8))
+        local sy = syBelow
+        if syBelow + h > vp.Y - 8 then
+            local up = syAbove - h - 6
+            sy = (up >= 8) and up or math.clamp(syBelow, 8, math.max(8, vp.Y - h - 8))
         end
-        return UDim2.new(0, x, 0, y)
+        return UDim2.new(0, sx - winPos.X, 0, sy - winPos.Y)
     end
 
     makeDraggable(window, topDrag)
