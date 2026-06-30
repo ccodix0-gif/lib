@@ -4,18 +4,50 @@
 -- dropdowns, multi keybinds, colour pickers, live theming and saved configs.
 -- The icon pack is embedded as base64, so the library is self contained.
 --
--- Usage (loadstring):
+-- LOADING
 --   local UI = loadstring(game:HttpGet("<url>/interface.luau"))()
 --   local win = UI.new({ icon = "logo", toggleKey = Enum.KeyCode.RightShift })
---   local tab = win:tab({ name = "Main", icon = "layout-dashboard", group = "Common" })
---   local card = tab:sub("Features"):card({ title = "Combat", icon = "bolt", column = "left" })
---   local get, set = win:flag("aimbot", false)        -- persisted value
+--   -- Set _G.NewRealityShowcase = false before loading to skip the demo window.
+--
+-- LAYOUT: window -> tab -> sub -> card -> controls
+--   local tab  = win:tab({ name = "Main", icon = "eye", group = "Visuals", subtitle = "Players" })
+--   local sub  = tab:sub("Features")                         -- top sub-tab (call once per name)
+--   local card = sub:card({ title = "Combat", icon = "bolt", column = "left" })  -- column "left"/"right"
+--
+-- FLAGS (persisted values). win:flag(key, default) returns get, set:
+--   local get, set = win:flag("aimbot", false)
 --   card:toggle("Aimbot", get, set)
---   card:slider("FOV", 0, 500, win:flag("fov", 100))   -- get,set unpacked
---   local bg, bs = win:flag("bind", { "E" })
---   card:keybind("Bind", bg, bs, { multi = true })      -- right click clears it
---   win:saveConfig("default"); win:loadConfig("default")
--- Set _G.NewRealityShowcase = false before loading to skip the demo window.
+--   -- get/set is two values; when passed as the LAST args it unpacks directly:
+--   card:slider("FOV", 0, 500, win:flag("fov", 100))
+--   -- After changing a flag yourself, call win:markDirty() so auto save persists it.
+--
+-- CONTROLS (all are methods on a card):
+--   card:toggle(text, get, set [, buildSettings])  -- buildSettings(sc) adds a gear popover; fill sc like a card
+--   card:slider(text, min, max, get, set [, decimals])
+--   card:dropdown(text, options, get, set [, { search = true, multi = true }])  -- options: table or function
+--   card:keybind(text, get, set [, { multi = true, list = false }])  -- right click / x icon clears it
+--   card:colorpicker(text, getRgb, setRgb [, { alpha = false }])     -- value is { r, g, b, a }, a in 0..1
+--   card:button(text, onClick)
+--   card:input(text, placeholder, get, set)
+--   card:segmented(text, options, get, set)         -- inline pills, no popover
+--   card:label(text)                                -- wraps to multiple lines
+--   card:divider()
+--
+-- GEAR POPOVERS: put long option lists behind a control's gear instead of the card:
+--   card:toggle("Chams", g, s, function(sc)
+--       sc:dropdown("Type", { "Fill", "Outline" }, win:flag("chamsType", "Fill"))
+--       sc:colorpicker("Colour", getRgb, setRgb)
+--   end)
+--
+-- THEME: win:getColor(key) -> { r, g, b, a }; win:setColor(key, { r, g, b, a }); win:resetTheme()
+--   keys: accent, background, sidebar, card, control, track, text, subtext, stroke
+--
+-- CONFIGS: win:saveConfig(name) / loadConfig(name) / listConfigs() / deleteConfig(name)
+--   win:setAutoLoad(name|nil) / getAutoLoad()       -- which config loads on launch
+--   win:setAutoSave(name|nil)                        -- auto persists that config a moment after any change
+--
+-- EXTRAS: win:notify({ title, text, icon, duration }), win:watermark{...}, win:keybindList{...},
+--   win:refreshAll() (re-sync every control from its flag), win:toggle() (show/hide the window).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -28,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.12"
+Interface.version = "2026.06.30.13"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
