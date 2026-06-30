@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.7"
+Interface.version = "2026.06.30.8"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -891,6 +891,22 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     button.Parent = row
     corner(button, 6)
 
+    -- A visible clear button (tap to remove the bind) for users who do not know
+    -- the right click shortcut and players on mobile / console.
+    local clearBtn = Instance.new("TextButton")
+    clearBtn.Name = "Clear"
+    clearBtn.AnchorPoint = Vector2.new(1, 0.5)
+    clearBtn.Position = UDim2.new(1, -5, 0.5, 0)
+    clearBtn.Size = UDim2.new(0, 16, 0, 16)
+    clearBtn.BackgroundTransparency = 1
+    clearBtn.Text = "x"
+    clearBtn.FontFace = FONT
+    clearBtn.TextSize = 15
+    clearBtn.TextColor3 = PALETTE.subtext
+    clearBtn.ZIndex = 4
+    clearBtn.Visible = false
+    clearBtn.Parent = button
+
     -- Normalise the stored value into a list of key names.
     local function keyList()
         local v = getKey()
@@ -914,8 +930,17 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
             setKey(list[1])
         end
         button.Text = display()
+        clearBtn.Visible = #list > 0
     end
     button.Text = display()
+    clearBtn.Visible = #keyList() > 0
+    clearBtn.MouseButton1Click:Connect(function()
+        commit({})
+        button.TextColor3 = PALETTE.text
+        tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
+    end)
+    clearBtn.MouseEnter:Connect(function() clearBtn.TextColor3 = PALETTE.accent end)
+    clearBtn.MouseLeave:Connect(function() clearBtn.TextColor3 = PALETTE.subtext end)
 
     local capturing = false
     button.MouseEnter:Connect(function()
@@ -930,9 +955,13 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
         button.Text = "..."
         button.TextColor3 = PALETTE.accent
     end)
+    -- Left click: capture a key. Right click: clear the bind (works for any bind,
+    -- and also cancels an in progress capture).
     button.MouseButton2Click:Connect(function()
+        capturing = false
         commit({})
         button.TextColor3 = PALETTE.text
+        tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
     end)
     UserInputService.InputBegan:Connect(function(input, gpe)
         if capturing and input.UserInputType == Enum.UserInputType.Keyboard then
@@ -964,7 +993,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
             end
         end
     end)
-    if ctx and ctx._refresh then table.insert(ctx._refresh, function() button.Text = display() end) end
+    if ctx and ctx._refresh then table.insert(ctx._refresh, function() button.Text = display(); clearBtn.Visible = #keyList() > 0 end) end
     -- Register the bind so the keybind panel can list it.
     if ctx and ctx._binds and opts.list ~= false then
         table.insert(ctx._binds, {
@@ -1176,11 +1205,10 @@ end
 function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     local row = controlRow(parent, 30)
     rowLabel(row, text, 120)
-    -- Alpha (opacity) is opt in: pass opts.alpha = true to show the bar. When
-    -- shown, the value is { r, g, b, a } with a in 0..1 (scripts reading r,g,b
-    -- still work). It is off by default so pickers whose consumer ignores alpha
-    -- do not show a bar that appears to do nothing.
-    local useAlpha = opts and opts.alpha == true
+    -- Alpha (opacity) is shown by default; pass opts.alpha = false to hide it on a
+    -- picker whose consumer ignores the 4th value. When shown, the value is
+    -- { r, g, b, a } with a in 0..1 (scripts reading r, g, b still work).
+    local useAlpha = not (opts and opts.alpha == false)
     local alpha = useAlpha and ((getRgb() or {})[4] or 1) or 1
 
     local function hexOf(rgb)
@@ -2085,6 +2113,16 @@ function Window:saveConfig(name)
         theme[key] = { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) }
     end
     local payload = { flags = self.flags, theme = theme }
+    -- Persist the dragged positions of detached parts (watermark, keybind list).
+    -- The main window is intentionally excluded so it always opens centred.
+    local function serPos(frame)
+        if frame and frame.Parent then
+            local p = frame.Position
+            return { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset }
+        end
+        return nil
+    end
+    payload.overlays = { watermark = serPos(self._watermark), keybind = serPos(self._keybindPanel) }
     local ok, err = pcall(function()
         ensureConfigDir()
         writefile(configPath(name), HttpService:JSONEncode(payload))
@@ -2140,8 +2178,19 @@ function Window:loadConfig(name)
             end
         end
     end
+    -- Restore the saved positions of detached parts. Stored for later too, so a
+    -- watermark / keybind list created after this load still picks them up.
+    if type(data.overlays) == "table" then
+        self._overlayPos = data.overlays
+        local function dePos(frame, t)
+            if frame and frame.Parent and type(t) == "table" and #t == 4 then
+                pcall(function() frame.Position = UDim2.new(t[1], t[2], t[3], t[4]) end)
+            end
+        end
+        dePos(self._watermark, data.overlays.watermark)
+        dePos(self._keybindPanel, data.overlays.keybind)
+    end
     self:refreshAll()
-    print("[NewReality] loaded config: " .. path)
     return true
 end
 
@@ -2311,6 +2360,10 @@ function Window:watermark(opts)
     local lay = listLayout(wm, 9, Enum.FillDirection.Horizontal)
     lay.VerticalAlignment = Enum.VerticalAlignment.Center
     self._watermark = wm
+    if self._overlayPos and type(self._overlayPos.watermark) == "table" and #self._overlayPos.watermark == 4 then
+        local t = self._overlayPos.watermark
+        wm.Position = UDim2.new(t[1], t[2], t[3], t[4])
+    end
 
     local order = 0
     local function nextO() order = order + 1 return order end
@@ -2401,6 +2454,10 @@ function Window:keybindList(opts)
     corner(panel, 8)
     stroke(panel, PALETTE.stroke, 1, 0.3)
     self._keybindPanel = panel
+    if self._overlayPos and type(self._overlayPos.keybind) == "table" and #self._overlayPos.keybind == 4 then
+        local t = self._overlayPos.keybind
+        panel.Position = UDim2.new(t[1], t[2], t[3], t[4])
+    end
 
     local body = Instance.new("Frame")
     body.BackgroundTransparency = 1
@@ -2514,6 +2571,9 @@ function Interface.new(opts)
     screen.ResetOnSpawn = false
     screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screen.IgnoreGuiInset = true
+    -- High DisplayOrder so the window, watermark and keybind list sit above any
+    -- other GUI a script creates (ESP text billboards should use a lower order).
+    pcall(function() screen.DisplayOrder = 100000 end)
     screen.Parent = guiParent()
     self.screen = screen
 
