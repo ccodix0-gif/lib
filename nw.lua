@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.9"
+Interface.version = "2026.06.30.12"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -638,13 +638,17 @@ local Card
 
 function Controls.label(parent, text)
     local row = controlRow(parent, 18)
+    row.AutomaticSize = Enum.AutomaticSize.Y
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
-    label.Size = UDim2.new(1, 0, 1, 0)
+    label.Size = UDim2.new(1, 0, 0, 0)
+    label.AutomaticSize = Enum.AutomaticSize.Y
+    label.TextWrapped = true
     label.FontFace = FONT
     label.TextSize = 13
     label.TextColor3 = PALETTE.subtext
     label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
     label.Text = text
     label.Parent = row
     return row
@@ -697,7 +701,8 @@ function Controls.toggle(parent, ctx, text, get, set, buildSettings)
             buildSettings(Card.new(body, ctx))
             local px = gear.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 230
             local py = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
-            popover.Position = ctx.fitPanel and ctx.fitPanel(px, py, 270, 220) or UDim2.new(0, px, 0, py)
+            local pAbove = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
+            popover.Position = ctx.fitPanel and ctx.fitPanel(px, py, 270, 220, pAbove) or UDim2.new(0, px, 0, py)
             popover.GroupTransparency = 1
             tween(popover, 0.18, { GroupTransparency = 0 })
         end)
@@ -892,20 +897,20 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     corner(button, 6)
 
     -- A visible clear button (tap to remove the bind) for users who do not know
-    -- the right click shortcut and players on mobile / console.
+    -- the right click shortcut and players on mobile / console. Uses the x icon.
     local clearBtn = Instance.new("TextButton")
     clearBtn.Name = "Clear"
     clearBtn.AnchorPoint = Vector2.new(1, 0.5)
     clearBtn.Position = UDim2.new(1, -5, 0.5, 0)
     clearBtn.Size = UDim2.new(0, 16, 0, 16)
     clearBtn.BackgroundTransparency = 1
-    clearBtn.Text = "x"
-    clearBtn.FontFace = FONT
-    clearBtn.TextSize = 15
-    clearBtn.TextColor3 = PALETTE.subtext
+    clearBtn.Text = ""
+    clearBtn.AutoButtonColor = false
     clearBtn.ZIndex = 4
     clearBtn.Visible = false
     clearBtn.Parent = button
+    local clearImg = makeIcon(clearBtn, "x", UDim2.new(1, 0, 1, 0), PALETTE.subtext)
+    clearImg.Active = false
 
     -- Normalise the stored value into a list of key names.
     local function keyList()
@@ -939,8 +944,8 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
         button.TextColor3 = PALETTE.text
         tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
     end)
-    clearBtn.MouseEnter:Connect(function() clearBtn.TextColor3 = PALETTE.accent end)
-    clearBtn.MouseLeave:Connect(function() clearBtn.TextColor3 = PALETTE.subtext end)
+    clearBtn.MouseEnter:Connect(function() tintIcon(clearImg, PALETTE.accent) end)
+    clearBtn.MouseLeave:Connect(function() tintIcon(clearImg, PALETTE.subtext) end)
 
     local capturing = false
     button.MouseEnter:Connect(function()
@@ -1074,7 +1079,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             panel = nil
             return
         end
-        if ctx.closeOverlays then ctx.closeOverlays() end
+        if ctx.closeOverlays then ctx.closeOverlays(true) end
         if ctx.showBackdrop then ctx.showBackdrop() end
         panel = Instance.new("CanvasGroup")
         panel.BackgroundColor3 = PALETTE.card
@@ -1084,7 +1089,8 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         panel.AutomaticSize = Enum.AutomaticSize.Y
         local dx = button.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 70
         local dy = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 32
-        panel.Position = ctx.fitPanel and ctx.fitPanel(dx, dy, 210, 240) or UDim2.new(0, dx, 0, dy)
+        local dAbove = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
+        panel.Position = ctx.fitPanel and ctx.fitPanel(dx, dy, 210, 240, dAbove) or UDim2.new(0, dx, 0, dy)
         panel.Parent = ctx.overlay
         corner(panel, 10)
         stroke(panel, PALETTE.stroke, 1, 0.2)
@@ -1258,7 +1264,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     local h, s, v = colorOf(getRgb()):ToHSV()
     local function openPicker()
         if panel and panel.Parent then panel:Destroy() panel = nil return end
-        if ctx.closeOverlays then ctx.closeOverlays() end
+        if ctx.closeOverlays then ctx.closeOverlays(true) end
         if ctx.showBackdrop then ctx.showBackdrop() end
         panel = Instance.new("Frame")
         panel.BackgroundColor3 = PALETTE.card
@@ -1268,7 +1274,8 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         panel.Size = UDim2.new(0, 232, 0, panelH)
         local cx = swatch.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 190
         local cy = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
-        panel.Position = ctx.fitPanel and ctx.fitPanel(cx, cy, 232, panelH) or UDim2.new(0, cx, 0, cy)
+        local cAbove = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
+        panel.Position = ctx.fitPanel and ctx.fitPanel(cx, cy, 232, panelH, cAbove) or UDim2.new(0, cx, 0, cy)
         panel.Parent = ctx.overlay
         corner(panel, 10)
         stroke(panel, PALETTE.stroke, 1, 0.2)
@@ -1984,6 +1991,25 @@ function Window:tab(opts)
         tabPage.GroupTransparency = 1
         tabPage.Position = UDim2.new(0, 0, 0, 12)
         tween(tabPage, 0.22, { GroupTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
+        -- Brand gradient sweep across the page so switching sections has a transition.
+        local sweep = Instance.new("Frame")
+        sweep.Size = UDim2.new(1, 0, 1, 0)
+        sweep.BackgroundColor3 = PALETTE.accent
+        sweep.BorderSizePixel = 0
+        sweep.ZIndex = 50
+        sweep.Parent = tabPage
+        local sg = Instance.new("UIGradient")
+        sg.Color = ColorSequence.new(PALETTE.accent)
+        sg.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.46, 0.72),
+            NumberSequenceKeypoint.new(0.54, 0.72),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        sg.Offset = Vector2.new(-1.2, 0)
+        sg.Parent = sweep
+        tween(sg, 0.45, { Offset = Vector2.new(1.2, 0) })
+        game:GetService("Debris"):AddItem(sweep, 0.5)
         tween(btn, 0.15, { BackgroundTransparency = 0 })
         tween(label, 0.15, { TextColor3 = PALETTE.text })
         tween(indicator, 0.2, { Size = UDim2.new(0, 3, 0, 20) }, Enum.EasingStyle.Back)
@@ -2053,6 +2079,7 @@ function Window:setColor(key, rgb)
     if self._refresh then
         for _, fn in ipairs(self._refresh) do pcall(fn) end
     end
+    self._dirty = true
 end
 
 function Window:getColor(key)
@@ -2080,8 +2107,12 @@ function Window:flag(key, default)
     if self.flags[key] == nil then
         self.flags[key] = default
     end
-    return function() return self.flags[key] end, function(v) self.flags[key] = v end
+    return function() return self.flags[key] end, function(v) self.flags[key] = v; self._dirty = true end
 end
+
+-- Marks the config dirty so auto save will persist it on its next tick. Controls
+-- with their own setter (colour pickers) call this so their changes are saved too.
+function Window:markDirty() self._dirty = true end
 
 local CONFIG_ROOT = "NewReality/configs"
 -- Configs are stored per game so one game's configs never appear in another.
@@ -2103,7 +2134,7 @@ local function ensureConfigDir()
     end)
 end
 
-function Window:saveConfig(name)
+function Window:saveConfig(name, silent)
     if type(name) ~= "string" or name == "" then return false end
     if type(writefile) ~= "function" then warn("[NewReality] executor has no writefile") return false end
     -- Snapshot the current theme so colours are restored on load too.
@@ -2134,7 +2165,7 @@ function Window:saveConfig(name)
         err = "file missing after write (executor blocked writefile?)"
     end
     if ok then
-        print("[NewReality] saved config: " .. configPath(name))
+        if not silent then print("[NewReality] saved config: " .. configPath(name)) end
     else
         warn("[NewReality] saveConfig failed: " .. tostring(err))
     end
@@ -2247,6 +2278,25 @@ function Window:getAutoLoad()
         end
     end)
     return out
+end
+
+-- Auto save: persists the named config a couple of seconds after any change, so
+-- every toggle, slider and colour is kept without the user pressing Save. Pass
+-- nil to stop. Combined with setAutoLoad, settings survive between sessions.
+function Window:setAutoSave(name)
+    self._autoSaveName = (type(name) == "string" and name ~= "") and name or nil
+    if self._autoSaveName and not self._autoSaveConn then
+        local acc = 0
+        self._autoSaveConn = RunService.Heartbeat:Connect(function(dt)
+            acc = acc + dt
+            if acc < 2 then return end
+            acc = 0
+            if self._dirty and self._autoSaveName then
+                self._dirty = false
+                self:saveConfig(self._autoSaveName, true)
+            end
+        end)
+    end
 end
 
 -- Toast notification, slides in at the bottom right and auto dismisses.
@@ -2699,9 +2749,14 @@ function Interface.new(opts)
 
     -- Close every transient panel currently floating in the overlay. Called when
     -- a new panel opens or when tabs/sub-tabs change so nothing is left hanging.
-    self.closeOverlays = function()
+    -- Closes transient overlay panels. With keepPopovers = true the gear settings
+    -- popovers stay open, so a dropdown or colour picker opened from inside one does
+    -- not close it. Tab switches and backdrop clicks close everything.
+    self.closeOverlays = function(keepPopovers)
         for _, child in ipairs(overlay:GetChildren()) do
-            child:Destroy()
+            if not (keepPopovers and child.Name == "Popover") then
+                child:Destroy()
+            end
         end
     end
 
@@ -2723,11 +2778,17 @@ function Interface.new(opts)
     end
 
     -- Keep a floating panel inside the window bounds given its offset and size.
-    self.fitPanel = function(xOff, yOff, w, h)
+    self.fitPanel = function(xOff, yBelow, w, h, yAbove)
         local size = self.window.AbsoluteSize
-        local maxX = math.max(8, size.X - w - 8)
-        local maxY = math.max(8, size.Y - h - 8)
-        return UDim2.new(0, math.clamp(xOff, 8, maxX), 0, math.clamp(yOff, 8, maxY))
+        local x = math.clamp(xOff, 8, math.max(8, size.X - w - 8))
+        local y = yBelow
+        -- Prefer opening below the control. If it would overflow the window bottom,
+        -- flip and open above the control instead so the panel never covers it.
+        if yBelow + h > size.Y - 8 then
+            local up = (yAbove or yBelow) - h - 6
+            y = (up >= 8) and up or math.clamp(yBelow, 8, math.max(8, size.Y - h - 8))
+        end
+        return UDim2.new(0, x, 0, y)
     end
 
     makeDraggable(window, topDrag)
