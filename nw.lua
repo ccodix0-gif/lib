@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.5"
+Interface.version = "2026.06.30.7"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -1176,9 +1176,11 @@ end
 function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     local row = controlRow(parent, 30)
     rowLabel(row, text, 120)
-    -- Alpha (opacity) is shown by default; pass opts.alpha = false to hide it. When
-    -- shown, the value is { r, g, b, a } with a in 0..1 (scripts reading r,g,b still work).
-    local useAlpha = not (opts and opts.alpha == false)
+    -- Alpha (opacity) is opt in: pass opts.alpha = true to show the bar. When
+    -- shown, the value is { r, g, b, a } with a in 0..1 (scripts reading r,g,b
+    -- still work). It is off by default so pickers whose consumer ignores alpha
+    -- do not show a bar that appears to do nothing.
+    local useAlpha = opts and opts.alpha == true
     local alpha = useAlpha and ((getRgb() or {})[4] or 1) or 1
 
     local function hexOf(rgb)
@@ -1982,21 +1984,13 @@ end
 -- Recolour every part that follows this palette key, then refresh the dynamic
 -- controls (toggles, segmented, lists) that pick colours at runtime.
 --
--- Two paths are used. Tagged parts (themed(...)) are matched by their nrK key.
--- Untagged parts painted straight from the palette are matched by their current
--- colour, but only when that colour is unique in the palette, so keys that share
--- a colour (e.g. track and controlHover) never bleed into one another.
+-- Only parts tagged with themed(inst, prop, key) follow the palette, matched by
+-- their nrK key, so changing one colour never bleeds onto unrelated elements.
 function Window:setColor(key, rgb)
-    local old = PALETTE[key]
     local new = (typeof(rgb) == "Color3") and rgb or colorOf(rgb)
     local alpha = (type(rgb) == "table" and rgb[4]) or PALETTE_A[key] or 1
     PALETTE[key] = new
     PALETTE_A[key] = alpha
-
-    local unique = true
-    for k, c in pairs(PALETTE) do
-        if k ~= key and c == old then unique = false break end
-    end
 
     -- Map the key's alpha onto a part's transparency. The part's own original
     -- transparency is remembered once so a return to full opacity restores it,
@@ -2021,21 +2015,11 @@ function Window:setColor(key, rgb)
         end
     end
 
-    local matchProps = { "BackgroundColor3", "TextColor3", "ImageColor3", "Color" }
     for _, d in ipairs(self.screen:GetDescendants()) do
-        local tagged = d:GetAttribute("nrK")
-        if tagged == key then
+        if d:GetAttribute("nrK") == key then
             local prop = d:GetAttribute("nrP")
             pcall(function() d[prop] = new end)
             applyAlpha(d, prop)
-        elseif unique and tagged == nil then
-            for _, prop in ipairs(matchProps) do
-                local ok, cur = pcall(function() return d[prop] end)
-                if ok and cur == old then
-                    pcall(function() d[prop] = new end)
-                    applyAlpha(d, prop)
-                end
-            end
         end
     end
     if self._refresh then
@@ -2776,7 +2760,7 @@ function Interface.showcase()
         -- Live theme colours: every tagged part recolours instantly.
         local theme = s:card({ title = "Theme", icon = "palette", subtitle = "Colour every part", column = "left" })
         local function themePicker(label, key)
-            theme:colorpicker(label, function() return win:getColor(key) end, function(rgb) win:setColor(key, rgb) end)
+            theme:colorpicker(label, function() return win:getColor(key) end, function(rgb) win:setColor(key, rgb) end, { alpha = true })
         end
         themePicker("Accent", "accent")
         themePicker("Background", "background")
