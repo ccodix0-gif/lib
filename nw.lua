@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.14"
+Interface.version = "2026.06.30.16"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -528,10 +528,18 @@ local function makeDraggable(window, handle)
         if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
             or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
-            window.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
+            local sx, sy = startPos.X.Scale, startPos.Y.Scale
+            local tx = startPos.X.Offset + delta.X
+            local ty = startPos.Y.Offset + delta.Y
+            -- Keep the whole window on screen so it can never be dragged off the
+            -- bottom / edges (otherwise its controls would be unreachable).
+            local cam = workspace.CurrentCamera
+            local vp = (cam and cam.ViewportSize) or window.AbsoluteSize
+            local ws = window.AbsoluteSize
+            local m = 8
+            local absX = math.clamp(sx * vp.X + tx, m, math.max(m, vp.X - ws.X - m))
+            local absY = math.clamp(sy * vp.Y + ty, m, math.max(m, vp.Y - ws.Y - m))
+            window.Position = UDim2.new(sx, absX - sx * vp.X, sy, absY - sy * vp.Y)
         end
     end)
 end
@@ -735,6 +743,14 @@ function Controls.toggle(parent, ctx, text, get, set, buildSettings)
             local py = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
             local pAbove = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
             popover.Position = ctx.fitPanel and ctx.fitPanel(px, py, 270, 220, pAbove) or UDim2.new(0, px, 0, py)
+            -- Reposition once the popover has auto sized, using its real height, so a
+            -- tall settings list near the screen bottom flips fully above and stays on screen.
+            task.spawn(function()
+                RunService.RenderStepped:Wait()
+                if popover and popover.Parent and ctx.fitPanel then
+                    popover.Position = ctx.fitPanel(px, py, 270, popover.AbsoluteSize.Y, pAbove)
+                end
+            end)
             popover.GroupTransparency = 1
             tween(popover, 0.18, { GroupTransparency = 0 })
         end)
@@ -1131,6 +1147,14 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         local destY = panel.Position
         panel.Position = destY - UDim2.new(0, 0, 0, 6)
         tween(panel, 0.16, { GroupTransparency = 0, Position = destY })
+        -- Reposition once the list has auto sized, using its real height, so a long
+        -- list near the screen bottom flips above and stays fully on screen.
+        task.spawn(function()
+            RunService.RenderStepped:Wait()
+            if panel and panel.Parent and ctx.fitPanel then
+                panel.Position = ctx.fitPanel(dx, dy, 210, panel.AbsoluteSize.Y, dAbove)
+            end
+        end)
         listLayout(panel, 0)
 
         -- Search as a flush header at the top of the panel (top corners follow
@@ -1942,7 +1966,7 @@ function Window:tab(opts)
 
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, 0, 0, 38)
-    themed(btn, "BackgroundColor3", "control")
+    themed(btn, "BackgroundColor3", "accent")
     btn.BackgroundTransparency = 1
     btn.AutoButtonColor = false
     btn.Text = ""
@@ -1950,6 +1974,14 @@ function Window:tab(opts)
     btn.LayoutOrder = nextOrder(self.sidebarList)
     btn.Parent = self.sidebarList
     corner(btn, 8)
+    -- Active tab fill: accent on the left fading to transparent on the right.
+    local btnGrad = Instance.new("UIGradient")
+    btnGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.35),
+        NumberSequenceKeypoint.new(0.65, 1),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    btnGrad.Parent = btn
 
     local icon = makeIcon(btn, opts.icon, UDim2.new(0, 24, 0, 24), PALETTE.text)
     icon.AnchorPoint = Vector2.new(0, 0.5)
@@ -1975,26 +2007,6 @@ function Window:tab(opts)
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.Text = opts.name
     label.Parent = btn
-
-    -- Flowing brand gradient on the tab label. It runs constantly and is only shown
-    -- (Enabled) on the active tab, so the selected section keeps the moving gradient.
-    local labelGrad = Instance.new("UIGradient")
-    labelGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, PALETTE.accent),
-        ColorSequenceKeypoint.new(0.5, PALETTE.text),
-        ColorSequenceKeypoint.new(1, PALETTE.accent),
-    })
-    labelGrad.Enabled = false
-    labelGrad.Parent = label
-    task.spawn(function()
-        while label.Parent do
-            local e = 0
-            while e < 1 and label.Parent do
-                e += RunService.RenderStepped:Wait()
-                labelGrad.Offset = Vector2.new(-1 + e * 2, 0)
-            end
-        end
-    end)
 
     local tabPage = Instance.new("CanvasGroup")
     tabPage.Size = UDim2.new(1, 0, 1, 0)
@@ -2025,7 +2037,7 @@ function Window:tab(opts)
     local tabObj = setmetatable({
         _ctx = self, _subBar = subBar, _subPages = subPages, _subs = {},
         name = opts.name, btn = btn, icon = icon, label = label, page = tabPage,
-        indicator = indicator, labelGrad = labelGrad,
+        indicator = indicator,
     }, Tab)
     table.insert(self.tabs, tabObj)
 
@@ -2034,7 +2046,6 @@ function Window:tab(opts)
             other.page.Visible = false
             tween(other.btn, 0.15, { BackgroundTransparency = 1 })
             tween(other.label, 0.15, { TextColor3 = PALETTE.subtext })
-            if other.labelGrad then other.labelGrad.Enabled = false end
             if other.indicator then
                 tween(other.indicator, 0.15, { Size = UDim2.new(0, 3, 0, 0) })
             end
@@ -2044,9 +2055,6 @@ function Window:tab(opts)
         tabPage.GroupTransparency = 1
         tabPage.Position = UDim2.new(0, 0, 0, 12)
         tween(tabPage, 0.22, { GroupTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
-        -- Show the flowing gradient on the now active tab label.
-        label.TextColor3 = PALETTE.text
-        labelGrad.Enabled = true
         tween(btn, 0.15, { BackgroundTransparency = 0 })
         tween(label, 0.15, { TextColor3 = PALETTE.text })
         tween(indicator, 0.2, { Size = UDim2.new(0, 3, 0, 20) }, Enum.EasingStyle.Back)
