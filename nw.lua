@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.29.2"
+Interface.version = "2026.06.30.2"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -1153,9 +1153,13 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
     return row
 end
 
-function Controls.colorpicker(parent, ctx, text, getRgb, setRgb)
+function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     local row = controlRow(parent, 30)
     rowLabel(row, text, 120)
+    -- Optional alpha: when opts.alpha is set, the value is { r, g, b, a } with a in 0..1
+    -- and an opacity slider is shown in the picker. Without it the value stays { r, g, b }.
+    local useAlpha = opts and opts.alpha == true
+    local alpha = useAlpha and ((getRgb() or {})[4] or 1) or 1
 
     local function hexOf(rgb)
         return string.format("#%02X%02X%02X", rgb[1] or 0, rgb[2] or 0, rgb[3] or 0)
@@ -1191,6 +1195,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb)
     swatch.Position = UDim2.new(1, -108, 0.5, 0)
     swatch.Size = UDim2.new(0, 18, 0, 18)
     swatch.BackgroundColor3 = colorOf(getRgb())
+    swatch.BackgroundTransparency = useAlpha and (1 - alpha) or 0
     swatch.BorderSizePixel = 0
     swatch.AutoButtonColor = false
     swatch.Text = ""
@@ -1209,10 +1214,11 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb)
         panel.BackgroundColor3 = PALETTE.card
         panel.BorderSizePixel = 0
         panel.ZIndex = 60
-        panel.Size = UDim2.new(0, 232, 0, 196)
+        local panelH = useAlpha and 226 or 196
+        panel.Size = UDim2.new(0, 232, 0, panelH)
         local cx = swatch.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 190
         local cy = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
-        panel.Position = ctx.fitPanel and ctx.fitPanel(cx, cy, 232, 196) or UDim2.new(0, cx, 0, cy)
+        panel.Position = ctx.fitPanel and ctx.fitPanel(cx, cy, 232, panelH) or UDim2.new(0, cx, 0, cy)
         panel.Parent = ctx.overlay
         corner(panel, 10)
         stroke(panel, PALETTE.stroke, 1, 0.2)
@@ -1289,6 +1295,32 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb)
         corner(hueCursor, 2)
         stroke(hueCursor, Color3.fromRGB(0, 0, 0), 1, 0.4)
 
+        -- Opacity (alpha) bar below the SV box.
+        local alphaBar, alphaCursor
+        if useAlpha then
+            alphaBar = Instance.new("ImageButton")
+            alphaBar.Position = UDim2.new(0, 0, 0, 150)
+            alphaBar.Size = UDim2.new(1, 0, 0, 16)
+            alphaBar.BackgroundColor3 = colorOf(getRgb())
+            alphaBar.AutoButtonColor = false
+            alphaBar.BorderSizePixel = 0
+            alphaBar.Parent = panel
+            corner(alphaBar, 4)
+            local aGrad = Instance.new("UIGradient")
+            aGrad.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) })
+            aGrad.Parent = alphaBar
+            alphaCursor = Instance.new("Frame")
+            alphaCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+            alphaCursor.Size = UDim2.new(0, 4, 1, 4)
+            alphaCursor.Position = UDim2.new(alpha, 0, 0.5, 0)
+            alphaCursor.BackgroundColor3 = Color3.new(1, 1, 1)
+            alphaCursor.BorderSizePixel = 0
+            alphaCursor.ZIndex = 5
+            alphaCursor.Parent = alphaBar
+            corner(alphaCursor, 2)
+            stroke(alphaCursor, Color3.fromRGB(0, 0, 0), 1, 0.4)
+        end
+
         local hexBox
         local function apply()
             sv.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
@@ -1299,9 +1331,15 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb)
             local rgb = { math.floor(final.R * 255 + 0.5), math.floor(final.G * 255 + 0.5), math.floor(final.B * 255 + 0.5) }
             hexLabel.Text = hexOf(rgb)
             if hexBox then hexBox.Text = hexOf(rgb) end
+            if useAlpha then
+                alphaBar.BackgroundColor3 = final
+                alphaCursor.Position = UDim2.new(alpha, 0, 0.5, 0)
+                swatch.BackgroundTransparency = 1 - alpha
+                rgb[4] = alpha
+            end
             setRgb(rgb)
         end
-        local dragSV, dragHue = false, false
+        local dragSV, dragHue, dragAlpha = false, false, false
         local function updSV(x, y)
             s = math.clamp((x - sv.AbsolutePosition.X) / math.max(sv.AbsoluteSize.X, 1), 0, 1)
             v = 1 - math.clamp((y - sv.AbsolutePosition.Y) / math.max(sv.AbsoluteSize.Y, 1), 0, 1)
@@ -1311,15 +1349,24 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb)
             h = math.clamp((y - hue.AbsolutePosition.Y) / math.max(hue.AbsoluteSize.Y, 1), 0, 1)
             apply()
         end
+        local function updAlpha(x)
+            alpha = math.clamp((x - alphaBar.AbsolutePosition.X) / math.max(alphaBar.AbsoluteSize.X, 1), 0, 1)
+            apply()
+        end
         sv.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragSV = true updSV(i.Position.X, i.Position.Y) end end)
         hue.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragHue = true updHue(i.Position.Y) end end)
+        if useAlpha then
+            alphaBar.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragAlpha = true updAlpha(i.Position.X) end end)
+        end
         UserInputService.InputChanged:Connect(function(i)
             if i.UserInputType == Enum.UserInputType.MouseMovement then
-                if dragSV then updSV(i.Position.X, i.Position.Y) elseif dragHue then updHue(i.Position.Y) end
+                if dragSV then updSV(i.Position.X, i.Position.Y)
+                elseif dragHue then updHue(i.Position.Y)
+                elseif dragAlpha then updAlpha(i.Position.X) end
             end
         end)
         UserInputService.InputEnded:Connect(function(i)
-            if i.UserInputType == Enum.UserInputType.MouseButton1 then dragSV = false dragHue = false end
+            if i.UserInputType == Enum.UserInputType.MouseButton1 then dragSV = false dragHue = false dragAlpha = false end
         end)
 
         hexBox = Instance.new("TextBox")
@@ -1362,6 +1409,10 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb)
             swatch.BackgroundColor3 = c
             hexLabel.Text = hexOf(getRgb())
             h, s, v = c:ToHSV()
+            if useAlpha then
+                alpha = (getRgb() or {})[4] or alpha
+                swatch.BackgroundTransparency = 1 - alpha
+            end
         end)
     end
     return row
@@ -1584,7 +1635,7 @@ function Card:toggle(text, get, set, settings) return Controls.toggle(self._fram
 function Card:slider(text, min, max, get, set, decimals, format) return Controls.slider(self._frame, self._ctx, text, min, max, get, set, decimals, format) end
 function Card:keybind(text, getKey, setKey, opts) return Controls.keybind(self._frame, self._ctx, text, getKey, setKey, opts) end
 function Card:dropdown(text, options, get, set, opts) return Controls.dropdown(self._frame, self._ctx, text, options, get, set, opts) end
-function Card:colorpicker(text, getRgb, setRgb) return Controls.colorpicker(self._frame, self._ctx, text, getRgb, setRgb) end
+function Card:colorpicker(text, getRgb, setRgb, opts) return Controls.colorpicker(self._frame, self._ctx, text, getRgb, setRgb, opts) end
 function Card:segmented(text, options, get, set) return Controls.segmented(self._frame, self._ctx, text, options, get, set) end
 function Card:list(options, get, set, opts) return Controls.list(self._frame, self._ctx, options, get, set, opts) end
 function Card:stepper(text, min, max, step, get, set) return Controls.stepper(self._frame, self._ctx, text, min, max, step, get, set) end
@@ -1963,7 +2014,9 @@ end
 local CONFIG_ROOT = "NewReality/configs"
 -- Configs are stored per game so one game's configs never appear in another.
 local function placeFolder()
-    return CONFIG_ROOT .. "/" .. tostring(game.PlaceId)
+    -- Key by GameId (universe), not PlaceId, so every place of one game (e.g. a
+    -- separate lobby place and the main game place) shares the same configs.
+    return CONFIG_ROOT .. "/" .. tostring(game.GameId)
 end
 local function configPath(name)
     return placeFolder() .. "/" .. name .. ".json"
