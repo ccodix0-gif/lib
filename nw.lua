@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.16"
+Interface.version = "2026.06.30.17"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2057,6 +2057,9 @@ function Window:tab(opts)
         tween(tabPage, 0.22, { GroupTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
         tween(btn, 0.15, { BackgroundTransparency = 0 })
         tween(label, 0.15, { TextColor3 = PALETTE.text })
+        -- Slide the accent gradient fill in from the left as the section opens.
+        btnGrad.Offset = Vector2.new(-1, 0)
+        tween(btnGrad, 0.35, { Offset = Vector2.new(0, 0) }, Enum.EasingStyle.Quint)
         tween(indicator, 0.2, { Size = UDim2.new(0, 3, 0, 20) }, Enum.EasingStyle.Back)
         self.title.Text = opts.name
         if self.subtitle then
