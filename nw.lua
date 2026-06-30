@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.8"
+Interface.version = "2026.06.30.9"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
