@@ -28,7 +28,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.3"
+Interface.version = "2026.06.30.4"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -51,6 +51,19 @@ local DEFAULTS = {}
 for k, v in pairs(PALETTE) do DEFAULTS[k] = v end
 Interface.defaults = DEFAULTS
 
+-- Per key opacity (1 = fully opaque). Colour pickers may carry an alpha that is
+-- mapped onto the matching transparency property when a themed part is painted.
+local PALETTE_A = {}
+for k in pairs(PALETTE) do PALETTE_A[k] = 1 end
+Interface.paletteAlpha = PALETTE_A
+
+-- Colour property -> transparency property, so a key's alpha can fade its parts.
+local TRANS_OF = {
+    BackgroundColor3 = "BackgroundTransparency",
+    TextColor3 = "TextTransparency",
+    ImageColor3 = "ImageTransparency",
+}
+
 local FONT = Font.new("rbxasset://fonts/families/Arial.json", Enum.FontWeight.Heavy, Enum.FontStyle.Normal)
 Interface.FontFace = FONT
 
@@ -65,6 +78,13 @@ local function themed(instance, prop, key)
     instance[prop] = PALETTE[key]
     instance:SetAttribute("nrK", key)
     instance:SetAttribute("nrP", prop)
+    -- Carry the key's alpha onto the matching transparency property (only when
+    -- the key is actually faded, so default parts keep their own transparency).
+    local a = PALETTE_A[key]
+    local tp = TRANS_OF[prop]
+    if a and a < 1 and tp then
+        pcall(function() instance[tp] = 1 - a end)
+    end
     return instance
 end
 
@@ -1959,14 +1979,63 @@ function Window:toggle()
     self.window.Visible = not self.window.Visible
 end
 
--- Recolour only elements explicitly tagged with this palette key, then refresh
--- the dynamic controls (toggles, segmented, lists) that pick colours at runtime.
+-- Recolour every part that follows this palette key, then refresh the dynamic
+-- controls (toggles, segmented, lists) that pick colours at runtime.
+--
+-- Two paths are used. Tagged parts (themed(...)) are matched by their nrK key.
+-- Untagged parts painted straight from the palette are matched by their current
+-- colour, but only when that colour is unique in the palette, so keys that share
+-- a colour (e.g. track and controlHover) never bleed into one another.
 function Window:setColor(key, rgb)
-    PALETTE[key] = (typeof(rgb) == "Color3") and rgb or colorOf(rgb)
+    local old = PALETTE[key]
+    local new = (typeof(rgb) == "Color3") and rgb or colorOf(rgb)
+    local alpha = (type(rgb) == "table" and rgb[4]) or PALETTE_A[key] or 1
+    PALETTE[key] = new
+    PALETTE_A[key] = alpha
+
+    local unique = true
+    for k, c in pairs(PALETTE) do
+        if k ~= key and c == old then unique = false break end
+    end
+
+    -- Map the key's alpha onto a part's transparency. The part's own original
+    -- transparency is remembered once so a return to full opacity restores it,
+    -- and parts that are fully hidden stay hidden.
+    local function applyAlpha(d, prop)
+        local tp = TRANS_OF[prop]
+        if not tp then return end
+        local ok, cur = pcall(function() return d[tp] end)
+        if not ok or type(cur) ~= "number" then return end
+        local attr = "nrT_" .. tp
+        local base = d:GetAttribute(attr)
+        if alpha < 1 then
+            if base == nil then
+                base = cur
+                if base < 1 then d:SetAttribute(attr, base) end
+            end
+            if base >= 1 then return end
+            pcall(function() d[tp] = 1 - alpha end)
+        elseif base ~= nil then
+            pcall(function() d[tp] = base end)
+            d:SetAttribute(attr, nil)
+        end
+    end
+
+    local matchProps = { "BackgroundColor3", "TextColor3", "ImageColor3", "Color" }
     for _, d in ipairs(self.screen:GetDescendants()) do
-        if d:GetAttribute("nrK") == key then
+        local tagged = d:GetAttribute("nrK")
+        if tagged == key then
             local prop = d:GetAttribute("nrP")
-            pcall(function() d[prop] = PALETTE[key] end)
+            pcall(function() d[prop] = new end)
+            applyAlpha(d, prop)
+        elseif unique and tagged == nil then
+            for _, prop in ipairs(matchProps) do
+                local ok, cur = pcall(function() return d[prop] end)
+                if ok and cur == old then
+                    pcall(function() d[prop] = new end)
+                    applyAlpha(d, prop)
+                end
+            end
         end
     end
     if self._refresh then
@@ -1976,22 +2045,13 @@ end
 
 function Window:getColor(key)
     local c = PALETTE[key]
-    return { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) }
+    return { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5), PALETTE_A[key] or 1 }
 end
 
--- Restore the default palette.
+-- Restore the default palette and full opacity for every key.
 function Window:resetTheme()
     for key, def in pairs(DEFAULTS) do
-        PALETTE[key] = def
-        for _, d in ipairs(self.screen:GetDescendants()) do
-            if d:GetAttribute("nrK") == key then
-                local prop = d:GetAttribute("nrP")
-                pcall(function() d[prop] = PALETTE[key] end)
-            end
-        end
-    end
-    if self._refresh then
-        for _, fn in ipairs(self._refresh) do pcall(fn) end
+        self:setColor(key, { math.floor(def.R * 255 + 0.5), math.floor(def.G * 255 + 0.5), math.floor(def.B * 255 + 0.5), 1 })
     end
 end
 
