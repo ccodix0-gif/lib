@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.20"
+Interface.version = "2026.06.30.21"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2721,8 +2721,9 @@ function Interface.new(opts)
         local bgGrad = Instance.new("UIGradient")
         bgGrad.Rotation = 90
         bgGrad.Transparency = NumberSequence.new({
-            NumberSequenceKeypoint.new(0, 1),   -- fully transparent at the top
-            NumberSequenceKeypoint.new(1, 0.9), -- faint near the bottom
+            NumberSequenceKeypoint.new(0, 1),      -- fully transparent at the very top
+            NumberSequenceKeypoint.new(0.35, 0.94), -- long, soft fade through the upper area
+            NumberSequenceKeypoint.new(1, 0.72),   -- fuller, more visible toward the bottom
         })
         bgGrad.Parent = bg
         local function rebuildBg()
