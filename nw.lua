@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.20"
+Interface.version = "2026.06.30.21"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -988,6 +988,9 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     clearBtn.MouseLeave:Connect(function() tintIcon(clearImg, PALETTE.subtext) end)
 
     local capturing = false
+    -- Timestamp of the last successful capture, so the right-click that binds a
+    -- mouse button is not immediately treated as a right-click clear.
+    local lastBind = 0
     -- Mouse buttons can be bound too (aim on right click, side buttons, etc.).
     local function mouseName(it)
         if it == Enum.UserInputType.MouseButton1 then return "MouseButton1" end
@@ -1001,28 +1004,17 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     button.MouseLeave:Connect(function()
         if not capturing then tween(button, 0.12, { BackgroundColor3 = PALETTE.control }) end
     end)
-    -- Left click: capture a key. Right click: clear the bind.
+    -- Left click: start capturing the next key or mouse button.
     button.MouseButton1Click:Connect(function()
         capturing = true
         button.Text = "..."
         button.TextColor3 = PALETTE.accent
     end)
-    -- Right click while capturing binds the right mouse button; otherwise it clears.
+    -- Right click clears the bind, unless a mouse button was just captured (the
+    -- capturing right-click is handled by InputBegan, so ignore its release here).
     button.MouseButton2Click:Connect(function()
-        if capturing then
-            capturing = false
-            button.TextColor3 = PALETTE.text
-            if multi then
-                local list = keyList()
-                local has = false
-                for _, v in ipairs(list) do if v == "MouseButton2" then has = true end end
-                if not has then table.insert(list, "MouseButton2") end
-                commit(list)
-            else
-                commit({ "MouseButton2" })
-            end
-            return
-        end
+        if capturing then return end
+        if os.clock() - lastBind < 0.3 then return end
         commit({})
         button.TextColor3 = PALETTE.text
         tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
@@ -1032,6 +1024,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
             local mn = mouseName(input.UserInputType)
             if input.UserInputType == Enum.UserInputType.Keyboard then
                 capturing = false
+                lastBind = os.clock()
                 button.TextColor3 = PALETTE.text
                 local name = input.KeyCode.Name
                 if name == "Escape" or name == "Backspace" or name == "Delete" then
@@ -1051,6 +1044,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
             elseif mn and mn ~= "MouseButton1" then
                 -- MouseButton1 is reserved for clicking the button itself.
                 capturing = false
+                lastBind = os.clock()
                 button.TextColor3 = PALETTE.text
                 if multi then
                     local list = keyList()
