@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.25"
+Interface.version = "2026.06.30.21"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2257,13 +2257,18 @@ function Window:loadConfig(name)
     -- New format is { flags = , theme = }; old format was just the flags table.
     local flags = (type(data.flags) == "table") and data.flags or data
     for k, v in pairs(flags) do self.flags[k] = v end
-    -- Restore the saved theme through the same path the live colour picker uses,
-    -- so every accent element, dynamic control and the background gradient update
-    -- exactly as they do when a colour is changed by hand.
+    -- Restore the saved theme colours by re-tagging every themed element.
     if type(data.theme) == "table" then
         for key, rgb in pairs(data.theme) do
             if DEFAULTS[key] and type(rgb) == "table" then
-                self:setColor(key, rgb)
+                PALETTE[key] = colorOf(rgb)
+            end
+        end
+        for _, d in ipairs(self.screen:GetDescendants()) do
+            local k = d:GetAttribute("nrK")
+            if k and PALETTE[k] then
+                local prop = d:GetAttribute("nrP")
+                pcall(function() d[prop] = PALETTE[k] end)
             end
         end
     end
@@ -2695,24 +2700,23 @@ function Interface.new(opts)
     shadow(window)
     self.window = window
 
-    -- Background line art: a single image sized for the whole window. White at the
-    -- top fading down into the accent colour at the bottom, kept faint so it blends
-    -- in. Rounded to match the window so the image never spills past the corners.
-    local function attachBackground(parent, radius)
-        local bgImage = backgroundAsset()
-        if not bgImage then return nil end
+    -- Background line art: white at the top fading down into the accent colour at
+    -- the bottom, kept faint so it blends into the window instead of covering it.
+    -- Rounded to match the window so the image never spills past the corners.
+    local bgImage = backgroundAsset()
+    if bgImage then
         local bg = Instance.new("ImageLabel")
         bg.Name = "Background"
         bg.BackgroundTransparency = 1
         bg.Size = UDim2.new(1, 0, 1, 0)
         bg.Position = UDim2.new(0, 0, 0, 0)
         bg.Image = bgImage
-        bg.ScaleType = Enum.ScaleType.Stretch
+        bg.ScaleType = Enum.ScaleType.Crop
         bg.ImageColor3 = Color3.fromRGB(255, 255, 255)
         bg.ImageTransparency = 0
         bg.ZIndex = 0
-        bg.Parent = parent
-        corner(bg, radius or 14)
+        bg.Parent = window
+        corner(bg, 14)
         -- Rotation 90 runs the gradient top (offset 0) to bottom (offset 1).
         local bgGrad = Instance.new("UIGradient")
         bgGrad.Rotation = 90
@@ -2730,9 +2734,8 @@ function Interface.new(opts)
         end
         rebuildBg()
         table.insert(self._refresh, rebuildBg)
-        return bg
+        self.background = bg
     end
-    self.background = attachBackground(window, 14)
 
     -- Sidebar
     local sidebar = Instance.new("Frame")
@@ -2741,28 +2744,12 @@ function Interface.new(opts)
     sidebar.BorderSizePixel = 0
     sidebar.Parent = window
     corner(sidebar, 14)
-    -- The background is a single image sized for the whole window, so the sidebar
-    -- is fully transparent and that one image shows through it seamlessly, with no
-    -- tone boundary between the sidebar and the content.
-    sidebar.BackgroundTransparency = 1
     local sidebarMask = Instance.new("Frame")
     sidebarMask.Size = UDim2.new(0, 12, 1, 0)
     sidebarMask.Position = UDim2.new(1, -12, 0, 0)
     themed(sidebarMask, "BackgroundColor3", "sidebar")
-    sidebarMask.BackgroundTransparency = 1
     sidebarMask.BorderSizePixel = 0
     sidebarMask.Parent = sidebar
-
-    -- Thin divider marking the sidebar / content split, so removing the solid panel
-    -- does not leave the navigation floating with no structure.
-    local divider = Instance.new("Frame")
-    divider.Size = UDim2.new(0, 1, 1, -28)
-    divider.Position = UDim2.new(0, 230, 0, 14)
-    divider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    divider.BackgroundTransparency = 0.92
-    divider.BorderSizePixel = 0
-    divider.ZIndex = 2
-    divider.Parent = window
 
     local brandRow = Instance.new("Frame")
     brandRow.Size = UDim2.new(1, -28, 0, 48)
