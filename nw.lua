@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.24"
+Interface.version = "2026.06.30.25"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2741,17 +2741,28 @@ function Interface.new(opts)
     sidebar.BorderSizePixel = 0
     sidebar.Parent = window
     corner(sidebar, 14)
-    -- The background is a single image sized for the whole window. The sidebar is
-    -- kept slightly translucent so that one image shows through it continuously,
-    -- instead of drawing a second copy that would not line up.
-    sidebar.BackgroundTransparency = 0.3
+    -- The background is a single image sized for the whole window, so the sidebar
+    -- is fully transparent and that one image shows through it seamlessly, with no
+    -- tone boundary between the sidebar and the content.
+    sidebar.BackgroundTransparency = 1
     local sidebarMask = Instance.new("Frame")
     sidebarMask.Size = UDim2.new(0, 12, 1, 0)
     sidebarMask.Position = UDim2.new(1, -12, 0, 0)
     themed(sidebarMask, "BackgroundColor3", "sidebar")
-    sidebarMask.BackgroundTransparency = 0.3
+    sidebarMask.BackgroundTransparency = 1
     sidebarMask.BorderSizePixel = 0
     sidebarMask.Parent = sidebar
+
+    -- Thin divider marking the sidebar / content split, so removing the solid panel
+    -- does not leave the navigation floating with no structure.
+    local divider = Instance.new("Frame")
+    divider.Size = UDim2.new(0, 1, 1, -28)
+    divider.Position = UDim2.new(0, 230, 0, 14)
+    divider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    divider.BackgroundTransparency = 0.92
+    divider.BorderSizePixel = 0
+    divider.ZIndex = 2
+    divider.Parent = window
 
     local brandRow = Instance.new("Frame")
     brandRow.Size = UDim2.new(1, -28, 0, 48)
