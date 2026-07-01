@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.18"
+Interface.version = "2026.06.30.19"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -1130,7 +1130,10 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         local dx = button.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 70
         local dy = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 32
         local dAbove = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
-        panel.Position = ctx.fitPanel and ctx.fitPanel(dx, dy, 210, 240, dAbove) or UDim2.new(0, dx, 0, dy)
+        -- Estimate the real list height so a short list is not wrongly flipped above
+        -- just because of a large fixed guess. Search header + padding + rows.
+        local estH = (opts.search and 38 or 0) + 12 + math.max(#getOptions(), 1) * 35
+        panel.Position = ctx.fitPanel and ctx.fitPanel(dx, dy, 210, estH, dAbove) or UDim2.new(0, dx, 0, dy)
         panel.Parent = ctx.overlay
         corner(panel, 10)
         stroke(panel, PALETTE.stroke, 1, 0.2)
