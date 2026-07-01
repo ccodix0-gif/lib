@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.23"
+Interface.version = "2026.06.30.24"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2695,10 +2695,9 @@ function Interface.new(opts)
     shadow(window)
     self.window = window
 
-    -- Background line art: white at the top fading down into the accent colour at
-    -- the bottom, kept faint so it blends into the panel instead of covering it.
-    -- Rounded to match its parent so the image never spills past the corners. Used
-    -- for both the window content and the sidebar so lines cover the whole UI.
+    -- Background line art: a single image sized for the whole window. White at the
+    -- top fading down into the accent colour at the bottom, kept faint so it blends
+    -- in. Rounded to match the window so the image never spills past the corners.
     local function attachBackground(parent, radius)
         local bgImage = backgroundAsset()
         if not bgImage then return nil end
@@ -2708,7 +2707,7 @@ function Interface.new(opts)
         bg.Size = UDim2.new(1, 0, 1, 0)
         bg.Position = UDim2.new(0, 0, 0, 0)
         bg.Image = bgImage
-        bg.ScaleType = Enum.ScaleType.Crop
+        bg.ScaleType = Enum.ScaleType.Stretch
         bg.ImageColor3 = Color3.fromRGB(255, 255, 255)
         bg.ImageTransparency = 0
         bg.ZIndex = 0
@@ -2742,12 +2741,15 @@ function Interface.new(opts)
     sidebar.BorderSizePixel = 0
     sidebar.Parent = window
     corner(sidebar, 14)
-    -- Same line art on the sidebar so the background covers the whole UI.
-    attachBackground(sidebar, 14)
+    -- The background is a single image sized for the whole window. The sidebar is
+    -- kept slightly translucent so that one image shows through it continuously,
+    -- instead of drawing a second copy that would not line up.
+    sidebar.BackgroundTransparency = 0.3
     local sidebarMask = Instance.new("Frame")
     sidebarMask.Size = UDim2.new(0, 12, 1, 0)
     sidebarMask.Position = UDim2.new(1, -12, 0, 0)
     themed(sidebarMask, "BackgroundColor3", "sidebar")
+    sidebarMask.BackgroundTransparency = 0.3
     sidebarMask.BorderSizePixel = 0
     sidebarMask.Parent = sidebar
 
