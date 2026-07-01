@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.21"
+Interface.version = "2026.06.30.22"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2701,10 +2701,12 @@ function Interface.new(opts)
     self.window = window
 
     -- Background line art: white at the top fading down into the accent colour at
-    -- the bottom, kept faint so it blends into the window instead of covering it.
-    -- Rounded to match the window so the image never spills past the corners.
-    local bgImage = backgroundAsset()
-    if bgImage then
+    -- the bottom, kept faint so it blends into the panel instead of covering it.
+    -- Rounded to match its parent so the image never spills past the corners. Used
+    -- for both the window content and the sidebar so lines cover the whole UI.
+    local function attachBackground(parent, radius)
+        local bgImage = backgroundAsset()
+        if not bgImage then return nil end
         local bg = Instance.new("ImageLabel")
         bg.Name = "Background"
         bg.BackgroundTransparency = 1
@@ -2715,8 +2717,8 @@ function Interface.new(opts)
         bg.ImageColor3 = Color3.fromRGB(255, 255, 255)
         bg.ImageTransparency = 0
         bg.ZIndex = 0
-        bg.Parent = window
-        corner(bg, 14)
+        bg.Parent = parent
+        corner(bg, radius or 14)
         -- Rotation 90 runs the gradient top (offset 0) to bottom (offset 1).
         local bgGrad = Instance.new("UIGradient")
         bgGrad.Rotation = 90
@@ -2734,8 +2736,9 @@ function Interface.new(opts)
         end
         rebuildBg()
         table.insert(self._refresh, rebuildBg)
-        self.background = bg
+        return bg
     end
+    self.background = attachBackground(window, 14)
 
     -- Sidebar
     local sidebar = Instance.new("Frame")
@@ -2744,6 +2747,8 @@ function Interface.new(opts)
     sidebar.BorderSizePixel = 0
     sidebar.Parent = window
     corner(sidebar, 14)
+    -- Same line art on the sidebar so the background covers the whole UI.
+    attachBackground(sidebar, 14)
     local sidebarMask = Instance.new("Frame")
     sidebarMask.Size = UDim2.new(0, 12, 1, 0)
     sidebarMask.Position = UDim2.new(1, -12, 0, 0)
