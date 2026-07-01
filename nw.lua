@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.17"
+Interface.version = "2026.06.30.18"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -528,18 +528,10 @@ local function makeDraggable(window, handle)
         if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
             or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
-            local sx, sy = startPos.X.Scale, startPos.Y.Scale
-            local tx = startPos.X.Offset + delta.X
-            local ty = startPos.Y.Offset + delta.Y
-            -- Keep the whole window on screen so it can never be dragged off the
-            -- bottom / edges (otherwise its controls would be unreachable).
-            local cam = workspace.CurrentCamera
-            local vp = (cam and cam.ViewportSize) or window.AbsoluteSize
-            local ws = window.AbsoluteSize
-            local m = 8
-            local absX = math.clamp(sx * vp.X + tx, m, math.max(m, vp.X - ws.X - m))
-            local absY = math.clamp(sy * vp.Y + ty, m, math.max(m, vp.Y - ws.Y - m))
-            window.Position = UDim2.new(sx, absX - sx * vp.X, sy, absY - sy * vp.Y)
+            window.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
         end
     end)
 end
