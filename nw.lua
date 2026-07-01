@@ -60,7 +60,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.22"
+Interface.version = "2026.06.30.23"
 
 -- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
@@ -2257,18 +2257,13 @@ function Window:loadConfig(name)
     -- New format is { flags = , theme = }; old format was just the flags table.
     local flags = (type(data.flags) == "table") and data.flags or data
     for k, v in pairs(flags) do self.flags[k] = v end
-    -- Restore the saved theme colours by re-tagging every themed element.
+    -- Restore the saved theme through the same path the live colour picker uses,
+    -- so every accent element, dynamic control and the background gradient update
+    -- exactly as they do when a colour is changed by hand.
     if type(data.theme) == "table" then
         for key, rgb in pairs(data.theme) do
             if DEFAULTS[key] and type(rgb) == "table" then
-                PALETTE[key] = colorOf(rgb)
-            end
-        end
-        for _, d in ipairs(self.screen:GetDescendants()) do
-            local k = d:GetAttribute("nrK")
-            if k and PALETTE[k] then
-                local prop = d:GetAttribute("nrP")
-                pcall(function() d[prop] = PALETTE[k] end)
+                self:setColor(key, rgb)
             end
         end
     end
