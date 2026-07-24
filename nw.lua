@@ -43,16 +43,11 @@
 --   keys: accent, background, sidebar, card, control, track, text, subtext, stroke
 --
 -- CONFIGS: win:saveConfig(name) / loadConfig(name) / listConfigs() / deleteConfig(name)
---   Stored under NewReality/configs/<GameId>/ so each game only sees its own configs.
---   Auto save is ALWAYS on: the active config (last saved/loaded, "default" at boot)
---   is persisted a moment after any change. win:setAutoLoad(name|nil) / getAutoLoad()
---   still control which config loads on launch. setAutoSave(name) retargets it manually.
+--   win:setAutoLoad(name|nil) / getAutoLoad()       -- which config loads on launch
+--   win:setAutoSave(name|nil)                        -- auto persists that config a moment after any change
 --
 -- EXTRAS: win:notify({ title, text, icon, duration }), win:watermark{...}, win:keybindList{...},
---   win:panel({ name, title, icon, width, position }) -- custom floating HUD panel,
 --   win:refreshAll() (re-sync every control from its flag), win:toggle() (show/hide the window).
---
--- Debug prints are off by default; set Interface.debug = true (UI.debug) to see them.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -65,18 +60,9 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.24.1"
+Interface.version = "2026.06.30.21"
 
--- Gate every console message behind this flag: released scripts must stay silent
--- in F9, so nothing prints unless a developer opts in with UI.debug = true.
-Interface.debug = false
-local function report(...)
-    if Interface.debug then
-        warn("[NewReality]", ...)
-    end
-end
-
--- Theme: our grey palette with the cyan CcodixHub accent.
+-- Theme: our grey palette with the pink NewReality accent.
 local PALETTE = {
     sidebar = Color3.fromRGB(24, 24, 28),
     background = Color3.fromRGB(31, 31, 36),
@@ -88,7 +74,7 @@ local PALETTE = {
     stroke = Color3.fromRGB(58, 58, 68),
     text = Color3.fromRGB(255, 255, 255),
     subtext = Color3.fromRGB(150, 150, 162),
-    accent = Color3.fromRGB(0, 255, 255),
+    accent = Color3.fromRGB(251, 149, 255),
 }
 Interface.palette = PALETTE
 
@@ -385,11 +371,6 @@ end
 
 -- Decode the embedded pack to a cache folder once, then load via getcustomasset.
 local CACHE_DIR = "NewReality/iconcache/"
-
--- CcodixHub brand mark, split in two halves so each can be tinted separately:
--- "logo_c" follows the accent colour, "logo_h" stays white. 128px, tiny.
-ICON_DATA["logo_c"] = "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"
-ICON_DATA["logo_h"] = "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADJElEQVR42u3dvWoUURiH8eedHTUERARFC9FGVFAQFASRCH7hV6WFvVdgI9h5DTZehKCF2Nhp5RUo2FoKNipElJ28FjkLYRHNkrMmmXl+sMXCcnJm5n/O2cnMvAuSJEmSJEmSJEmSJEmSJEmSJEmStp/o+wZmZrVtjIi0r3IG2GajP4CstK9yXiOr5uifpa9tXw982fgXwEmgA5oNNNmVffUaeJCZo4joavUzMxdK2weBlQ32dQzsAF4BD//V15Z+Ow4cq9jexzn1sylB3VexzSPr+VDfA/CjjKgao6oFfs6xr8ub0de+B6BZszObCu1E3/raoEEzAAZABkAGQAZABkAGQAZABkAGQAZABkAGQAZABkAGQP3TugtmEpk5AkaZWau9BEYGYHv4Ve6w7Sq3+z0zVwzA1jUZoUuZ+ay8z8rt79+MZzUMwGwP0BwC7vXpYR0DMJss039UngFis74HGIDZD1TraaAMgAyADIAMgAyADIAMgAyADIDwfgD6fy2gN8fCADDsawHtAEZsrXYC+AS8KUtnzbZb4C6wuOZvGYBK29etqfPXbLBO4LuIuD+n2oYXgcMGoK6vrF5nH02t4ZMqWrPu6J2Z2Zb2uloVPcvIb1wCKhZKLqVX7wIXgFvAZeDo1DaPy0FYb1m1jIhxrpb4rFkpdOx3gDmEAPgCvAReZuYu4CxwA7gOnJna/q6MxmZIp8ftAIpFNyUQP4F35fU4M08AV8rscB7Y+4fTvabvBbV7HYAyC3RTYYiIGEfER1Zr/z7NzAPAEnAbuMRqnd0/LRVpAHoQhhKIyVS/EhGfgefA88xcBM4BN4FrwGlgoa/7a7D/CIqISWHm6aViGXhbXo8y8xRwFbgDfDMAw1sq3gPvgSeZubt8vjMAw1squoj47gww8KWibz/G5OXggf8SlwHAG0JkAGQAZABkAGQAZABkAGQAZABkAIS3hOl/GJdXjV8Ph3Xetm4A2DKPnO2rdDwmbewxANvn8vIv4CGwm43feDp51OxDeb/intbWqEurvz7DUHs2zj7duyhJkiRJkiRJkiRJkiRJkiRJkiRJkiTpNwHk6nqwu6siAAAAAElFTkSuQmCC"
 local cacheReady = false
 local function ensureCache()
     if cacheReady then return cacheReady end
@@ -469,7 +450,11 @@ local function iconAsset(name)
         iconLogged = true
         local count = 0
         for _ in pairs(ICON_DATA) do count += 1 end
-        report("embedded icons: " .. count)
+        if count > 0 then
+            print("[NewReality] embedded icons: " .. count)
+        else
+            warn("[NewReality] no embedded icons present")
+        end
     end
     iconCache[name] = result
     return result or nil
@@ -493,58 +478,6 @@ local function makeIcon(parent, name, size, color)
     img.Parent = parent
     return img
 end
-
--- CcodixHub "CH" brand mark: the C half follows the accent colour (retinted live
--- with the theme), the H half stays white. Falls back to text when the image
--- assets cannot be materialised (no writefile/getcustomasset on the executor).
-local function makeBrandLogo(parent, height)
-    height = height or 24
-    local overlap = math.floor(height * 0.42)
-    local holder = Instance.new("Frame")
-    holder.Name = "BrandLogo"
-    holder.BackgroundTransparency = 1
-    holder.Size = UDim2.new(0, height * 2 - overlap, 0, height)
-    holder.Parent = parent
-    local cAsset, hAsset = iconAsset("logo_c"), iconAsset("logo_h")
-    if cAsset and hAsset then
-        local c = Instance.new("ImageLabel")
-        c.BackgroundTransparency = 1
-        c.Size = UDim2.new(0, height, 0, height)
-        c.Position = UDim2.new(0, 0, 0, 0)
-        c.Image = cAsset
-        c.ScaleType = Enum.ScaleType.Fit
-        themed(c, "ImageColor3", "accent")
-        c.Parent = holder
-        local hImg = Instance.new("ImageLabel")
-        hImg.BackgroundTransparency = 1
-        hImg.Size = UDim2.new(0, height, 0, height)
-        hImg.Position = UDim2.new(0, height - overlap, 0, 0)
-        hImg.Image = hAsset
-        hImg.ImageColor3 = Color3.new(1, 1, 1)
-        hImg.ScaleType = Enum.ScaleType.Fit
-        hImg.Parent = holder
-    else
-        local c = Instance.new("TextLabel")
-        c.BackgroundTransparency = 1
-        c.Size = UDim2.new(0, height, 0, height)
-        c.FontFace = FONT
-        c.TextSize = height
-        themed(c, "TextColor3", "accent")
-        c.Text = "C"
-        c.Parent = holder
-        local h2 = Instance.new("TextLabel")
-        h2.BackgroundTransparency = 1
-        h2.Size = UDim2.new(0, height, 0, height)
-        h2.Position = UDim2.new(0, height - overlap, 0, 0)
-        h2.FontFace = FONT
-        h2.TextSize = height
-        h2.TextColor3 = Color3.new(1, 1, 1)
-        h2.Text = "H"
-        h2.Parent = holder
-    end
-    return holder
-end
-Interface.makeBrandLogo = makeBrandLogo
 
 local function guiParent()
     if gethui then
@@ -573,42 +506,6 @@ end
 -- Gentle icon colour transition.
 local function tintIcon(img, color)
     tween(img, 0.22, { ImageColor3 = color })
-end
-
--- Keep a floating overlay panel glued to its anchor control while the page
--- scrolls or the window moves, and close it once the anchor scrolls out of
--- its column so no panel is ever left hanging in mid air.
-local function trackAnchor(panel, anchor, place)
-    local scroller = anchor:FindFirstAncestorWhichIsA("ScrollingFrame")
-    local conns = {}
-    local function stop()
-        for _, c in ipairs(conns) do
-            pcall(function() c:Disconnect() end)
-        end
-        table.clear(conns)
-    end
-    local function update()
-        if not (panel.Parent and anchor.Parent) then
-            stop()
-            return
-        end
-        if scroller then
-            local top = scroller.AbsolutePosition.Y
-            local bottom = top + scroller.AbsoluteSize.Y
-            local cy = anchor.AbsolutePosition.Y + anchor.AbsoluteSize.Y * 0.5
-            if cy < top - 2 or cy > bottom + 2 then
-                stop()
-                panel:Destroy()
-                return
-            end
-        end
-        place()
-    end
-    table.insert(conns, anchor:GetPropertyChangedSignal("AbsolutePosition"):Connect(update))
-    if scroller then
-        table.insert(conns, scroller:GetPropertyChangedSignal("CanvasPosition"):Connect(update))
-    end
-    panel.Destroying:Connect(stop)
 end
 
 local function makeDraggable(window, handle)
@@ -834,24 +731,18 @@ function Controls.toggle(parent, ctx, text, get, set, buildSettings)
             title.LayoutOrder = nextOrder(body)
             title.Parent = body
             buildSettings(Card.new(body, ctx))
-            -- Placement recomputed from the gear's live position so the popover
-            -- follows the row when the column scrolls or the window is dragged.
-            local function place()
-                if not (popover and popover.Parent) then return end
-                local px = gear.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 230
-                local py = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
-                local pAbove = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
-                local h = math.max(popover.AbsoluteSize.Y, 100)
-                popover.Position = ctx.fitPanel and ctx.fitPanel(px, py, 270, h, pAbove) or UDim2.new(0, px, 0, py)
-            end
-            place()
+            local px = gear.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 230
+            local py = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
+            local pAbove = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
+            popover.Position = ctx.fitPanel and ctx.fitPanel(px, py, 270, 220, pAbove) or UDim2.new(0, px, 0, py)
             -- Reposition once the popover has auto sized, using its real height, so a
             -- tall settings list near the screen bottom flips fully above and stays on screen.
             task.spawn(function()
                 RunService.RenderStepped:Wait()
-                place()
+                if popover and popover.Parent and ctx.fitPanel then
+                    popover.Position = ctx.fitPanel(px, py, 270, popover.AbsoluteSize.Y, pAbove)
+                end
             end)
-            trackAnchor(popover, gear, place)
             popover.GroupTransparency = 1
             tween(popover, 0.18, { GroupTransparency = 0 })
         end)
@@ -1269,22 +1160,14 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         panel.ZIndex = 60
         panel.Size = UDim2.new(0, 210, 0, 0)
         panel.AutomaticSize = Enum.AutomaticSize.Y
+        local dx = button.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 70
+        local dy = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 32
+        local dAbove = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
         -- Estimate the real list height so a short list is not wrongly flipped above
         -- just because of a large fixed guess. Search header + padding + rows.
         local estH = (opts.search and 38 or 0) + 12 + math.max(#getOptions(), 1) * 35
-        -- Placement recomputed from the button's live position so the list follows
-        -- the row when the column scrolls or the window is dragged.
-        local function place()
-            if not (panel and panel.Parent) then return end
-            local dx = button.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 70
-            local dy = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 32
-            local dAbove = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
-            local h = math.max(panel.AbsoluteSize.Y, estH)
-            panel.Position = ctx.fitPanel and ctx.fitPanel(dx, dy, 210, h, dAbove) or UDim2.new(0, dx, 0, dy)
-        end
-        place()
+        panel.Position = ctx.fitPanel and ctx.fitPanel(dx, dy, 210, estH, dAbove) or UDim2.new(0, dx, 0, dy)
         panel.Parent = ctx.overlay
-        place()
         corner(panel, 10)
         stroke(panel, PALETTE.stroke, 1, 0.2)
         -- Fade and slide in.
@@ -1296,8 +1179,9 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         -- list near the screen bottom flips above and stays fully on screen.
         task.spawn(function()
             RunService.RenderStepped:Wait()
-            place()
-            trackAnchor(panel, button, place)
+            if panel and panel.Parent and ctx.fitPanel then
+                panel.Position = ctx.fitPanel(dx, dy, 210, panel.AbsoluteSize.Y, dAbove)
+            end
         end)
         listLayout(panel, 0)
 
@@ -1472,18 +1356,11 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         panel.ZIndex = 60
         local panelH = useAlpha and 226 or 196
         panel.Size = UDim2.new(0, 232, 0, panelH)
-        -- Placement recomputed from the swatch's live position so the picker follows
-        -- the row when the column scrolls or the window is dragged.
-        local function place()
-            if not (panel and panel.Parent) then return end
-            local cx = swatch.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 190
-            local cy = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
-            local cAbove = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
-            panel.Position = ctx.fitPanel and ctx.fitPanel(cx, cy, 232, panelH, cAbove) or UDim2.new(0, cx, 0, cy)
-        end
+        local cx = swatch.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 190
+        local cy = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
+        local cAbove = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
+        panel.Position = ctx.fitPanel and ctx.fitPanel(cx, cy, 232, panelH, cAbove) or UDim2.new(0, cx, 0, cy)
         panel.Parent = ctx.overlay
-        place()
-        trackAnchor(panel, row, place)
         corner(panel, 10)
         stroke(panel, PALETTE.stroke, 1, 0.2)
         padding(panel, 12)
@@ -2231,26 +2108,7 @@ function Window:tab(opts)
 end
 
 function Window:toggle()
-    local w = self.window
-    local scale = self._scale
-    if w.Visible then
-        -- Shrink + fade out, then hide.
-        if self.closeOverlays then self.closeOverlays() end
-        if scale then
-            tween(scale, 0.14, { Scale = 0.94 }).Completed:Once(function()
-                w.Visible = false
-                scale.Scale = 1
-            end)
-        else
-            w.Visible = false
-        end
-    else
-        w.Visible = true
-        if scale then
-            scale.Scale = 0.94
-            tween(scale, 0.22, { Scale = 1 }, Enum.EasingStyle.Back)
-        end
-    end
+    self.window.Visible = not self.window.Visible
 end
 
 -- Recolour every part that follows this palette key, then refresh the dynamic
@@ -2354,7 +2212,7 @@ end
 
 function Window:saveConfig(name, silent)
     if type(name) ~= "string" or name == "" then return false end
-    if type(writefile) ~= "function" then report("executor has no writefile") return false end
+    if type(writefile) ~= "function" then warn("[NewReality] executor has no writefile") return false end
     -- Snapshot the current theme so colours are restored on load too.
     local theme = {}
     for key in pairs(DEFAULTS) do
@@ -2362,8 +2220,8 @@ function Window:saveConfig(name, silent)
         theme[key] = { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) }
     end
     local payload = { flags = self.flags, theme = theme }
-    -- Persist the dragged positions of detached parts (watermark, keybind list,
-    -- custom panels). The main window is excluded so it always opens centred.
+    -- Persist the dragged positions of detached parts (watermark, keybind list).
+    -- The main window is intentionally excluded so it always opens centred.
     local function serPos(frame)
         if frame and frame.Parent then
             local p = frame.Position
@@ -2371,13 +2229,7 @@ function Window:saveConfig(name, silent)
         end
         return nil
     end
-    local panels = {}
-    if self._panels then
-        for pname, frame in pairs(self._panels) do
-            panels[pname] = serPos(frame)
-        end
-    end
-    payload.overlays = { watermark = serPos(self._watermark), keybind = serPos(self._keybindPanel), panels = panels }
+    payload.overlays = { watermark = serPos(self._watermark), keybind = serPos(self._keybindPanel) }
     local ok, err = pcall(function()
         ensureConfigDir()
         writefile(configPath(name), HttpService:JSONEncode(payload))
@@ -2389,12 +2241,9 @@ function Window:saveConfig(name, silent)
         err = "file missing after write (executor blocked writefile?)"
     end
     if ok then
-        -- Auto save always follows the config touched last.
-        self._activeConfig = name
-        self:setAutoSave(name)
-        if not silent then report("saved config: " .. configPath(name)) end
+        if not silent then print("[NewReality] saved config: " .. configPath(name)) end
     else
-        report("saveConfig failed: " .. tostring(err))
+        warn("[NewReality] saveConfig failed: " .. tostring(err))
     end
     return ok
 end
@@ -2402,19 +2251,19 @@ end
 function Window:loadConfig(name)
     if type(name) ~= "string" or name == "" then return false end
     if type(readfile) ~= "function" or type(isfile) ~= "function" then
-        report("executor has no readfile/isfile")
+        warn("[NewReality] executor has no readfile/isfile")
         return false
     end
     local path = configPath(name)
     if not isfile(path) then
-        report("config '" .. name .. "' does not exist (" .. path .. ")")
+        warn("[NewReality] config '" .. name .. "' does not exist (" .. path .. ")")
         return false
     end
     local ok, data = pcall(function()
         return HttpService:JSONDecode(readfile(path))
     end)
     if not ok then
-        report("loadConfig failed: " .. tostring(data))
+        warn("[NewReality] loadConfig failed: " .. tostring(data))
         return false
     end
     if type(data) ~= "table" then return false end
@@ -2437,7 +2286,7 @@ function Window:loadConfig(name)
         end
     end
     -- Restore the saved positions of detached parts. Stored for later too, so a
-    -- watermark / keybind list / panel created after this load still picks them up.
+    -- watermark / keybind list created after this load still picks them up.
     if type(data.overlays) == "table" then
         self._overlayPos = data.overlays
         local function dePos(frame, t)
@@ -2447,16 +2296,8 @@ function Window:loadConfig(name)
         end
         dePos(self._watermark, data.overlays.watermark)
         dePos(self._keybindPanel, data.overlays.keybind)
-        if type(data.overlays.panels) == "table" and self._panels then
-            for pname, frame in pairs(self._panels) do
-                dePos(frame, data.overlays.panels[pname])
-            end
-        end
     end
     self:refreshAll()
-    -- Auto save follows the config that was just loaded.
-    self._activeConfig = name
-    self:setAutoSave(name)
     return true
 end
 
@@ -2482,14 +2323,9 @@ end
 
 function Window:deleteConfig(name)
     if type(name) ~= "string" or name == "" then return false end
-    if type(delfile) ~= "function" then report("executor has no delfile") return false end
+    if type(delfile) ~= "function" then warn("[NewReality] executor has no delfile") return false end
     local ok, err = pcall(function() delfile(configPath(name)) end)
-    if not ok then report("deleteConfig failed: " .. tostring(err)) end
-    -- Never keep auto-saving into a deleted config.
-    if ok and self._activeConfig == name then
-        self._activeConfig = "default"
-        self:setAutoSave("default")
-    end
+    if not ok then warn("[NewReality] deleteConfig failed: " .. tostring(err)) end
     return ok
 end
 
@@ -2615,17 +2451,11 @@ function Window:notify(opts)
         msg.Parent = toast
     end
 
-    -- Pop in: fade + small scale bounce.
-    local tScale = Instance.new("UIScale")
-    tScale.Scale = 0.9
-    tScale.Parent = toast
     tween(toast, 0.2, { GroupTransparency = 0 })
-    tween(tScale, 0.24, { Scale = 1 }, Enum.EasingStyle.Back)
     tween(st, 0.2, { Transparency = 0.3 })
     task.delay(opts.duration or 3, function()
         if toast and toast.Parent then
             tween(st, 0.25, { Transparency = 1 })
-            tween(tScale, 0.25, { Scale = 0.92 })
             tween(toast, 0.25, { GroupTransparency = 1 }).Completed:Once(function()
                 toast:Destroy()
             end)
@@ -2689,18 +2519,9 @@ function Window:watermark(opts)
     end
 
     if show.logo ~= false then
-        if opts.icon and opts.icon ~= "logo" and iconAsset(opts.icon) then
-            local ic = makeIcon(wm, opts.icon, UDim2.new(0, 24, 0, 24), Color3.fromRGB(255, 255, 255))
-            ic.ZIndex = 150
-            ic.LayoutOrder = nextO()
-        else
-            local logo = makeBrandLogo(wm, 22)
-            logo.ZIndex = 150
-            logo.LayoutOrder = nextO()
-            for _, d in ipairs(logo:GetChildren()) do
-                pcall(function() d.ZIndex = 150 end)
-            end
-        end
+        local ic = makeIcon(wm, opts.icon or "logo", UDim2.new(0, 24, 0, 24), Color3.fromRGB(255, 255, 255))
+        ic.ZIndex = 150
+        ic.LayoutOrder = nextO()
     end
     if show.brand ~= false then
         local brand = textSeg("NewReality")
@@ -2867,212 +2688,19 @@ function Window:keybindList(opts)
     return panel
 end
 
--- Custom floating HUD panel built by the library, so scripts don't have to
--- hand-roll their own ScreenGui HUDs. Styled like the watermark / keybind list.
--- opts: { name = "farm" (unique id, used to persist position), title, icon,
---         width = 220, position = UDim2, visible = true }
--- Returns a panel object:
---   panel:label(initialText) -> setter(text)   -- add an auto-height text row
---   panel:row(leftText, rightText) -> setter(right) -- label + value pair
---   panel:setTitle(text) / panel:show(bool) / panel:destroy()
---   panel.frame -- the raw Frame if a script needs it
-function Window:panel(opts)
-    opts = opts or {}
-    local name = tostring(opts.name or opts.title or ("panel" .. tostring(math.random(1e4, 9e4))))
-    self._panels = self._panels or {}
-    if self._panels[name] then
-        pcall(function() self._panels[name]:Destroy() end)
-        self._panels[name] = nil
-    end
-    local width = opts.width or 220
-
-    local frame = Instance.new("Frame")
-    frame.Name = "Panel_" .. name
-    frame.Size = UDim2.new(0, width, 0, 0)
-    frame.AutomaticSize = Enum.AutomaticSize.Y
-    frame.Position = opts.position or UDim2.new(0, 16, 0, 120)
-    themed(frame, "BackgroundColor3", "card")
-    frame.BorderSizePixel = 0
-    frame.ZIndex = 150
-    frame.Visible = opts.visible ~= false
-    frame.Parent = self.screen
-    corner(frame, 8)
-    stroke(frame, PALETTE.stroke, 1, 0.3)
-    self._panels[name] = frame
-    -- Pick up a saved position from the loaded config, matching keybindList.
-    if self._overlayPos and type(self._overlayPos.panels) == "table" then
-        local t = self._overlayPos.panels[name]
-        if type(t) == "table" and #t == 4 then
-            pcall(function() frame.Position = UDim2.new(t[1], t[2], t[3], t[4]) end)
-        end
-    end
-
-    local body = Instance.new("Frame")
-    body.BackgroundTransparency = 1
-    body.Size = UDim2.new(1, 0, 0, 0)
-    body.AutomaticSize = Enum.AutomaticSize.Y
-    body.ZIndex = 150
-    body.Parent = frame
-    listLayout(body, 4)
-    padding(body, 10)
-
-    local titleLabel
-    if opts.title ~= false then
-        local titleRow = Instance.new("Frame")
-        titleRow.Size = UDim2.new(1, 0, 0, 20)
-        titleRow.BackgroundTransparency = 1
-        titleRow.ZIndex = 150
-        titleRow.LayoutOrder = 0
-        titleRow.Parent = body
-        local textX = 0
-        if opts.icon then
-            local ic = makeIcon(titleRow, opts.icon, UDim2.new(0, 16, 0, 16), PALETTE.text)
-            ic.AnchorPoint = Vector2.new(0, 0.5)
-            ic.Position = UDim2.new(0, 0, 0.5, 0)
-            ic.ZIndex = 150
-            textX = 22
-        end
-        titleLabel = Instance.new("TextLabel")
-        titleLabel.BackgroundTransparency = 1
-        titleLabel.Position = UDim2.new(0, textX, 0, 0)
-        titleLabel.Size = UDim2.new(1, -textX, 1, 0)
-        titleLabel.FontFace = FONT
-        titleLabel.TextSize = 15
-        titleLabel.TextColor3 = PALETTE.text
-        titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-        titleLabel.Text = tostring(opts.title or "Panel")
-        titleLabel.ZIndex = 150
-        titleLabel.Parent = titleRow
-
-        local divider = Instance.new("Frame")
-        divider.Size = UDim2.new(1, 0, 0, 1)
-        divider.BackgroundColor3 = PALETTE.stroke
-        divider.BackgroundTransparency = 0.4
-        divider.BorderSizePixel = 0
-        divider.ZIndex = 150
-        divider.LayoutOrder = 1
-        divider.Parent = body
-    end
-
-    makeDraggable(frame, frame)
-    -- Fade in.
-    frame.BackgroundTransparency = 1
-    tween(frame, 0.2, { BackgroundTransparency = 0 })
-
-    local windowSelf = self
-    local panel = { frame = frame }
-    function panel:label(initial)
-        local lbl = Instance.new("TextLabel")
-        lbl.BackgroundTransparency = 1
-        lbl.Size = UDim2.new(1, 0, 0, 0)
-        lbl.AutomaticSize = Enum.AutomaticSize.Y
-        lbl.FontFace = FONT
-        lbl.TextSize = 13
-        lbl.TextColor3 = PALETTE.text
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.TextYAlignment = Enum.TextYAlignment.Top
-        lbl.TextWrapped = true
-        lbl.Text = tostring(initial or "")
-        lbl.ZIndex = 150
-        lbl.LayoutOrder = nextOrder(body)
-        lbl.Parent = body
-        return function(text)
-            lbl.Text = tostring(text)
-        end, lbl
-    end
-    function panel:row(leftText, rightText)
-        local r = Instance.new("Frame")
-        r.Size = UDim2.new(1, 0, 0, 18)
-        r.BackgroundTransparency = 1
-        r.ZIndex = 150
-        r.LayoutOrder = nextOrder(body)
-        r.Parent = body
-        local left = Instance.new("TextLabel")
-        left.BackgroundTransparency = 1
-        left.Size = UDim2.new(0.5, 0, 1, 0)
-        left.FontFace = FONT
-        left.TextSize = 13
-        left.TextColor3 = PALETTE.subtext
-        left.TextXAlignment = Enum.TextXAlignment.Left
-        left.TextTruncate = Enum.TextTruncate.AtEnd
-        left.Text = tostring(leftText or "")
-        left.ZIndex = 150
-        left.Parent = r
-        local right = Instance.new("TextLabel")
-        right.AnchorPoint = Vector2.new(1, 0)
-        right.Position = UDim2.new(1, 0, 0, 0)
-        right.BackgroundTransparency = 1
-        right.Size = UDim2.new(0.5, 0, 1, 0)
-        right.FontFace = FONT
-        right.TextSize = 13
-        right.TextColor3 = PALETTE.text
-        right.TextXAlignment = Enum.TextXAlignment.Right
-        right.TextTruncate = Enum.TextTruncate.AtEnd
-        right.Text = tostring(rightText or "")
-        right.ZIndex = 150
-        right.Parent = r
-        return function(text)
-            right.Text = tostring(text)
-        end, r
-    end
-    function panel:setTitle(text)
-        if titleLabel then titleLabel.Text = tostring(text) end
-    end
-    function panel:show(on)
-        frame.Visible = on ~= false
-    end
-    function panel:destroy()
-        if windowSelf._panels and windowSelf._panels[name] == frame then
-            windowSelf._panels[name] = nil
-        end
-        frame:Destroy()
-    end
-    return panel
-end
-
--- Random per-session GUI name + executor protection, so the interface can't be
--- located by a fixed name from other scripts or naive detections.
-local function randomName()
-    local s = ""
-    for _ = 1, math.random(10, 14) do
-        s = s .. string.char(math.random(97, 122))
-    end
-    return s
-end
-local function protectGui(gui)
-    pcall(function()
-        if syn and syn.protect_gui then syn.protect_gui(gui) end
-    end)
-    pcall(function()
-        if protectgui then protectgui(gui) end
-    end)
-end
-
 function Interface.new(opts)
     opts = opts or {}
-    local self = setmetatable({ tabs = {}, groups = {}, _refresh = {}, flags = {}, _binds = {}, _panels = {} }, Window)
-
-    local parent = guiParent()
-    -- Kill leftovers from a previous run of this library (tagged, any name).
-    pcall(function()
-        for _, g in ipairs(parent:GetChildren()) do
-            if g:IsA("ScreenGui") and g:GetAttribute("nrWin") then
-                g:Destroy()
-            end
-        end
-    end)
+    local self = setmetatable({ tabs = {}, groups = {}, _refresh = {}, flags = {}, _binds = {} }, Window)
 
     local screen = Instance.new("ScreenGui")
-    screen.Name = randomName()
-    screen:SetAttribute("nrWin", true)
+    screen.Name = "NewReality"
     screen.ResetOnSpawn = false
     screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screen.IgnoreGuiInset = true
     -- High DisplayOrder so the window, watermark and keybind list sit above any
     -- other GUI a script creates (ESP text billboards should use a lower order).
     pcall(function() screen.DisplayOrder = 100000 end)
-    protectGui(screen)
-    screen.Parent = parent
+    screen.Parent = guiParent()
     self.screen = screen
 
     local window = Instance.new("Frame")
@@ -3104,30 +2732,23 @@ function Interface.new(opts)
     brandRow.Position = UDim2.new(0, 16, 0, 16)
     brandRow.BackgroundTransparency = 1
     brandRow.Parent = sidebar
-    -- CcodixHub "CH" mark: C follows the accent, H stays white. A custom icon
-    -- name passed via opts.icon still renders as a single tinted image.
-    local textX = 0
-    if opts.icon and opts.icon ~= "logo" and iconAsset(opts.icon) then
+    local hasLogo = iconAsset(opts.icon or "logo") ~= nil
+    local logoName = opts.icon or "logo"
+    if hasLogo then
         local logo = Instance.new("ImageLabel")
         logo.BackgroundTransparency = 1
         logo.Size = UDim2.new(0, 40, 0, 40)
-        logo.Image = iconAsset(opts.icon) or ""
+        logo.Image = iconAsset(logoName) or ""
         logo.ImageColor3 = Color3.fromRGB(255, 255, 255)
         logo.ScaleType = Enum.ScaleType.Fit
         logo.AnchorPoint = Vector2.new(0, 0.5)
         logo.Position = UDim2.new(0, 0, 0.5, 0)
         logo.Parent = brandRow
-        textX = 50
-    else
-        local logo = makeBrandLogo(brandRow, 40)
-        logo.AnchorPoint = Vector2.new(0, 0.5)
-        logo.Position = UDim2.new(0, 0, 0.5, 0)
-        textX = logo.Size.X.Offset + 10
     end
     local brand = Instance.new("TextLabel")
     brand.BackgroundTransparency = 1
-    brand.Position = UDim2.new(0, textX, 0, 0)
-    brand.Size = UDim2.new(1, -textX, 1, 0)
+    brand.Position = UDim2.new(0, hasLogo and 50 or 0, 0, 0)
+    brand.Size = UDim2.new(1, hasLogo and -50 or 0, 1, 0)
     brand.FontFace = FONT
     brand.TextSize = 23
     brand.TextColor3 = PALETTE.text
@@ -3265,19 +2886,9 @@ function Interface.new(opts)
     local scale = Instance.new("UIScale")
     scale.Scale = 0.92
     scale.Parent = window
-    self._scale = scale
     window.BackgroundTransparency = 1
     tween(window, 0.25, { BackgroundTransparency = 0 })
     tween(scale, 0.32, { Scale = 1 }, Enum.EasingStyle.Back)
-
-    -- Auto save is always on: unless a script retargets it, every change lands in
-    -- the "default" config (or whichever config gets saved/loaded later).
-    task.defer(function()
-        if not self._autoSaveName then
-            self._activeConfig = self._activeConfig or "default"
-            self:setAutoSave(self._activeConfig)
-        end
-    end)
 
     return self
 end
@@ -3329,7 +2940,7 @@ function Interface.showcase()
         pick:dropdown("Single", { "Alpha", "Beta", "Gamma" }, function() return single end, function(v) single = v end, { search = true })
         local multi = { "Pink" }
         pick:dropdown("Multi", { "Red", "Green", "Blue", "Pink" }, function() return multi end, function(v) multi = v end, { multi = true, search = true })
-        local accent = { 0, 255, 255 }
+        local accent = { 251, 149, 255 }
         pick:colorpicker("Accent", function() return accent end, function(v) accent = v end)
 
         local conf = s:card({ title = "Config List", icon = "device-floppy", column = "right" })
