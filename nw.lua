@@ -1,13 +1,16 @@
 -- NewReality interface
--- Sidebar based UI kit: grouped sidebar tabs with icons, top sub-tabs, titled
--- cards in two columns, toggles with gear popovers, sliders, searchable
--- dropdowns, multi keybinds, colour pickers, live theming and saved configs.
+-- Sidebar based UI kit for the NW scripts: grouped sidebar tabs with icons, top
+-- sub-tabs, titled cards in two columns, toggles with gear popovers, sliders,
+-- searchable dropdowns, multi keybinds, colour pickers, live theming, saved
+-- configs and detached overlays (watermark, keybind panel, custom HUD).
 -- The icon pack is embedded as base64, so the library is self contained.
 --
+-- The full guide with every option lives in docs/interface-lib.md, this header
+-- is only the short reference.
+--
 -- LOADING
---   local UI = loadstring(game:HttpGet("<url>/interface.luau"))()
---   local win = UI.new({ icon = "logo", toggleKey = Enum.KeyCode.RightShift })
---   -- Set _G.NewRealityShowcase = false before loading to skip the demo window.
+--   local UI = loadstring(game:HttpGet("<url>/nw.lua"))()
+--   local win = UI.new({ toggleKey = Enum.KeyCode.RightShift })
 --
 -- LAYOUT: window -> tab -> sub -> card -> controls
 --   local tab  = win:tab({ name = "Main", icon = "eye", group = "Visuals", subtitle = "Players" })
@@ -30,6 +33,8 @@
 --   card:button(text, onClick)
 --   card:input(text, placeholder, get, set)
 --   card:segmented(text, options, get, set)         -- inline pills, no popover
+--   card:list(options, get, set)                    -- inline searchable list
+--   card:stepper(text, min, max, step, get, set)
 --   card:label(text)                                -- wraps to multiple lines
 --   card:divider()
 --
@@ -40,29 +45,48 @@
 --   end)
 --
 -- THEME: win:getColor(key) -> { r, g, b, a }; win:setColor(key, { r, g, b, a }); win:resetTheme()
---   keys: accent, background, sidebar, card, control, track, text, subtext, stroke
+--   keys: accent, background, sidebar, card, cardTop, control, controlHover,
+--   track, text, subtext, stroke
 --
 -- CONFIGS: win:saveConfig(name) / loadConfig(name) / listConfigs() / deleteConfig(name)
 --   win:setAutoLoad(name|nil) / getAutoLoad()       -- which config loads on launch
 --   win:setAutoSave(name|nil)                        -- auto persists that config a moment after any change
 --
--- EXTRAS: win:notify({ title, text, icon, duration }), win:watermark{...}, win:keybindList{...},
---   win:refreshAll() (re-sync every control from its flag), win:toggle() (show/hide the window).
+-- OVERLAYS (detached, draggable, positions saved with the config):
+--   win:watermark{...}      -- logo, brand, fps, time strip
+--   win:keybindList{...}    -- every registered keybind with its live state
+--   win:hud{...}            -- custom panel built from rows, bars and sections
+--   win:notify({ title, text, icon, duration })
+--
+-- MISC: win:refreshAll() (re-sync every control from its flag), win:toggle()
+--   (show/hide the window), win:unload() (remove everything the library made).
+--   UI.licence(fn [, seconds]) gates window creation on your own check.
 
+-- Services and the executor globals we rely on are captured once, at load time,
+-- before another script in the session can hook them. Everything below uses the
+-- captured copies, so a later hook on Instance.new or on a service cannot see or
+-- redirect what the library builds.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 
+local newInstance = Instance.new
+local envGet = getgenv
+local guiHidden = gethui
+local fileWrite, fileRead, fileExists, fileDelete = writefile, readfile, isfile, delfile
+local folderMake, folderExists, folderList = makefolder, isfolder, listfiles
+local customAsset = getcustomasset
+
 local LocalPlayer = Players.LocalPlayer
 
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.06.30.21"
+Interface.version = "2026.07.28.1"
 
--- Theme: our grey palette with the pink NewReality accent.
+-- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
     sidebar = Color3.fromRGB(24, 24, 28),
     background = Color3.fromRGB(31, 31, 36),
@@ -74,7 +98,7 @@ local PALETTE = {
     stroke = Color3.fromRGB(58, 58, 68),
     text = Color3.fromRGB(255, 255, 255),
     subtext = Color3.fromRGB(150, 150, 162),
-    accent = Color3.fromRGB(251, 149, 255),
+    accent = Color3.fromRGB(0, 255, 255),
 }
 Interface.palette = PALETTE
 
@@ -104,12 +128,29 @@ local function colorOf(rgb)
 end
 Interface.colorOf = colorOf
 
--- Theme tagging: any element tagged with themed(inst, prop, key) follows the
--- palette and can be recoloured live through Window:setColor(key, rgb).
+-- Theme tagging: any element passed to themed(inst, prop, key) follows the
+-- palette and is recoloured live by Window:setColor(key, rgb).
+--
+-- Tagged parts are held in a per key registry with weak keys instead of instance
+-- attributes. Recolouring then touches only the parts that use that key, with no
+-- descendant walk over the whole GUI, and nothing about the theme is readable
+-- from the instance tree by another script.
+local THEME_REG = {}
+for key in pairs(PALETTE) do
+    THEME_REG[key] = setmetatable({}, { __mode = "k" })
+end
+
 local function themed(instance, prop, key)
     instance[prop] = PALETTE[key]
-    instance:SetAttribute("nrK", key)
-    instance:SetAttribute("nrP", prop)
+    local reg = THEME_REG[key]
+    if reg then
+        local entry = reg[instance]
+        if entry then
+            entry[#entry + 1] = prop
+        else
+            reg[instance] = { prop }
+        end
+    end
     -- Carry the key's alpha onto the matching transparency property (only when
     -- the key is actually faded, so default parts keep their own transparency).
     local a = PALETTE_A[key]
@@ -118,6 +159,136 @@ local function themed(instance, prop, key)
         pcall(function() instance[tp] = 1 - a end)
     end
     return instance
+end
+
+-- Base transparency of a themed part, remembered the first time an alpha below 1
+-- fades it, so a return to full opacity restores the part's own value.
+local THEME_BASE = setmetatable({}, { __mode = "k" })
+
+-- Session guard ---------------------------------------------------------------
+-- The kit is paid and closed source, so the runtime makes a loaded copy harder
+-- to read and harder to touch from another script in the same session:
+--   * services and executor globals are captured above, before any foreign hook
+--   * every instance it builds gets a random name, nothing is findable by name
+--   * the ScreenGui goes into the executor's hidden container when there is one
+--   * that ScreenGui is watched, a foreign reparent is undone
+--   * the table the loader gets back is a locked proxy over the real module
+--   * an optional licence check gates window creation and keeps re-checking
+-- None of this makes a script unbreakable, it removes the easy ways in.
+local NAME_POOL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+local nameRandom = Random.new(math.floor(os.clock() * 1e6) % 2147483647)
+local function randomName(length)
+    length = length or 12
+    local out = table.create(length)
+    for i = 1, length do
+        local at = nameRandom:NextInteger(1, #NAME_POOL)
+        out[i] = string.sub(NAME_POOL, at, at)
+    end
+    return table.concat(out)
+end
+
+-- Licence gate. A loader can hand the library a validator before it builds a
+-- window: Interface.licence(function() return stillPaid end). While one is set
+-- it runs on window creation and again on a timer, and a window whose check
+-- stops passing unloads itself. Without a validator nothing is gated, so a
+-- local build still runs.
+local licenceFn, licencePeriod = nil, 60
+local function licenceOk()
+    if not licenceFn then return true end
+    local ok, allowed = pcall(licenceFn)
+    return ok and allowed ~= false
+end
+
+function Interface.licence(fn, period)
+    licenceFn = type(fn) == "function" and fn or nil
+    if type(period) == "number" and period >= 10 then licencePeriod = period end
+end
+
+-- Input hub -------------------------------------------------------------------
+-- One connection per input signal for the whole library. Controls register a
+-- listener instead of connecting on their own, so a window with a few hundred
+-- controls costs three connections instead of a few hundred that all wake up on
+-- every mouse move.
+local keyListeners = {}
+local activeDrag = nil
+
+local function isPointer(inputType)
+    return inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch
+end
+
+-- Register a key / mouse button listener: fn(input, gameProcessed).
+local function onKey(fn)
+    keyListeners[fn] = true
+    return function() keyListeners[fn] = nil end
+end
+
+-- Take over the pointer. handlers.move(x, y) runs while it moves, handlers.stop()
+-- when the button is released. Only one drag is ever active, which is all the
+-- pointer can do anyway, and it keeps the move signal down to one branch.
+local function beginDrag(handlers)
+    local previous = activeDrag
+    activeDrag = handlers
+    if previous and previous.stop then previous.stop() end
+end
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    for fn in pairs(keyListeners) do
+        local ok, err = pcall(fn, input, gpe)
+        if not ok then warn("[NewReality] input listener: " .. tostring(err)) end
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    local drag = activeDrag
+    if not drag then return end
+    local kind = input.UserInputType
+    if kind == Enum.UserInputType.MouseMovement or kind == Enum.UserInputType.Touch then
+        drag.move(input.Position.X, input.Position.Y)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    local drag = activeDrag
+    if drag and isPointer(input.UserInputType) then
+        activeDrag = nil
+        if drag.stop then drag.stop() end
+    end
+end)
+
+-- Frame driver ----------------------------------------------------------------
+-- Everything that shows a live value (watermark, keybind panel, HUD, the brand
+-- gradient) shares one RenderStepped connection and runs on its own interval, so
+-- a panel that only needs a few updates a second is not rebuilt every frame.
+local tickers = {}
+local tickerConn = nil
+local function addTicker(interval, fn)
+    local entry = { interval = interval or 0, acc = interval or 0, fn = fn }
+    tickers[entry] = true
+    if not tickerConn then
+        tickerConn = RunService.RenderStepped:Connect(function(dt)
+            for e in pairs(tickers) do
+                e.acc += dt
+                if e.acc >= e.interval then
+                    local step = e.acc
+                    e.acc = 0
+                    -- One bad callback (a HUD value that reads a missing
+                    -- object) must not take the whole driver down with it.
+                    local ok, err = pcall(e.fn, step)
+                    if not ok then
+                        tickers[e] = nil
+                        warn("[NewReality] timer stopped: " .. tostring(err))
+                    end
+                end
+            end
+        end)
+    end
+    return function() tickers[entry] = nil end
+end
+
+-- Viewport size, used to keep dragged panels and floating lists on screen.
+local function viewport()
+    local cam = workspace.CurrentCamera
+    return (cam and cam.ViewportSize) or Vector2.new(1920, 1080)
 end
 
 -- Element helpers
@@ -284,6 +455,8 @@ local ICON_DATA = {
     ["list"] = "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",
     ["lock"] = "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",
     ["logo"] = "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OiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmBjA5JUiCjQ5IUyOiQJAUyOiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmBjA5JUiCjQ5IUyOiQJAUyOiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmBjA5JUiCjQ5IUyOiQJAUyOiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmBjA5JUiCjQ5IUyOiQJAUyOiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmBjA5JUiCjQ5IUyOiQJAUyOiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmBjA5JUiCjQ5IUyOiQJAUyOiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmBjA5JUiCjQ5IUyOiQJAUyOiRJgYwOSVIgo0OSFMjokCQFMjokSYGMDklSIKNDkhTI6JAkBTI6JEmB/n/uKjCC6SGrrgAAAABJRU5ErkJggg==",
+    ["logo-c"] = "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",
+    ["logo-h"] = "iVBORw0KGgoAAAANSUhEUgAAAPAAAADwCAYAAAA+VemSAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAATjSURBVHhe7dktqJ91GMfhzbMx0TAUwajBoOJ0CgZtgsVm0qTNNzSKQRBBk4hBDItmFYyCxWA0GAzbEQRN8w0MgmEIm9+z/4MMPDD03vy9XRfcPGdnh3Pu7bk/LOwIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACM7eLFi49kXrp06dLzvUz2eTHzdD4+uq3Zrex567bzC1f+GVrPwTvNPLCtyazyks/khXcne/2Ux962Zrey4+nLC3cof4dvbmsyq7zk97b33ZXstZ9H9wFnz1O7jfuT3V7b1mRWAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTlIBrBExTAq4RME0JuEbANCXgGgHTVMcBn9tW7Fr2vHdbuTsCXkDHAX+bx42ZY5njnc5e9nwwzy4JeAEdB3zhIOLM/vbscc5lvt9W7k52E/Ds8pK7DJg6AS9AwPMS8AIEPC8BL0DA8xLwAgQ8LwEvQMDzEvACBDwvAS9AwPMS8AIEPC8BL0DA8xLwAgQ8LwEvQMDzEvACBDwvAS9AwPMS8AIEPC8BL0DA8xLwAgQ8LwEvQMDzEvACBDwvAS9AwPMS8AIEPC8BL0DA8xLwAgQ8LwEvQMDzEvACBDwvAS9AwPMS8AIEPC8BL0DA8xLwAgQ8LwEvoNeAs9fvmU8yH+WXH/c4B7tlPs/HXcpuAp5dXnKvAZ/dVuxaVr1zt3F/BLyAjgPez+OGbc1uZc/7dhv3R8ALyEt+f3vfXdkC3tvW7Fb2PLXbuD8CXkBe8tvb++6KgOsEvIC85Jvzrh/P893MN7tX3152EXBRdhPwSvLOj2ZO58W/mvki88flS2ggP1vARdlNwCvLAdyReTa3cPBfJud3Z/H/yM8TcFF2EzA7uYeTOYgnMh9kzu5O5PrJzxBwUXYTMP+U2ziW43g480bmy8yF3clcO/meAi7KbgLm6nIod2Wey3ya+XW7n5J8HwEXZTcB8+/kbm7LPJnjOZP57vIl/QcCrhMwJTmgE5lHM29lvsr8ud3WVeVrBVyU3QTMtZObujtH9Urms8xvuzM7XH5fwEXZTcBcHzmu2zNPZT7M/LDd3N/yOQEXZTcBc/3l1m7KsT2WeSfz9XZ8P+dxbPuSbmVPAcOVcngPZZ7JDR7fPtUtAcPABAwDEzAMTMAwMAHDwAQMAxMwDEzAMDABw8AEDAMTMAxMwDAwAcPABAwDEzAMTMAwMAHDwAQMAxMwDEzAMDABw8AEDAMTMAxMwDAwAcPABAwDEzAMTMAwMAHDwAQMAxMwDEzAMDABw8ASyf1bL93Jbq9vawKHSST3ZM5nftyevcwvmZe3NYHD5B+6vczJDueWBHxiWxMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGNaRI38BN9zxgfhFP18AAAAASUVORK5CYII=",
     ["macro"] = "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",
     ["magnet"] = "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",
     ["mail"] = "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",
@@ -369,14 +542,28 @@ local function base64Decode(data)
     return table.concat(out)
 end
 
--- Decode the embedded pack to a cache folder once, then load via getcustomasset.
+-- Decode the embedded pack to a cache folder, then load it via getcustomasset.
+-- A build stamp sits next to the cached PNGs: while it matches this build the
+-- files are reused as they are, so a session only decodes and writes an icon the
+-- first time that build sees it.
 local CACHE_DIR = "NewReality/iconcache/"
+local STAMP_PATH = CACHE_DIR .. "build.txt"
 local cacheReady = false
+local cacheFresh = false
 local function ensureCache()
     if cacheReady then return cacheReady end
     pcall(function()
-        if makefolder and isfolder and not isfolder("NewReality") then makefolder("NewReality") end
-        if makefolder and isfolder and not isfolder(CACHE_DIR) then makefolder(CACHE_DIR) end
+        if folderMake and folderExists then
+            if not folderExists("NewReality") then folderMake("NewReality") end
+            if not folderExists(CACHE_DIR) then folderMake(CACHE_DIR) end
+        end
+        if fileExists and fileRead and fileExists(STAMP_PATH) then
+            cacheFresh = fileRead(STAMP_PATH) == Interface.version
+        end
+        if not cacheFresh and fileWrite then
+            fileWrite(STAMP_PATH, Interface.version)
+            cacheFresh = true
+        end
         cacheReady = true
     end)
     return cacheReady
@@ -385,13 +572,17 @@ end
 local function embeddedAsset(name)
     local b64 = ICON_DATA[name]
     if not b64 then return nil end
-    if not (writefile and getcustomasset) then return nil end
+    if not (fileWrite and customAsset) then return nil end
     local path = CACHE_DIR .. name .. ".png"
     local ok, asset = pcall(function()
         ensureCache()
-        -- Always rewrite so updated embedded data is never masked by a stale file.
-        writefile(path, base64Decode(b64))
-        return getcustomasset(path)
+        -- Only decode when the cached file is missing or was written by an older
+        -- build, so updated embedded data is never masked by a stale file.
+        local cached = cacheFresh and fileExists and fileExists(path)
+        if not cached then
+            fileWrite(path, base64Decode(b64))
+        end
+        return customAsset(path)
     end)
     if ok then return asset end
     return nil
@@ -403,9 +594,9 @@ local function probeIconFolder()
     end
     iconFolder = false
     pcall(function()
-        if not isfile then return end
+        if not fileExists then return end
         for _, dir in ipairs(ICON_DIRS) do
-            if isfile(dir .. "settings.png") then
+            if fileExists(dir .. "settings.png") then
                 iconFolder = dir
                 return
             end
@@ -436,12 +627,12 @@ local function iconAsset(name)
         result = emb
     else
         pcall(function()
-            if not (isfile and getcustomasset) then return end
+            if not (fileExists and customAsset) then return end
             local dir = probeIconFolder()
             if dir then
                 local path = dir .. name .. ".png"
-                if isfile(path) then
-                    result = getcustomasset(path)
+                if fileExists(path) then
+                    result = customAsset(path)
                 end
             end
         end)
@@ -469,7 +660,7 @@ function Interface.setIconFolder(folder)
 end
 
 local function makeIcon(parent, name, size, color)
-    local img = Instance.new("ImageLabel")
+    local img = newInstance("ImageLabel")
     img.BackgroundTransparency = 1
     img.Size = size or UDim2.new(0, 18, 0, 18)
     img.Image = iconAsset(name) or ""
@@ -479,9 +670,60 @@ local function makeIcon(parent, name, size, color)
     return img
 end
 
-local function guiParent()
-    if gethui then
-        return gethui()
+-- The CcodixHub mark: one logo cut into two layers that sit exactly on top of
+-- each other. The C follows the accent colour, the H stays white, so a theme
+-- change repaints half the logo and nothing has to be re-exported.
+local function logoMark(parent, size, opts)
+    opts = opts or {}
+    local holder = newInstance("Frame")
+    holder.Name = randomName()
+    holder.BackgroundTransparency = 1
+    holder.Size = size or UDim2.new(0, 40, 0, 40)
+    holder.Parent = parent
+
+    local back = newInstance("ImageLabel")
+    back.Name = randomName()
+    back.BackgroundTransparency = 1
+    back.Size = UDim2.new(1, 0, 1, 0)
+    back.Image = iconAsset("logo-c") or ""
+    back.ScaleType = Enum.ScaleType.Fit
+    back.Parent = holder
+    themed(back, "ImageColor3", "accent")
+
+    local front = newInstance("ImageLabel")
+    front.Name = randomName()
+    front.BackgroundTransparency = 1
+    front.Size = UDim2.new(1, 0, 1, 0)
+    front.Image = iconAsset("logo-h") or ""
+    front.ImageColor3 = opts.letterColor or Color3.fromRGB(255, 255, 255)
+    front.ScaleType = Enum.ScaleType.Fit
+    front.ZIndex = (opts.zIndex or 1) + 1
+    front.Parent = holder
+
+    if opts.zIndex then
+        holder.ZIndex = opts.zIndex
+        back.ZIndex = opts.zIndex
+    end
+    -- The last return says whether the pack is missing both halves, the caller
+    -- then hides the holder instead of leaving a blank square.
+    return holder, back, front, (back.Image == "" and front.Image == "")
+end
+Interface.logo = logoMark
+
+-- Where the ScreenGui goes. The executor's hidden container is preferred: the
+-- GUI is then not listed under CoreGui, so nothing walking the tree finds it.
+local function guiParent(gui)
+    if gui then
+        pcall(function()
+            if syn and syn.protect_gui then syn.protect_gui(gui) end
+        end)
+        pcall(function()
+            if protectgui then protectgui(gui) end
+        end)
+    end
+    if guiHidden then
+        local ok, hidden = pcall(guiHidden)
+        if ok and hidden then return hidden end
     end
     local ok, coreGui = pcall(game.GetService, game, "CoreGui")
     if ok and coreGui then
@@ -490,14 +732,26 @@ local function guiParent()
     return LocalPlayer:WaitForChild("PlayerGui")
 end
 
+-- Layout order counter per container. Kept in a weak table instead of an
+-- instance attribute: it is one table lookup instead of two property calls per
+-- row, and the GUI tree carries no marks that describe the layout.
+local ORDER = setmetatable({}, { __mode = "k" })
 local function nextOrder(holder)
-    local n = (holder:GetAttribute("nrOrder") or 0) + 1
-    holder:SetAttribute("nrOrder", n)
+    local n = (ORDER[holder] or 0) + 1
+    ORDER[holder] = n
     return n
 end
 
+-- Motion presets. Quint out is the base curve for everything that moves or
+-- fades, Back for the parts that should settle with a small overshoot (toggle
+-- knob, window open, tab indicator).
+local EASE = Enum.EasingStyle.Quint
+local EASE_SOFT = Enum.EasingStyle.Sine
+local EASE_POP = Enum.EasingStyle.Back
+local OUT = Enum.EasingDirection.Out
+
 local function tween(instance, time, props, style, dir)
-    local info = TweenInfo.new(time, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out)
+    local info = TweenInfo.new(time, style or EASE, dir or OUT)
     local t = TweenService:Create(instance, info, props)
     t:Play()
     return t
@@ -505,40 +759,61 @@ end
 
 -- Gentle icon colour transition.
 local function tintIcon(img, color)
-    tween(img, 0.22, { ImageColor3 = color })
+    tween(img, 0.18, { ImageColor3 = color }, EASE_SOFT)
 end
 
-local function makeDraggable(window, handle)
+-- Hover helper: fades a part between two colours and returns the setter, so a
+-- control can force the resting colour after a click without re-reading state.
+local function hoverFill(part, base, hover, time)
+    part.MouseEnter:Connect(function() tween(part, time or 0.14, { BackgroundColor3 = hover() }, EASE_SOFT) end)
+    part.MouseLeave:Connect(function() tween(part, time or 0.18, { BackgroundColor3 = base() }, EASE_SOFT) end)
+end
+
+-- Press feedback: a short squash on mouse down, released on mouse up. Used by
+-- buttons and by the pill toggles.
+local function pressScale(button, amount)
+    local scale = newInstance("UIScale")
+    scale.Parent = button
+    button.MouseButton1Down:Connect(function() tween(scale, 0.08, { Scale = amount or 0.97 }, EASE_SOFT) end)
+    button.MouseButton1Up:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_POP) end)
+    button.MouseLeave:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_SOFT) end)
+    return scale
+end
+
+-- Drag a frame by a handle. The frame is kept on screen (a margin of it always
+-- stays inside the viewport) and onDrop fires once the pointer is released, so
+-- the overlays can persist their new position.
+local function makeDraggable(frame, handle, onDrop)
     handle.Active = true
-    local dragging, dragStart, startPos
     handle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = window.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            window.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
-        end
+        if not isPointer(input.UserInputType) then return end
+        local origin = input.Position
+        local startPos = frame.Position
+        local startAbs = frame.AbsolutePosition
+        local size = frame.AbsoluteSize
+        local view = viewport()
+        beginDrag({
+            move = function(x, y)
+                local wantX = startAbs.X + (x - origin.X)
+                local wantY = startAbs.Y + (y - origin.Y)
+                local keptX = math.clamp(wantX, 40 - size.X, view.X - 40)
+                local keptY = math.clamp(wantY, 0, view.Y - 28)
+                frame.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + (keptX - startAbs.X),
+                    startPos.Y.Scale, startPos.Y.Offset + (keptY - startAbs.Y)
+                )
+            end,
+            stop = function()
+                if onDrop then onDrop(frame) end
+            end,
+        })
     end)
 end
 
--- The NewReality brand text with the white to accent scrolling gradient.
+-- The NewReality brand text with the white to accent scrolling gradient. The
+-- sweep runs off the shared ticker and stops itself when the label is gone.
 local function animateBrand(label)
-    local gradient = Instance.new("UIGradient")
+    local gradient = newInstance("UIGradient")
     local function rebuild()
         gradient.Color = ColorSequence.new({
             ColorSequenceKeypoint.new(0, PALETTE.text),
@@ -548,16 +823,144 @@ local function animateBrand(label)
     end
     rebuild()
     gradient.Parent = label
-    task.spawn(function()
-        while label.Parent do
-            local elapsed = 0
-            while elapsed < 1 and label.Parent do
-                elapsed += RunService.RenderStepped:Wait()
-                gradient.Offset = Vector2.new(-1 + elapsed * 2, 0)
-            end
+    local phase, stop = 0, nil
+    stop = addTicker(0, function(dt)
+        if not label.Parent then
+            if stop then stop() end
+            return
         end
+        phase = (phase + dt * 0.55) % 1
+        gradient.Offset = Vector2.new(-1 + phase * 2, 0)
     end)
     return rebuild
+end
+
+-- Floating panels -------------------------------------------------------------
+-- Dropdown lists, colour pickers and gear popovers are not children of the
+-- control that opens them: they live in the window overlay so they always draw
+-- above the cards. That also means they have to be told where their control
+-- went, otherwise scrolling the column leaves the panel behind, floating over
+-- the wrong row.
+--
+-- openPanel glues a panel to its anchor. AbsolutePosition of the anchor changes
+-- on every scroll and every window move, the panel is placed again from it, and
+-- while the anchor is scrolled out of its column the panel hides with it.
+
+-- Nearest scrolling ancestor, so a panel knows which viewport it belongs to.
+local function scrollerOf(instance)
+    local node = instance.Parent
+    while node do
+        if node:IsA("ScrollingFrame") then return node end
+        if node:IsA("ScreenGui") then return nil end
+        node = node.Parent
+    end
+    return nil
+end
+
+-- cfg: anchor, width, height (first guess until auto size settles), gap,
+-- offsetX, radius, popover (stays open when a child panel opens), onClose.
+local function openPanel(ctx, cfg)
+    local stack = ctx._panels
+    local zBase = 50 + #stack * 10
+    local anchor = cfg.anchor
+    local width = cfg.width or 210
+    local gap = cfg.gap or 6
+
+    -- Click catcher under the panel: anything outside it closes this panel only,
+    -- so a dropdown opened inside a gear popover does not close the popover.
+    local backdrop = newInstance("TextButton")
+    backdrop.Name = randomName()
+    backdrop.Size = UDim2.new(1, 0, 1, 0)
+    backdrop.BackgroundTransparency = 1
+    backdrop.AutoButtonColor = false
+    backdrop.Text = ""
+    backdrop.ZIndex = zBase
+    backdrop.Parent = ctx.overlay
+
+    local panel = newInstance("CanvasGroup")
+    panel.Name = randomName()
+    panel.Size = UDim2.new(0, width, 0, cfg.height or 0)
+    panel.AutomaticSize = Enum.AutomaticSize.Y
+    panel.BackgroundColor3 = PALETTE.card
+    panel.BorderSizePixel = 0
+    panel.GroupTransparency = 1
+    panel.ZIndex = zBase + 1
+    panel.Parent = ctx.overlay
+    corner(panel, cfg.radius or 10)
+    -- A stroke is not composited by GroupTransparency, so it fades on its own.
+    local edge = stroke(panel, PALETTE.stroke, 1, 1)
+
+    local scroller = scrollerOf(anchor)
+    local controller, closed = nil, false
+
+    local function place()
+        if closed or not anchor.Parent then return end
+        local origin = ctx.window.AbsolutePosition
+        local at = anchor.AbsolutePosition
+        local size = anchor.AbsoluteSize
+        local height = panel.AbsoluteSize.Y
+        if height < 4 then height = cfg.height or 0 end
+        local x = at.X - origin.X + (cfg.offsetX or 0)
+        local below = at.Y - origin.Y + size.Y + gap
+        local above = at.Y - origin.Y - gap
+        panel.Position = ctx.fitPanel(x, below, width, height, above)
+    end
+
+    -- Hide while the control is scrolled past the top or bottom of its column,
+    -- the panel would otherwise float over the header or the next card.
+    local function clip()
+        if closed then return end
+        local show = true
+        if scroller then
+            local top = scroller.AbsolutePosition.Y
+            local bottom = top + scroller.AbsoluteSize.Y
+            local at = anchor.AbsolutePosition.Y
+            show = (at + anchor.AbsoluteSize.Y > top + 2) and (at < bottom - 2)
+        end
+        panel.Visible = show
+        backdrop.Visible = show
+    end
+
+    local conns = {
+        anchor:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+            place()
+            clip()
+        end),
+        -- Auto sized panels report their real height a frame later, and a search
+        -- filter changes it again, so follow the size instead of guessing once.
+        panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(place),
+    }
+
+    local function close()
+        if closed then return end
+        closed = true
+        for _, conn in ipairs(conns) do conn:Disconnect() end
+        for i = #stack, 1, -1 do
+            if stack[i] == controller then table.remove(stack, i) end
+        end
+        backdrop:Destroy()
+        if cfg.onClose then cfg.onClose() end
+        tween(edge, 0.12, { Transparency = 1 }, EASE_SOFT)
+        local out = tween(panel, 0.14, { GroupTransparency = 1 }, EASE_SOFT)
+        out.Completed:Once(function() panel:Destroy() end)
+    end
+
+    controller = { frame = panel, close = close, popover = cfg.popover == true }
+    stack[#stack + 1] = controller
+    backdrop.MouseButton1Click:Connect(close)
+
+    place()
+    clip()
+    -- Open: fade in with a small settle, position is owned by place() so the
+    -- panel can be moved by a scroll while it is still appearing.
+    local scale = newInstance("UIScale")
+    scale.Scale = 0.97
+    scale.Parent = panel
+    tween(panel, 0.16, { GroupTransparency = 0 })
+    tween(edge, 0.18, { Transparency = 0.2 }, EASE_SOFT)
+    tween(scale, 0.22, { Scale = 1 }, EASE_POP)
+
+    return panel, controller
 end
 
 -- Control builders. Each builds into a container (a card body or a popover body)
@@ -608,8 +1011,9 @@ local function makePill(row, ctx, get, set)
     corner(knob, 8)
 
     local function render(value)
-        tween(pill, 0.16, { BackgroundColor3 = value and PALETTE.accent or PALETTE.track })
-        tween(knob, 0.16, { Position = value and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8) }, Enum.EasingStyle.Back)
+        tween(pill, 0.2, { BackgroundColor3 = value and PALETTE.accent or PALETTE.track }, EASE_SOFT)
+        -- Back easing gives the knob a small settle at the end of the travel.
+        tween(knob, 0.28, { Position = value and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8) }, EASE_POP)
     end
     render(get())
     -- Re-apply on theme change or config load (move the knob too, not just colour).
@@ -618,6 +1022,13 @@ local function makePill(row, ctx, get, set)
             render(get())
         end)
     end
+    pill.MouseEnter:Connect(function()
+        if not get() then tween(pill, 0.14, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT) end
+    end)
+    pill.MouseLeave:Connect(function()
+        if not get() then tween(pill, 0.18, { BackgroundColor3 = PALETTE.track }, EASE_SOFT) end
+    end)
+    pressScale(pill, 0.94)
     pill.MouseButton1Click:Connect(function()
         local value = not get()
         set(value)
@@ -627,7 +1038,7 @@ local function makePill(row, ctx, get, set)
 end
 
 local function gearIcon(row)
-    local btn = Instance.new("TextButton")
+    local btn = newInstance("TextButton")
     btn.AnchorPoint = Vector2.new(1, 0.5)
     btn.Position = UDim2.new(1, -54, 0.5, 0)
     btn.Size = UDim2.new(0, 24, 0, 24)
@@ -658,9 +1069,15 @@ local function gearIcon(row)
         corner(hole, 4)
         hole.Parent = btn
     end
-    btn.MouseEnter:Connect(function() if img.Image ~= "" then tintIcon(img, PALETTE.accent) end end)
-    btn.MouseLeave:Connect(function() if img.Image ~= "" then tintIcon(img, PALETTE.text) end end)
-    return btn
+    btn.MouseEnter:Connect(function()
+        if img.Image ~= "" then tintIcon(img, PALETTE.accent) end
+        tween(img, 0.25, { Rotation = img.Rotation + 45 })
+    end)
+    btn.MouseLeave:Connect(function()
+        if img.Image ~= "" then tintIcon(img, PALETTE.text) end
+        tween(img, 0.3, { Rotation = 0 })
+    end)
+    return btn, img
 end
 
 local Controls = {}
@@ -692,35 +1109,39 @@ function Controls.toggle(parent, ctx, text, get, set, buildSettings)
     makePill(row, ctx, get, set)
 
     if buildSettings then
-        local gear = gearIcon(row)
-        local popover
+        local gear, gearImg = gearIcon(row)
+        local opened = nil
         gear.MouseButton1Click:Connect(function()
-            if popover and popover.Parent then
-                popover:Destroy()
-                popover = nil
+            -- Second click on the gear closes the popover it opened.
+            if opened then
+                opened.close()
                 return
             end
             if ctx.closeOverlays then ctx.closeOverlays() end
-            if ctx.showBackdrop then ctx.showBackdrop() end
-            popover = Instance.new("CanvasGroup")
-            popover.Name = "Popover"
-            popover.Size = UDim2.new(0, 270, 0, 0)
-            popover.AutomaticSize = Enum.AutomaticSize.Y
-            popover.BackgroundColor3 = PALETTE.card
-            popover.BorderSizePixel = 0
-            popover.ZIndex = 50
-            popover.Visible = true
-            popover.Parent = ctx.overlay
-            corner(popover, 8)
-            stroke(popover, PALETTE.stroke, 1, 0.2)
-            local body = Instance.new("Frame")
+            local panel, controller = openPanel(ctx, {
+                anchor = gear,
+                width = 270,
+                height = 220,
+                offsetX = -230,
+                popover = true,
+                radius = 10,
+                onClose = function()
+                    opened = nil
+                    tween(gearImg, 0.25, { Rotation = 0 })
+                end,
+            })
+            opened = controller
+
+            local body = newInstance("Frame")
+            body.Name = randomName()
             body.BackgroundTransparency = 1
             body.Size = UDim2.new(1, 0, 0, 0)
             body.AutomaticSize = Enum.AutomaticSize.Y
-            body.Parent = popover
+            body.Parent = panel
             listLayout(body, 8)
             padding(body, 12)
-            local title = Instance.new("TextLabel")
+
+            local title = newInstance("TextLabel")
             title.BackgroundTransparency = 1
             title.Size = UDim2.new(1, 0, 0, 18)
             title.FontFace = FONT
@@ -731,20 +1152,7 @@ function Controls.toggle(parent, ctx, text, get, set, buildSettings)
             title.LayoutOrder = nextOrder(body)
             title.Parent = body
             buildSettings(Card.new(body, ctx))
-            local px = gear.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 230
-            local py = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
-            local pAbove = gear.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
-            popover.Position = ctx.fitPanel and ctx.fitPanel(px, py, 270, 220, pAbove) or UDim2.new(0, px, 0, py)
-            -- Reposition once the popover has auto sized, using its real height, so a
-            -- tall settings list near the screen bottom flips fully above and stays on screen.
-            task.spawn(function()
-                RunService.RenderStepped:Wait()
-                if popover and popover.Parent and ctx.fitPanel then
-                    popover.Position = ctx.fitPanel(px, py, 270, popover.AbsoluteSize.Y, pAbove)
-                end
-            end)
-            popover.GroupTransparency = 1
-            tween(popover, 0.18, { GroupTransparency = 0 })
+            tween(gearImg, 0.25, { Rotation = 90 })
         end)
     end
     return row
@@ -752,7 +1160,7 @@ end
 
 function Controls.button(parent, ctx, text, onClick)
     local row = controlRow(parent, 34)
-    local button = Instance.new("TextButton")
+    local button = newInstance("TextButton")
     button.Size = UDim2.new(1, 0, 1, 0)
     themed(button, "BackgroundColor3", "control")
     button.BorderSizePixel = 0
@@ -763,16 +1171,8 @@ function Controls.button(parent, ctx, text, onClick)
     button.Text = text
     button.Parent = row
     corner(button, 6)
-    button.MouseEnter:Connect(function()
-        tween(button, 0.12, { BackgroundColor3 = PALETTE.controlHover })
-    end)
-    button.MouseLeave:Connect(function()
-        tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
-    end)
-    local scale = Instance.new("UIScale")
-    scale.Parent = button
-    button.MouseButton1Down:Connect(function() tween(scale, 0.08, { Scale = 0.97 }) end)
-    button.MouseButton1Up:Connect(function() tween(scale, 0.08, { Scale = 1 }) end)
+    hoverFill(button, function() return PALETTE.control end, function() return PALETTE.controlHover end)
+    pressScale(button, 0.97)
     button.MouseButton1Click:Connect(function()
         if onClick then onClick() end
     end)
@@ -800,7 +1200,17 @@ function Controls.input(parent, ctx, text, placeholder, get, set)
     box.Parent = row
     corner(box, 6)
     padding(box, nil, { left = 10, right = 10 })
+    -- The outline lights up in the accent while the box has focus, so it is clear
+    -- which field the keyboard is going to.
+    local edge = stroke(box, PALETTE.accent, 1, 1)
+    box.Focused:Connect(function()
+        edge.Color = PALETTE.accent
+        tween(edge, 0.16, { Transparency = 0.25 }, EASE_SOFT)
+        tween(box, 0.16, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT)
+    end)
     box.FocusLost:Connect(function()
+        tween(edge, 0.2, { Transparency = 1 }, EASE_SOFT)
+        tween(box, 0.2, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
         if set then set(box.Text) end
     end)
     if ctx and ctx._refresh then table.insert(ctx._refresh, function() box.Text = (get and tostring(get() or "")) or "" end) end
@@ -867,13 +1277,21 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
         end
         return math.floor(value + 0.5)
     end
-    local function render(value)
+    -- While dragging the fill follows the pointer with no easing, every other
+    -- change (typed value, config load, another script writing the flag) slides
+    -- into place so the bar never jumps.
+    local function render(value, instant)
         local ratio = (max > min) and math.clamp((value - min) / (max - min), 0, 1) or 0
-        fill.Size = UDim2.new(ratio, 0, 1, 0)
-        knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+        if instant then
+            fill.Size = UDim2.new(ratio, 0, 1, 0)
+            knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+        else
+            tween(fill, 0.2, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
+            tween(knob, 0.2, { Position = UDim2.new(ratio, 0, 0.5, 0) }, EASE_SOFT)
+        end
         valueBox.Text = format and format(value) or tostring(value)
     end
-    render(get())
+    render(get(), true)
 
     -- The value box accepts a typed number (clamped to range).
     valueBox.FocusLost:Connect(function()
@@ -892,23 +1310,28 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
         local ratio = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
         local value = clampValue(min + ratio * (max - min))
         set(value)
-        render(value)
+        render(value, true)
     end
+    -- The pointer is taken over by the shared drag controller, so the slider does
+    -- not keep its own connection on InputChanged.
     track.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            setFromX(input.Position.X)
-        end
+        if not isPointer(input.UserInputType) then return end
+        dragging = true
+        tween(knob, 0.12, { Size = UDim2.new(0, 16, 0, 16) }, EASE_POP)
+        setFromX(input.Position.X)
+        beginDrag({
+            move = setFromX,
+            stop = function()
+                dragging = false
+                tween(knob, 0.18, { Size = UDim2.new(0, 12, 0, 12) }, EASE_SOFT)
+            end,
+        })
     end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            setFromX(input.Position.X)
-        end
+    track.MouseEnter:Connect(function()
+        if not dragging then tween(knob, 0.14, { Size = UDim2.new(0, 14, 0, 14) }, EASE_SOFT) end
     end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
+    track.MouseLeave:Connect(function()
+        if not dragging then tween(knob, 0.18, { Size = UDim2.new(0, 12, 0, 12) }, EASE_SOFT) end
     end)
     if ctx and ctx._refresh then table.insert(ctx._refresh, function() render(get()) end) end
     return row
@@ -1019,7 +1442,9 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
         button.TextColor3 = PALETTE.text
         tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
     end)
-    UserInputService.InputBegan:Connect(function(input, gpe)
+    -- One shared InputBegan feeds every keybind, so a script with fifty binds
+    -- still has a single connection on the service.
+    local stopKeys = onKey(function(input, gpe)
         if capturing then
             local mn = mouseName(input.UserInputType)
             if input.UserInputType == Enum.UserInputType.Keyboard then
@@ -1071,6 +1496,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
             end
         end
     end)
+    if ctx and ctx._conns then table.insert(ctx._conns, stopKeys) end
     if ctx and ctx._refresh then table.insert(ctx._refresh, function() button.Text = display(); clearBtn.Visible = #keyList() > 0 end) end
     -- Register the bind so the keybind panel can list it.
     if ctx and ctx._binds and opts.list ~= false then
@@ -1145,51 +1571,42 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         end)
     end
 
-    local panel
+    -- Rows are 32 high with 3 of spacing, the body pads 6 top and bottom, and it
+    -- stops growing at seven rows and starts scrolling instead.
+    local ROW_STEP = 35
+    local MAX_ROWS = 7
+    local opened = nil
+
     button.MouseButton1Click:Connect(function()
-        if panel and panel.Parent then
-            panel:Destroy()
-            panel = nil
+        if opened then
+            opened.close()
             return
         end
+        -- Keep a gear popover open: a dropdown inside it is a child, not a rival.
         if ctx.closeOverlays then ctx.closeOverlays(true) end
-        if ctx.showBackdrop then ctx.showBackdrop() end
-        panel = Instance.new("CanvasGroup")
-        panel.BackgroundColor3 = PALETTE.card
-        panel.BorderSizePixel = 0
-        panel.ZIndex = 60
-        panel.Size = UDim2.new(0, 210, 0, 0)
-        panel.AutomaticSize = Enum.AutomaticSize.Y
-        local dx = button.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 70
-        local dy = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 32
-        local dAbove = button.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
-        -- Estimate the real list height so a short list is not wrongly flipped above
-        -- just because of a large fixed guess. Search header + padding + rows.
-        local estH = (opts.search and 38 or 0) + 12 + math.max(#getOptions(), 1) * 35
-        panel.Position = ctx.fitPanel and ctx.fitPanel(dx, dy, 210, estH, dAbove) or UDim2.new(0, dx, 0, dy)
-        panel.Parent = ctx.overlay
-        corner(panel, 10)
-        stroke(panel, PALETTE.stroke, 1, 0.2)
-        -- Fade and slide in.
-        panel.GroupTransparency = 1
-        local destY = panel.Position
-        panel.Position = destY - UDim2.new(0, 0, 0, 6)
-        tween(panel, 0.16, { GroupTransparency = 0, Position = destY })
-        -- Reposition once the list has auto sized, using its real height, so a long
-        -- list near the screen bottom flips above and stays fully on screen.
-        task.spawn(function()
-            RunService.RenderStepped:Wait()
-            if panel and panel.Parent and ctx.fitPanel then
-                panel.Position = ctx.fitPanel(dx, dy, 210, panel.AbsoluteSize.Y, dAbove)
-            end
-        end)
+
+        local list = getOptions()
+        local guess = math.clamp(#list, 1, MAX_ROWS) * ROW_STEP + 12 + (opts.search and 38 or 0)
+        local panel, controller = openPanel(ctx, {
+            anchor = button,
+            width = 210,
+            height = guess,
+            offsetX = -70,
+            onClose = function()
+                opened = nil
+                tween(arrow, 0.25, { Rotation = 0 })
+            end,
+        })
+        opened = controller
+        tween(arrow, 0.25, { Rotation = 180 })
         listLayout(panel, 0)
 
         -- Search as a flush header at the top of the panel (top corners follow
         -- the panel rounding via the CanvasGroup clip, bottom edge is square).
         local searchBox
         if opts.search then
-            local header = Instance.new("Frame")
+            local header = newInstance("Frame")
+            header.Name = randomName()
             header.Size = UDim2.new(1, 0, 0, 38)
             header.BackgroundColor3 = PALETTE.control
             header.BorderSizePixel = 0
@@ -1198,7 +1615,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             local sicon = makeIcon(header, "search", UDim2.new(0, 16, 0, 16), PALETTE.subtext)
             sicon.AnchorPoint = Vector2.new(0, 0.5)
             sicon.Position = UDim2.new(0, 12, 0.5, 0)
-            searchBox = Instance.new("TextBox")
+            searchBox = newInstance("TextBox")
             searchBox.BackgroundTransparency = 1
             searchBox.Position = UDim2.new(0, 36, 0, 0)
             searchBox.Size = UDim2.new(1, -46, 1, 0)
@@ -1213,25 +1630,49 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             searchBox.Parent = header
         end
 
-        local body = Instance.new("Frame")
+        -- The list scrolls on its own. A long list then stays inside the panel,
+        -- and the wheel over the list moves the list instead of the card column
+        -- underneath it.
+        local body = newInstance("ScrollingFrame")
+        body.Name = randomName()
         body.BackgroundTransparency = 1
+        body.BorderSizePixel = 0
         body.Size = UDim2.new(1, 0, 0, 0)
-        body.AutomaticSize = Enum.AutomaticSize.Y
+        body.CanvasSize = UDim2.new(0, 0, 0, 0)
+        body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        body.ScrollingDirection = Enum.ScrollingDirection.Y
+        body.ScrollBarThickness = 3
+        body.ScrollBarImageColor3 = PALETTE.subtext
+        body.ScrollBarImageTransparency = 0.4
         body.LayoutOrder = 1
         body.Parent = panel
         listLayout(body, 3)
         padding(body, 6)
 
         local optRows = {}
+        local function fitBody()
+            local shown = 0
+            for _, refs in pairs(optRows) do
+                if refs.btn.Visible then shown += 1 end
+            end
+            shown = math.clamp(shown, 1, MAX_ROWS)
+            body.Size = UDim2.new(1, 0, 0, shown * ROW_STEP + 12)
+        end
+
         local function paint(refs, opt)
             local on = (multi and selected[opt] and true) or ((not multi) and tostring(get()) == tostring(opt))
             refs.on = on
             refs.btn.BackgroundColor3 = PALETTE.controlHover
-            refs.btn.BackgroundTransparency = on and 0 or 1
-            refs.label.TextColor3 = on and PALETTE.accent or PALETTE.text
+            tween(refs.btn, 0.12, { BackgroundTransparency = on and 0 or 1 }, EASE_SOFT)
+            tween(refs.label, 0.12, { TextColor3 = on and PALETTE.accent or PALETTE.text }, EASE_SOFT)
+            if refs.tick then
+                tween(refs.tick, 0.14, { ImageTransparency = on and 0 or 1 }, EASE_SOFT)
+            end
         end
-        for _, opt in ipairs(getOptions()) do
-            local optBtn = Instance.new("TextButton")
+
+        for _, opt in ipairs(list) do
+            local optBtn = newInstance("TextButton")
+            optBtn.Name = randomName()
             optBtn.Size = UDim2.new(1, 0, 0, 32)
             optBtn.BackgroundColor3 = PALETTE.controlHover
             optBtn.BackgroundTransparency = 1
@@ -1242,10 +1683,10 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             optBtn.Parent = body
             corner(optBtn, 8)
 
-            local optLabel = Instance.new("TextLabel")
+            local optLabel = newInstance("TextLabel")
             optLabel.BackgroundTransparency = 1
             optLabel.Position = UDim2.new(0, 14, 0, 0)
-            optLabel.Size = UDim2.new(1, -24, 1, 0)
+            optLabel.Size = UDim2.new(1, -46, 1, 0)
             optLabel.FontFace = FONT
             optLabel.TextSize = 13
             optLabel.TextColor3 = PALETTE.text
@@ -1254,31 +1695,39 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             optLabel.Text = tostring(opt)
             optLabel.Parent = optBtn
 
-            local refs = { btn = optBtn, label = optLabel, on = false }
+            -- A tick on the right of a picked row, so a multi select reads at a
+            -- glance without counting highlighted rows.
+            local tick = makeIcon(optBtn, "check", UDim2.new(0, 16, 0, 16), PALETTE.accent)
+            tick.AnchorPoint = Vector2.new(1, 0.5)
+            tick.Position = UDim2.new(1, -12, 0.5, 0)
+            tick.ImageTransparency = 1
+            tick.Active = false
+
+            local refs = { btn = optBtn, label = optLabel, tick = tick.Image ~= "" and tick or nil, on = false }
             optRows[opt] = refs
             paint(refs, opt)
             optBtn.MouseEnter:Connect(function()
-                if not refs.on then tween(optBtn, 0.1, { BackgroundTransparency = 0.5, BackgroundColor3 = PALETTE.controlHover }) end
+                if not refs.on then tween(optBtn, 0.12, { BackgroundTransparency = 0.5 }, EASE_SOFT) end
             end)
             optBtn.MouseLeave:Connect(function()
-                if not refs.on then tween(optBtn, 0.1, { BackgroundTransparency = 1 }) end
+                if not refs.on then tween(optBtn, 0.14, { BackgroundTransparency = 1 }, EASE_SOFT) end
             end)
             optBtn.MouseButton1Click:Connect(function()
                 if multi then
                     selected[opt] = not selected[opt] or nil
                     paint(refs, opt)
-                    local list = {}
-                    for _, o in ipairs(getOptions()) do if selected[o] then table.insert(list, o) end end
-                    set(list)
+                    local picked = {}
+                    for _, o in ipairs(getOptions()) do if selected[o] then table.insert(picked, o) end end
+                    set(picked)
                     button.Text = labelText()
                 else
                     set(opt)
                     button.Text = tostring(opt)
-                    panel:Destroy()
-                    panel = nil
+                    if opened then opened.close() end
                 end
             end)
         end
+        fitBody()
 
         if searchBox then
             searchBox:GetPropertyChangedSignal("Text"):Connect(function()
@@ -1286,6 +1735,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
                 for opt, refs in pairs(optRows) do
                     refs.btn.Visible = q == "" or tostring(opt):lower():find(q, 1, true) ~= nil
                 end
+                fitBody()
             end)
         end
     end)
@@ -1344,25 +1794,28 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     corner(swatch, 9)
     stroke(swatch, PALETTE.stroke, 1, 0.2)
 
-    local panel
+    local opened = nil
     local h, s, v = colorOf(getRgb()):ToHSV()
     local function openPicker()
-        if panel and panel.Parent then panel:Destroy() panel = nil return end
+        -- Second click on the palette icon closes the picker it opened.
+        if opened then
+            opened.close()
+            return
+        end
         if ctx.closeOverlays then ctx.closeOverlays(true) end
-        if ctx.showBackdrop then ctx.showBackdrop() end
-        panel = Instance.new("Frame")
-        panel.BackgroundColor3 = PALETTE.card
-        panel.BorderSizePixel = 0
-        panel.ZIndex = 60
         local panelH = useAlpha and 226 or 196
+        local panel, controller = openPanel(ctx, {
+            anchor = swatch,
+            width = 232,
+            height = panelH,
+            offsetX = -190,
+            onClose = function() opened = nil end,
+        })
+        opened = controller
+        -- The picker is a fixed layout, so it does not grow with its content the
+        -- way a dropdown list does.
+        panel.AutomaticSize = Enum.AutomaticSize.None
         panel.Size = UDim2.new(0, 232, 0, panelH)
-        local cx = swatch.AbsolutePosition.X - ctx.window.AbsolutePosition.X - 190
-        local cy = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y + 26
-        local cAbove = swatch.AbsolutePosition.Y - ctx.window.AbsolutePosition.Y - 6
-        panel.Position = ctx.fitPanel and ctx.fitPanel(cx, cy, 232, panelH, cAbove) or UDim2.new(0, cx, 0, cy)
-        panel.Parent = ctx.overlay
-        corner(panel, 10)
-        stroke(panel, PALETTE.stroke, 1, 0.2)
         padding(panel, 12)
 
         local sv = Instance.new("ImageButton")
@@ -1480,7 +1933,6 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             end
             setRgb(rgb)
         end
-        local dragSV, dragHue, dragAlpha = false, false, false
         local function updSV(x, y)
             s = math.clamp((x - sv.AbsolutePosition.X) / math.max(sv.AbsoluteSize.X, 1), 0, 1)
             v = 1 - math.clamp((y - sv.AbsolutePosition.Y) / math.max(sv.AbsoluteSize.Y, 1), 0, 1)
@@ -1494,21 +1946,30 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             alpha = math.clamp((x - alphaBar.AbsolutePosition.X) / math.max(alphaBar.AbsoluteSize.X, 1), 0, 1)
             apply()
         end
-        sv.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragSV = true updSV(i.Position.X, i.Position.Y) end end)
-        hue.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragHue = true updHue(i.Position.Y) end end)
+        -- Each field hands the pointer to the shared drag controller for as long
+        -- as the button is held, so the picker adds no permanent input listeners
+        -- and a drag that leaves the panel still tracks.
+        sv.InputBegan:Connect(function(i)
+            if not isPointer(i.UserInputType) then return end
+            updSV(i.Position.X, i.Position.Y)
+            tween(svCursor, 0.12, { Size = UDim2.new(0, 13, 0, 13) }, EASE_POP)
+            beginDrag({
+                move = updSV,
+                stop = function() tween(svCursor, 0.16, { Size = UDim2.new(0, 10, 0, 10) }, EASE_SOFT) end,
+            })
+        end)
+        hue.InputBegan:Connect(function(i)
+            if not isPointer(i.UserInputType) then return end
+            updHue(i.Position.Y)
+            beginDrag({ move = function(_, y) updHue(y) end })
+        end)
         if useAlpha then
-            alphaBar.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragAlpha = true updAlpha(i.Position.X) end end)
+            alphaBar.InputBegan:Connect(function(i)
+                if not isPointer(i.UserInputType) then return end
+                updAlpha(i.Position.X)
+                beginDrag({ move = function(x) updAlpha(x) end })
+            end)
         end
-        UserInputService.InputChanged:Connect(function(i)
-            if i.UserInputType == Enum.UserInputType.MouseMovement then
-                if dragSV then updSV(i.Position.X, i.Position.Y)
-                elseif dragHue then updHue(i.Position.Y)
-                elseif dragAlpha then updAlpha(i.Position.X) end
-            end
-        end)
-        UserInputService.InputEnded:Connect(function(i)
-            if i.UserInputType == Enum.UserInputType.MouseButton1 then dragSV = false dragHue = false dragAlpha = false end
-        end)
 
         hexBox = Instance.new("TextBox")
         hexBox.AnchorPoint = Vector2.new(0, 1)
@@ -2107,16 +2568,46 @@ function Window:tab(opts)
     return tabObj
 end
 
-function Window:toggle()
-    self.window.Visible = not self.window.Visible
+-- Show or hide the window. Opening settles it up from just under full size,
+-- closing shrinks it away first instead of blinking out.
+function Window:toggle(show)
+    local window = self.window
+    if show == nil then show = not window.Visible end
+    show = show and true or false
+    if show == self._open then return end
+    self._open = show
+    if self.closeOverlays then self.closeOverlays() end
+
+    local scale = self._scale
+    if show then
+        window.Visible = true
+        if scale then
+            scale.Scale = 0.94
+            tween(scale, 0.32, { Scale = 1 }, EASE_POP)
+        end
+        tween(window, 0.18, { BackgroundTransparency = 0 }, EASE_SOFT)
+    else
+        tween(window, 0.16, { BackgroundTransparency = 1 }, EASE_SOFT)
+        local out = scale and tween(scale, 0.16, { Scale = 0.94 }, EASE_SOFT)
+        if out then
+            out.Completed:Once(function()
+                if not self._open then window.Visible = false end
+            end)
+        else
+            window.Visible = false
+        end
+    end
 end
 
 -- Recolour every part that follows this palette key, then refresh the dynamic
 -- controls (toggles, segmented, lists) that pick colours at runtime.
 --
--- Only parts tagged with themed(inst, prop, key) follow the palette, matched by
--- their nrK key, so changing one colour never bleeds onto unrelated elements.
+-- Only parts passed to themed(inst, prop, key) follow the palette, and they are
+-- read from that key's registry, so one colour never bleeds onto unrelated
+-- elements and no walk over the GUI tree is needed.
 function Window:setColor(key, rgb)
+    local reg = THEME_REG[key]
+    if not reg then return end
     local new = (typeof(rgb) == "Color3") and rgb or colorOf(rgb)
     local alpha = (type(rgb) == "table" and rgb[4]) or PALETTE_A[key] or 1
     PALETTE[key] = new
@@ -2125,31 +2616,32 @@ function Window:setColor(key, rgb)
     -- Map the key's alpha onto a part's transparency. The part's own original
     -- transparency is remembered once so a return to full opacity restores it,
     -- and parts that are fully hidden stay hidden.
-    local function applyAlpha(d, prop)
+    local function applyAlpha(inst, prop)
         local tp = TRANS_OF[prop]
         if not tp then return end
-        local ok, cur = pcall(function() return d[tp] end)
-        if not ok or type(cur) ~= "number" then return end
-        local attr = "nrT_" .. tp
-        local base = d:GetAttribute(attr)
+        local bases = THEME_BASE[inst]
+        local base = bases and bases[tp]
         if alpha < 1 then
             if base == nil then
+                local ok, cur = pcall(function() return inst[tp] end)
+                if not ok or type(cur) ~= "number" then return end
                 base = cur
-                if base < 1 then d:SetAttribute(attr, base) end
+                bases = bases or {}
+                bases[tp] = base
+                THEME_BASE[inst] = bases
             end
             if base >= 1 then return end
-            pcall(function() d[tp] = 1 - alpha end)
+            pcall(function() inst[tp] = 1 - alpha end)
         elseif base ~= nil then
-            pcall(function() d[tp] = base end)
-            d:SetAttribute(attr, nil)
+            pcall(function() inst[tp] = base end)
+            bases[tp] = nil
         end
     end
 
-    for _, d in ipairs(self.screen:GetDescendants()) do
-        if d:GetAttribute("nrK") == key then
-            local prop = d:GetAttribute("nrP")
-            pcall(function() d[prop] = new end)
-            applyAlpha(d, prop)
+    for inst, props in pairs(reg) do
+        for _, prop in ipairs(props) do
+            pcall(function() inst[prop] = new end)
+            applyAlpha(inst, prop)
         end
     end
     if self._refresh then
@@ -2220,16 +2712,17 @@ function Window:saveConfig(name, silent)
         theme[key] = { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) }
     end
     local payload = { flags = self.flags, theme = theme }
-    -- Persist the dragged positions of detached parts (watermark, keybind list).
-    -- The main window is intentionally excluded so it always opens centred.
-    local function serPos(frame)
+    -- Persist the dragged position of every detached part (watermark, keybind
+    -- list, each HUD by its id). The main window is left out on purpose so it
+    -- always opens centred.
+    local overlays = {}
+    for key, frame in pairs(self._overlays) do
         if frame and frame.Parent then
             local p = frame.Position
-            return { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset }
+            overlays[key] = { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset }
         end
-        return nil
     end
-    payload.overlays = { watermark = serPos(self._watermark), keybind = serPos(self._keybindPanel) }
+    payload.overlays = overlays
     local ok, err = pcall(function()
         ensureConfigDir()
         writefile(configPath(name), HttpService:JSONEncode(payload))
@@ -2270,32 +2763,24 @@ function Window:loadConfig(name)
     -- New format is { flags = , theme = }; old format was just the flags table.
     local flags = (type(data.flags) == "table") and data.flags or data
     for k, v in pairs(flags) do self.flags[k] = v end
-    -- Restore the saved theme colours by re-tagging every themed element.
+    -- Restore the saved theme colours through the themed registry.
     if type(data.theme) == "table" then
         for key, rgb in pairs(data.theme) do
             if DEFAULTS[key] and type(rgb) == "table" then
-                PALETTE[key] = colorOf(rgb)
-            end
-        end
-        for _, d in ipairs(self.screen:GetDescendants()) do
-            local k = d:GetAttribute("nrK")
-            if k and PALETTE[k] then
-                local prop = d:GetAttribute("nrP")
-                pcall(function() d[prop] = PALETTE[k] end)
+                self:setColor(key, rgb)
             end
         end
     end
-    -- Restore the saved positions of detached parts. Stored for later too, so a
-    -- watermark / keybind list created after this load still picks them up.
+    -- Restore the saved positions of detached parts. Kept for later too, so an
+    -- overlay created after this load still picks its spot up.
     if type(data.overlays) == "table" then
         self._overlayPos = data.overlays
-        local function dePos(frame, t)
+        for name, t in pairs(data.overlays) do
+            local frame = self._overlays[name]
             if frame and frame.Parent and type(t) == "table" and #t == 4 then
                 pcall(function() frame.Position = UDim2.new(t[1], t[2], t[3], t[4]) end)
             end
         end
-        dePos(self._watermark, data.overlays.watermark)
-        dePos(self._keybindPanel, data.overlays.keybind)
     end
     self:refreshAll()
     return true
@@ -2361,17 +2846,16 @@ end
 -- nil to stop. Combined with setAutoLoad, settings survive between sessions.
 function Window:setAutoSave(name)
     self._autoSaveName = (type(name) == "string" and name ~= "") and name or nil
-    if self._autoSaveName and not self._autoSaveConn then
-        local acc = 0
-        self._autoSaveConn = RunService.Heartbeat:Connect(function(dt)
-            acc = acc + dt
-            if acc < 2 then return end
-            acc = 0
+    if self._autoSaveName and not self._autoSaveStop then
+        -- Runs on the shared ticker, two seconds apart, and only writes when a
+        -- control actually changed something.
+        self._autoSaveStop = addTicker(2, function()
             if self._dirty and self._autoSaveName then
                 self._dirty = false
                 self:saveConfig(self._autoSaveName, true)
             end
         end)
+        table.insert(self._conns, self._autoSaveStop)
     end
 end
 
@@ -2464,46 +2948,122 @@ function Window:notify(opts)
     return toast
 end
 
+-- Detached overlays -----------------------------------------------------------
+-- The watermark, the keybind panel and custom HUDs are the same shell: a small
+-- themed card that lives on the screen instead of inside the window, can be
+-- dragged anywhere and has its position saved with the config under its name.
+local OVERLAY_Z = 150
+
+local function overlayShell(self, name, opts)
+    local frame = newInstance("Frame")
+    frame.Name = randomName()
+    frame.Size = opts.size or UDim2.new(0, 0, 0, 34)
+    frame.AutomaticSize = opts.autoSize or Enum.AutomaticSize.X
+    frame.Position = opts.position or UDim2.new(0, 16, 0, 16)
+    themed(frame, "BackgroundColor3", "card")
+    frame.BorderSizePixel = 0
+    frame.ZIndex = OVERLAY_Z
+    frame.Parent = self.screen
+    corner(frame, opts.radius or 8)
+    stroke(frame, PALETTE.stroke, 1, 0.3)
+
+    -- A position saved in the config wins over the default one.
+    local saved = self._overlayPos and self._overlayPos[name]
+    if type(saved) == "table" and #saved == 4 then
+        frame.Position = UDim2.new(saved[1], saved[2], saved[3], saved[4])
+    end
+    self._overlays[name] = frame
+    -- Dropping it marks the config dirty, so auto save keeps the new spot.
+    makeDraggable(frame, frame, function() self._dirty = true end)
+
+    local scale = newInstance("UIScale")
+    scale.Scale = 0.94
+    scale.Parent = frame
+    tween(scale, 0.3, { Scale = 1 }, EASE_POP)
+    return frame
+end
+
+-- Title row shared by the keybind panel and the HUDs: optional logo or icon,
+-- the title itself and a divider under it.
+local function overlayHeader(body, cfg)
+    local row = newInstance("Frame")
+    row.Name = randomName()
+    row.Size = UDim2.new(1, 0, 0, 20)
+    row.BackgroundTransparency = 1
+    row.ZIndex = OVERLAY_Z
+    row.LayoutOrder = nextOrder(body)
+    row.Parent = body
+
+    local textX = 0
+    if cfg.logo then
+        local mark, _, _, empty = logoMark(row, UDim2.new(0, 18, 0, 18), { zIndex = OVERLAY_Z })
+        if empty then
+            mark:Destroy()
+        else
+            mark.AnchorPoint = Vector2.new(0, 0.5)
+            mark.Position = UDim2.new(0, 0, 0.5, 0)
+            textX = 24
+        end
+    elseif cfg.icon then
+        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 16, 0, 16), PALETTE.text)
+        ic.AnchorPoint = Vector2.new(0, 0.5)
+        ic.Position = UDim2.new(0, 0, 0.5, 0)
+        ic.ZIndex = OVERLAY_Z
+        if ic.Image ~= "" then textX = 22 else ic:Destroy() end
+    end
+
+    local title = newInstance("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, textX, 0, 0)
+    title.Size = UDim2.new(1, -textX, 1, 0)
+    title.FontFace = FONT
+    title.TextSize = 15
+    title.TextColor3 = PALETTE.text
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = cfg.title or ""
+    title.ZIndex = OVERLAY_Z
+    title.Parent = row
+
+    local divider = newInstance("Frame")
+    divider.Size = UDim2.new(1, 0, 0, 1)
+    divider.BackgroundColor3 = PALETTE.stroke
+    divider.BackgroundTransparency = 0.4
+    divider.BorderSizePixel = 0
+    divider.ZIndex = OVERLAY_Z
+    divider.LayoutOrder = nextOrder(body)
+    divider.Parent = body
+    return title
+end
+
 -- Draggable watermark: logo + animated NewReality brand | FPS | time.
--- opts: { position=UDim2, show = { logo=, brand=, fps=, time= } }
+-- opts: { position = UDim2, brand = "text", show = { logo=, brand=, fps=, time= } }
 function Window:watermark(opts)
     opts = opts or {}
     local show = opts.show or {}
     if self._watermark then self._watermark:Destroy() end
 
-    local wm = Instance.new("Frame")
-    wm.Name = "Watermark"
-    wm.AutomaticSize = Enum.AutomaticSize.X
-    wm.Size = UDim2.new(0, 0, 0, 34)
-    wm.Position = opts.position or UDim2.new(0, 16, 0, 16)
-    wm.BackgroundColor3 = PALETTE.card
-    wm.BorderSizePixel = 0
-    wm.ZIndex = 150
-    wm.Parent = self.screen
-    corner(wm, 8)
-    stroke(wm, PALETTE.stroke, 1, 0.3)
+    local wm = overlayShell(self, "watermark", {
+        position = opts.position or UDim2.new(0, 16, 0, 16),
+        size = UDim2.new(0, 0, 0, 34),
+    })
     padding(wm, nil, { left = 12, right = 12 })
     local lay = listLayout(wm, 9, Enum.FillDirection.Horizontal)
     lay.VerticalAlignment = Enum.VerticalAlignment.Center
     self._watermark = wm
-    if self._overlayPos and type(self._overlayPos.watermark) == "table" and #self._overlayPos.watermark == 4 then
-        local t = self._overlayPos.watermark
-        wm.Position = UDim2.new(t[1], t[2], t[3], t[4])
-    end
 
     local order = 0
     local function nextO() order = order + 1 return order end
     local function sep()
-        local f = Instance.new("Frame")
+        local f = newInstance("Frame")
         f.Size = UDim2.new(0, 1, 0, 16)
         f.BackgroundColor3 = PALETTE.stroke
         f.BorderSizePixel = 0
-        f.ZIndex = 150
+        f.ZIndex = OVERLAY_Z
         f.LayoutOrder = nextO()
         f.Parent = wm
     end
     local function textSeg(initial)
-        local t = Instance.new("TextLabel")
+        local t = newInstance("TextLabel")
         t.AutomaticSize = Enum.AutomaticSize.X
         t.Size = UDim2.new(0, 0, 1, 0)
         t.BackgroundTransparency = 1
@@ -2512,22 +3072,21 @@ function Window:watermark(opts)
         t.TextColor3 = PALETTE.text
         t.TextYAlignment = Enum.TextYAlignment.Center
         t.Text = initial
-        t.ZIndex = 150
+        t.ZIndex = OVERLAY_Z
         t.LayoutOrder = nextO()
         t.Parent = wm
         return t
     end
 
     if show.logo ~= false then
-        local ic = makeIcon(wm, opts.icon or "logo", UDim2.new(0, 24, 0, 24), Color3.fromRGB(255, 255, 255))
-        ic.ZIndex = 150
-        ic.LayoutOrder = nextO()
+        local mark, _, _, empty = logoMark(wm, UDim2.new(0, 24, 0, 24), { zIndex = OVERLAY_Z })
+        mark.LayoutOrder = nextO()
+        if empty then mark:Destroy() end
     end
     if show.brand ~= false then
-        local brand = textSeg("NewReality")
+        local brand = textSeg(opts.brand or "NewReality")
         brand.TextSize = 15
-        local rb = animateBrand(brand)
-        table.insert(self._refresh, rb)
+        table.insert(self._refresh, animateBrand(brand))
     end
 
     local fpsLabel, timeLabel
@@ -2540,23 +3099,23 @@ function Window:watermark(opts)
         timeLabel = textSeg("00:00:00")
     end
 
-    makeDraggable(wm, wm)
-
-    -- Update FPS (smoothed) and time.
-    local fps, acc, frames = 60, 0, 0
-    local conn
-    conn = RunService.RenderStepped:Connect(function(dt)
-        frames = frames + 1
-        acc = acc + dt
-        if acc >= 0.5 then
-            fps = math.floor(frames / acc + 0.5)
-            frames = 0
-            acc = 0
-            if fpsLabel then fpsLabel.Text = "FPS " .. fps end
+    -- Frames are counted every frame, the labels are only written twice a second.
+    local frames, acc, stop = 0, 0, nil
+    stop = addTicker(0, function(dt)
+        if not wm.Parent then
+            if stop then stop() end
+            return
+        end
+        frames += 1
+        acc += dt
+        if acc < 0.5 then return end
+        if wm.Visible then
+            if fpsLabel then fpsLabel.Text = "FPS " .. math.floor(frames / acc + 0.5) end
             if timeLabel then timeLabel.Text = os.date("%H:%M:%S") end
         end
+        frames, acc = 0, 0
     end)
-    wm.Destroying:Connect(function() if conn then conn:Disconnect() end end)
+    wm.Destroying:Connect(function() if stop then stop() end end)
     return wm
 end
 
@@ -2568,81 +3127,45 @@ function Window:keybindList(opts)
     local width = opts.width or 190
     local showInactive = opts.showInactive ~= false
 
-    local panel = Instance.new("Frame")
-    panel.Name = "Keybinds"
-    panel.Size = UDim2.new(0, width, 0, 0)
-    panel.AutomaticSize = Enum.AutomaticSize.Y
-    panel.Position = opts.position or UDim2.new(0, 16, 0, 70)
-    panel.BackgroundColor3 = PALETTE.card
-    panel.BorderSizePixel = 0
-    panel.ZIndex = 150
-    panel.Parent = self.screen
-    corner(panel, 8)
-    stroke(panel, PALETTE.stroke, 1, 0.3)
+    local panel = overlayShell(self, "keybind", {
+        position = opts.position or UDim2.new(0, 16, 0, 70),
+        size = UDim2.new(0, width, 0, 0),
+        autoSize = Enum.AutomaticSize.Y,
+    })
     self._keybindPanel = panel
-    if self._overlayPos and type(self._overlayPos.keybind) == "table" and #self._overlayPos.keybind == 4 then
-        local t = self._overlayPos.keybind
-        panel.Position = UDim2.new(t[1], t[2], t[3], t[4])
-    end
 
-    local body = Instance.new("Frame")
+    local body = newInstance("Frame")
+    body.Name = randomName()
     body.BackgroundTransparency = 1
     body.Size = UDim2.new(1, 0, 0, 0)
     body.AutomaticSize = Enum.AutomaticSize.Y
-    body.ZIndex = 150
+    body.ZIndex = OVERLAY_Z
     body.Parent = panel
     listLayout(body, 4)
     padding(body, 10)
-
-    local titleRow = Instance.new("Frame")
-    titleRow.Size = UDim2.new(1, 0, 0, 20)
-    titleRow.BackgroundTransparency = 1
-    titleRow.ZIndex = 150
-    titleRow.LayoutOrder = 0
-    titleRow.Parent = body
-    local titleIcon = makeIcon(titleRow, "keyboard", UDim2.new(0, 16, 0, 16), PALETTE.text)
-    titleIcon.AnchorPoint = Vector2.new(0, 0.5)
-    titleIcon.Position = UDim2.new(0, 0, 0.5, 0)
-    titleIcon.ZIndex = 150
-    local title = Instance.new("TextLabel")
-    title.BackgroundTransparency = 1
-    title.Position = UDim2.new(0, 22, 0, 0)
-    title.Size = UDim2.new(1, -22, 1, 0)
-    title.FontFace = FONT
-    title.TextSize = 15
-    title.TextColor3 = PALETTE.text
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Text = opts.title or "Keybinds"
-    title.ZIndex = 150
-    title.Parent = titleRow
-
-    local divider = Instance.new("Frame")
-    divider.Size = UDim2.new(1, 0, 0, 1)
-    divider.BackgroundColor3 = PALETTE.stroke
-    divider.BackgroundTransparency = 0.4
-    divider.BorderSizePixel = 0
-    divider.ZIndex = 150
-    divider.LayoutOrder = 1
-    divider.Parent = body
+    overlayHeader(body, { title = opts.title or "Keybinds", icon = opts.icon or "keyboard", logo = opts.logo })
 
     local rows = {}
-    for idx, bind in ipairs(self._binds) do
-        local row = Instance.new("Frame")
+    for _, bind in ipairs(self._binds) do
+        local row = newInstance("Frame")
+        row.Name = randomName()
         row.Size = UDim2.new(1, 0, 0, 20)
         row.BackgroundTransparency = 1
-        row.ZIndex = 150
-        row.LayoutOrder = idx + 1
+        row.ZIndex = OVERLAY_Z
+        row.LayoutOrder = nextOrder(body)
         row.Parent = body
-        local dot = Instance.new("Frame")
+
+        local dot = newInstance("Frame")
         dot.AnchorPoint = Vector2.new(0, 0.5)
         dot.Position = UDim2.new(0, 1, 0.5, 0)
         dot.Size = UDim2.new(0, 7, 0, 7)
         dot.BackgroundColor3 = PALETTE.subtext
         dot.BorderSizePixel = 0
-        dot.ZIndex = 150
+        dot.ZIndex = OVERLAY_Z
         dot.Parent = row
         corner(dot, 4)
-        local lbl = Instance.new("TextLabel")
+
+        local lbl = newInstance("TextLabel")
         lbl.BackgroundTransparency = 1
         lbl.Position = UDim2.new(0, 16, 0, 0)
         lbl.Size = UDim2.new(1, -76, 1, 0)
@@ -2652,9 +3175,10 @@ function Window:keybindList(opts)
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.TextTruncate = Enum.TextTruncate.AtEnd
         lbl.Text = bind.label
-        lbl.ZIndex = 150
+        lbl.ZIndex = OVERLAY_Z
         lbl.Parent = row
-        local keyLbl = Instance.new("TextLabel")
+
+        local keyLbl = newInstance("TextLabel")
         keyLbl.AnchorPoint = Vector2.new(1, 0.5)
         keyLbl.Position = UDim2.new(1, 0, 0.5, 0)
         keyLbl.Size = UDim2.new(0, 58, 1, 0)
@@ -2665,45 +3189,471 @@ function Window:keybindList(opts)
         keyLbl.TextXAlignment = Enum.TextXAlignment.Right
         keyLbl.TextTruncate = Enum.TextTruncate.AtEnd
         keyLbl.Text = ""
-        keyLbl.ZIndex = 150
+        keyLbl.ZIndex = OVERLAY_Z
         keyLbl.Parent = row
-        rows[idx] = { row = row, dot = dot, lbl = lbl, key = keyLbl, bind = bind }
+
+        rows[#rows + 1] = { row = row, dot = dot, lbl = lbl, key = keyLbl, bind = bind }
     end
 
-    makeDraggable(panel, panel)
-
-    local conn
-    conn = RunService.RenderStepped:Connect(function()
+    -- Ten refreshes a second is enough for a bind list, and each row is only
+    -- written when its key or its state actually changed.
+    local stop
+    stop = addTicker(0.1, function()
+        if not panel.Parent then
+            if stop then stop() end
+            return
+        end
         if not panel.Visible then return end
         for _, r in ipairs(rows) do
-            local keys = r.bind.keys and r.bind.keys() or {}
-            r.key.Text = (#keys > 0) and table.concat(keys, "+") or "None"
-            local active = r.bind.active and r.bind.active() or false
-            r.dot.BackgroundColor3 = active and PALETTE.accent or PALETTE.subtext
-            r.lbl.TextColor3 = active and PALETTE.text or PALETTE.subtext
-            r.row.Visible = showInactive or active
+            local keys = (r.bind.keys and r.bind.keys()) or {}
+            local text = (#keys > 0) and table.concat(keys, "+") or "None"
+            if text ~= r.lastKey then
+                r.lastKey = text
+                r.key.Text = text
+            end
+            local active = (r.bind.active and r.bind.active()) or false
+            if active ~= r.lastActive then
+                r.lastActive = active
+                tween(r.dot, 0.16, { BackgroundColor3 = active and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
+                tween(r.lbl, 0.16, { TextColor3 = active and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
+                r.row.Visible = showInactive or active
+            end
         end
     end)
-    panel.Destroying:Connect(function() if conn then conn:Disconnect() end end)
+    panel.Destroying:Connect(function() if stop then stop() end end)
     return panel
 end
 
-function Interface.new(opts)
-    opts = opts or {}
-    local self = setmetatable({ tabs = {}, groups = {}, _refresh = {}, flags = {}, _binds = {} }, Window)
+-- Custom HUD ------------------------------------------------------------------
+-- The same shell and the same row design as the watermark and the keybind panel,
+-- so a script never has to rebuild that look by hand. A row reads its value from
+-- a function and the panel refreshes the rows on one shared timer.
+--
+--   local hud = win:hud({ title = "Session", icon = "gauge", width = 190 })
+--   hud:row("Kills", function() return kills end)
+--   hud:row({ label = "Money", icon = "coin-pound", value = function() return cash end })
+--   hud:bar("Health", function() return hp / maxHp end)
+--   hud:section("Farm")
+--   local rate = hud:row("Per hour", "0")     -- pushed instead of polled
+--   rate:set("1 240")
+--
+-- Rows return a handle with set, setLabel, setVisible and remove. The HUD itself
+-- has setTitle, setVisible, clear, destroy and a .frame field.
+local Hud = {}
+Hud.__index = Hud
 
-    local screen = Instance.new("ScreenGui")
-    screen.Name = "NewReality"
+-- A value is a plain string or number, or a function polled on the timer.
+local function hudText(value)
+    if value == nil then return "" end
+    local kind = type(value)
+    if kind == "number" then
+        if value % 1 == 0 then return tostring(math.floor(value)) end
+        return string.format("%.2f", value)
+    elseif kind == "boolean" then
+        return value and "On" or "Off"
+    end
+    return tostring(value)
+end
+
+local function hudRead(source)
+    if type(source) == "function" then
+        local ok, out = pcall(source)
+        return ok and out or nil
+    end
+    return source
+end
+
+function Hud:_track(entry)
+    self._live[#self._live + 1] = entry
+    entry.update()
+end
+
+function Hud:_line(height)
+    local row = newInstance("Frame")
+    row.Name = randomName()
+    row.Size = UDim2.new(1, 0, 0, height)
+    row.BackgroundTransparency = 1
+    row.ZIndex = OVERLAY_Z
+    row.LayoutOrder = nextOrder(self._body)
+    row.Parent = self._body
+    return row
+end
+
+-- label / value row. cfg: label, value, icon, dot, color, height.
+function Hud:row(label, value, opts)
+    local cfg
+    if type(label) == "table" then
+        cfg = label
+    else
+        cfg = opts or {}
+        cfg.label = label
+        if value ~= nil then cfg.value = value end
+    end
+
+    local row = self:_line(cfg.height or 20)
+    local textX = 0
+    local dot
+    if cfg.dot then
+        dot = newInstance("Frame")
+        dot.AnchorPoint = Vector2.new(0, 0.5)
+        dot.Position = UDim2.new(0, 1, 0.5, 0)
+        dot.Size = UDim2.new(0, 7, 0, 7)
+        dot.BackgroundColor3 = PALETTE.subtext
+        dot.BorderSizePixel = 0
+        dot.ZIndex = OVERLAY_Z
+        dot.Parent = row
+        corner(dot, 4)
+        textX = 16
+    elseif cfg.icon then
+        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 15, 0, 15), PALETTE.subtext)
+        ic.AnchorPoint = Vector2.new(0, 0.5)
+        ic.Position = UDim2.new(0, 0, 0.5, 0)
+        ic.ZIndex = OVERLAY_Z
+        if ic.Image ~= "" then textX = 21 else ic:Destroy() end
+    end
+
+    local labelText = newInstance("TextLabel")
+    labelText.BackgroundTransparency = 1
+    labelText.Position = UDim2.new(0, textX, 0, 0)
+    labelText.Size = UDim2.new(1, -textX - 70, 1, 0)
+    labelText.FontFace = FONT
+    labelText.TextSize = 13
+    labelText.TextColor3 = PALETTE.text
+    labelText.TextXAlignment = Enum.TextXAlignment.Left
+    labelText.TextTruncate = Enum.TextTruncate.AtEnd
+    labelText.Text = cfg.label or ""
+    labelText.ZIndex = OVERLAY_Z
+    labelText.Parent = row
+
+    local valueText = newInstance("TextLabel")
+    valueText.AnchorPoint = Vector2.new(1, 0.5)
+    valueText.Position = UDim2.new(1, 0, 0.5, 0)
+    valueText.Size = UDim2.new(0, 68, 1, 0)
+    valueText.BackgroundTransparency = 1
+    valueText.FontFace = FONT
+    valueText.TextSize = 13
+    valueText.TextColor3 = cfg.color and colorOf(cfg.color) or PALETTE.subtext
+    valueText.TextXAlignment = Enum.TextXAlignment.Right
+    valueText.TextTruncate = Enum.TextTruncate.AtEnd
+    valueText.Text = hudText(hudRead(cfg.value))
+    valueText.ZIndex = OVERLAY_Z
+    valueText.Parent = row
+
+    local handle = {
+        frame = row,
+        set = function(_, v)
+            cfg.value = v
+            valueText.Text = hudText(hudRead(v))
+        end,
+        setLabel = function(_, v)
+            labelText.Text = tostring(v or "")
+        end,
+        setVisible = function(_, v)
+            row.Visible = v ~= false
+        end,
+        remove = function()
+            row:Destroy()
+        end,
+    }
+
+    -- Only poll the rows that were given a function, a pushed value costs nothing.
+    if type(cfg.value) == "function" or type(cfg.dot) == "function" then
+        self:_track({
+            update = function()
+                if type(cfg.value) == "function" then
+                    local text = hudText(hudRead(cfg.value))
+                    if text ~= handle._last then
+                        handle._last = text
+                        valueText.Text = text
+                    end
+                end
+                if type(cfg.dot) == "function" and dot then
+                    local on = hudRead(cfg.dot) and true or false
+                    if on ~= handle._lastDot then
+                        handle._lastDot = on
+                        tween(dot, 0.16, { BackgroundColor3 = on and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
+                        tween(labelText, 0.16, { TextColor3 = on and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
+                    end
+                end
+            end,
+            alive = function() return row.Parent ~= nil end,
+        })
+    end
+    return handle
+end
+
+-- Progress bar row. getRatio returns 0..1, opts: { color, text = fn, height }.
+function Hud:bar(label, getRatio, opts)
+    opts = opts or {}
+    local row = self:_line(opts.height or 30)
+
+    local labelText = newInstance("TextLabel")
+    labelText.BackgroundTransparency = 1
+    labelText.Size = UDim2.new(1, -60, 0, 15)
+    labelText.FontFace = FONT
+    labelText.TextSize = 13
+    labelText.TextColor3 = PALETTE.text
+    labelText.TextXAlignment = Enum.TextXAlignment.Left
+    labelText.TextTruncate = Enum.TextTruncate.AtEnd
+    labelText.Text = label or ""
+    labelText.ZIndex = OVERLAY_Z
+    labelText.Parent = row
+
+    local valueText = newInstance("TextLabel")
+    valueText.AnchorPoint = Vector2.new(1, 0)
+    valueText.Position = UDim2.new(1, 0, 0, 0)
+    valueText.Size = UDim2.new(0, 58, 0, 15)
+    valueText.BackgroundTransparency = 1
+    valueText.FontFace = FONT
+    valueText.TextSize = 13
+    valueText.TextColor3 = PALETTE.subtext
+    valueText.TextXAlignment = Enum.TextXAlignment.Right
+    valueText.Text = ""
+    valueText.ZIndex = OVERLAY_Z
+    valueText.Parent = row
+
+    local track = newInstance("Frame")
+    track.AnchorPoint = Vector2.new(0, 1)
+    track.Position = UDim2.new(0, 0, 1, 0)
+    track.Size = UDim2.new(1, 0, 0, 6)
+    themed(track, "BackgroundColor3", "track")
+    track.BorderSizePixel = 0
+    track.ZIndex = OVERLAY_Z
+    track.Parent = row
+    corner(track, 3)
+
+    local fill = newInstance("Frame")
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BorderSizePixel = 0
+    fill.ZIndex = OVERLAY_Z
+    fill.Parent = track
+    corner(fill, 3)
+    if opts.color then
+        fill.BackgroundColor3 = colorOf(opts.color)
+    else
+        themed(fill, "BackgroundColor3", "accent")
+    end
+
+    local last = nil
+    local function apply(ratio)
+        ratio = math.clamp(tonumber(ratio) or 0, 0, 1)
+        if last and math.abs(ratio - last) < 0.005 then return end
+        last = ratio
+        tween(fill, 0.18, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
+        valueText.Text = opts.text and tostring(opts.text(ratio)) or (math.floor(ratio * 100 + 0.5) .. "%")
+    end
+    apply(hudRead(getRatio) or 0)
+
+    local handle = {
+        frame = row,
+        set = function(_, v) apply(v) end,
+        setLabel = function(_, v) labelText.Text = tostring(v or "") end,
+        setVisible = function(_, v) row.Visible = v ~= false end,
+        remove = function() row:Destroy() end,
+    }
+    if type(getRatio) == "function" then
+        self:_track({
+            update = function() apply(hudRead(getRatio) or 0) end,
+            alive = function() return row.Parent ~= nil end,
+        })
+    end
+    return handle
+end
+
+-- Small upper case caption that splits the panel into groups.
+function Hud:section(text)
+    local row = self:_line(18)
+    local label = newInstance("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.FontFace = FONT
+    label.TextSize = 11
+    label.TextColor3 = PALETTE.subtext
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Bottom
+    label.Text = string.upper(tostring(text or ""))
+    label.ZIndex = OVERLAY_Z
+    label.Parent = row
+    return { frame = row, setLabel = function(_, v) label.Text = string.upper(tostring(v or "")) end }
+end
+
+-- Full width line of text, wraps over several lines when it is long.
+function Hud:text(value)
+    local row = self:_line(16)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    local label = newInstance("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, 0, 0, 0)
+    label.AutomaticSize = Enum.AutomaticSize.Y
+    label.TextWrapped = true
+    label.FontFace = FONT
+    label.TextSize = 13
+    label.TextColor3 = PALETTE.subtext
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Text = hudText(hudRead(value))
+    label.ZIndex = OVERLAY_Z
+    label.Parent = row
+
+    local handle = {
+        frame = row,
+        set = function(_, v) label.Text = hudText(hudRead(v)) end,
+        setVisible = function(_, v) row.Visible = v ~= false end,
+        remove = function() row:Destroy() end,
+    }
+    if type(value) == "function" then
+        self:_track({
+            update = function()
+                local text = hudText(hudRead(value))
+                if text ~= handle._last then
+                    handle._last = text
+                    label.Text = text
+                end
+            end,
+            alive = function() return row.Parent ~= nil end,
+        })
+    end
+    return handle
+end
+
+function Hud:divider()
+    local line = newInstance("Frame")
+    line.Size = UDim2.new(1, 0, 0, 1)
+    line.BackgroundColor3 = PALETTE.stroke
+    line.BackgroundTransparency = 0.4
+    line.BorderSizePixel = 0
+    line.ZIndex = OVERLAY_Z
+    line.LayoutOrder = nextOrder(self._body)
+    line.Parent = self._body
+    return line
+end
+
+function Hud:setTitle(text)
+    if self._title then self._title.Text = tostring(text or "") end
+end
+
+function Hud:setVisible(visible)
+    self.frame.Visible = visible ~= false
+end
+
+-- Drop every row but keep the panel and its title.
+function Hud:clear()
+    self._live = {}
+    for _, child in ipairs(self._body:GetChildren()) do
+        if child:IsA("GuiObject") and child ~= self._headerRow then
+            child:Destroy()
+        end
+    end
+end
+
+function Hud:destroy()
+    if self._stop then self._stop() end
+    self.frame:Destroy()
+end
+
+-- opts: title, icon, logo, width, position, id (config key), interval, visible.
+function Window:hud(opts)
+    opts = opts or {}
+    local id = "hud:" .. tostring(opts.id or opts.title or (#self._huds + 1))
+    local frame = overlayShell(self, id, {
+        position = opts.position or UDim2.new(0, 16, 0, 190),
+        size = UDim2.new(0, opts.width or 190, 0, 0),
+        autoSize = Enum.AutomaticSize.Y,
+        radius = opts.radius or 8,
+    })
+
+    local body = newInstance("Frame")
+    body.Name = randomName()
+    body.BackgroundTransparency = 1
+    body.Size = UDim2.new(1, 0, 0, 0)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    body.ZIndex = OVERLAY_Z
+    body.Parent = frame
+    listLayout(body, opts.spacing or 4)
+    padding(body, opts.padding or 10)
+
+    local hud = setmetatable({
+        frame = frame,
+        _body = body,
+        _live = {},
+        _ctx = self,
+        _id = id,
+    }, Hud)
+
+    if opts.title or opts.logo or opts.icon then
+        hud._title = overlayHeader(body, { title = opts.title or "", icon = opts.icon, logo = opts.logo })
+        hud._headerRow = hud._title.Parent
+    end
+    if opts.visible == false then frame.Visible = false end
+
+    -- One timer per HUD walks its polled rows, and a row that was removed drops
+    -- out of the list on the next pass.
+    local stop
+    stop = addTicker(opts.interval or 0.1, function()
+        if not frame.Parent then
+            if stop then stop() end
+            return
+        end
+        if not frame.Visible then return end
+        local live = hud._live
+        for i = #live, 1, -1 do
+            local entry = live[i]
+            if entry.alive and not entry.alive() then
+                table.remove(live, i)
+            else
+                entry.update()
+            end
+        end
+    end)
+    hud._stop = stop
+    frame.Destroying:Connect(function() if stop then stop() end end)
+
+    self._huds[#self._huds + 1] = hud
+    return hud
+end
+
+function Interface.new(opts)
+    if not licenceOk() then
+        error("[NewReality] this session is not licensed", 2)
+    end
+    opts = opts or {}
+    local self = setmetatable({
+        tabs = {}, groups = {}, flags = {},
+        _refresh = {}, _binds = {},
+        -- Open floating panels (dropdowns, pickers, gear popovers), the shared
+        -- listeners this window owns, the detached overlays by config name and
+        -- the HUDs built through win:hud.
+        _panels = {}, _conns = {}, _overlays = {}, _huds = {},
+        _open = true,
+    }, Window)
+
+    local screen = newInstance("ScreenGui")
+    screen.Name = randomName()
     screen.ResetOnSpawn = false
     screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screen.IgnoreGuiInset = true
     -- High DisplayOrder so the window, watermark and keybind list sit above any
     -- other GUI a script creates (ESP text billboards should use a lower order).
     pcall(function() screen.DisplayOrder = 100000 end)
-    screen.Parent = guiParent()
+    screen.Parent = guiParent(screen)
     self.screen = screen
 
-    local window = Instance.new("Frame")
+    -- Keep the ScreenGui where it was put. Reparenting another kit's GUI into
+    -- your own tree is the usual first step to reading it, so the move is put
+    -- back on the next step unless the window is being unloaded.
+    local home = screen.Parent
+    if home then
+        local guard = screen.AncestryChanged:Connect(function(_, parent)
+            if self._dead or parent == home then return end
+            task.defer(function()
+                if self._dead or screen.Parent == home then return end
+                pcall(function() screen.Parent = home end)
+            end)
+        end)
+        table.insert(self._conns, function() guard:Disconnect() end)
+    end
+
+    local window = newInstance("Frame")
+    window.Name = randomName()
     window.Size = UDim2.new(0, 900, 0, 580)
     window.Position = UDim2.new(0.5, -450, 0.5, -290)
     themed(window, "BackgroundColor3", "background")
@@ -2732,19 +3682,21 @@ function Interface.new(opts)
     brandRow.Position = UDim2.new(0, 16, 0, 16)
     brandRow.BackgroundTransparency = 1
     brandRow.Parent = sidebar
-    local hasLogo = iconAsset(opts.icon or "logo") ~= nil
-    local logoName = opts.icon or "logo"
-    if hasLogo then
-        local logo = Instance.new("ImageLabel")
-        logo.BackgroundTransparency = 1
-        logo.Size = UDim2.new(0, 40, 0, 40)
-        logo.Image = iconAsset(logoName) or ""
-        logo.ImageColor3 = Color3.fromRGB(255, 255, 255)
-        logo.ScaleType = Enum.ScaleType.Fit
-        logo.AnchorPoint = Vector2.new(0, 0.5)
-        logo.Position = UDim2.new(0, 0, 0.5, 0)
-        logo.Parent = brandRow
+    -- Brand mark: the two layer C+H logo whose C follows the accent colour, or
+    -- the single logo icon when that pack is not in the icon set.
+    local mark, _, _, noMark = logoMark(brandRow, UDim2.new(0, 40, 0, 40))
+    mark.AnchorPoint = Vector2.new(0, 0.5)
+    mark.Position = UDim2.new(0, 0, 0.5, 0)
+    if noMark then
+        mark:Destroy()
+        mark = nil
+        if iconAsset(opts.icon or "logo") then
+            mark = makeIcon(brandRow, opts.icon or "logo", UDim2.new(0, 40, 0, 40), Color3.fromRGB(255, 255, 255))
+            mark.AnchorPoint = Vector2.new(0, 0.5)
+            mark.Position = UDim2.new(0, 0, 0.5, 0)
+        end
     end
+    local hasLogo = mark ~= nil
     local brand = Instance.new("TextLabel")
     brand.BackgroundTransparency = 1
     brand.Position = UDim2.new(0, hasLogo and 50 or 0, 0, 0)
@@ -2823,34 +3775,18 @@ function Interface.new(opts)
     overlay.Parent = window
     self.overlay = overlay
 
-    -- Close every transient panel currently floating in the overlay. Called when
-    -- a new panel opens or when tabs/sub-tabs change so nothing is left hanging.
-    -- Closes transient overlay panels. With keepPopovers = true the gear settings
-    -- popovers stay open, so a dropdown or colour picker opened from inside one does
-    -- not close it. Tab switches and backdrop clicks close everything.
+    -- Close the floating panels, newest first. With keepPopovers the gear
+    -- settings popovers stay open, so a dropdown or a colour picker opened from
+    -- inside one does not take its host down with it. Tab switches, hiding the
+    -- window and opening a gear close everything.
     self.closeOverlays = function(keepPopovers)
-        for _, child in ipairs(overlay:GetChildren()) do
-            if not (keepPopovers and child.Name == "Popover") then
-                child:Destroy()
+        local stack = self._panels
+        for i = #stack, 1, -1 do
+            local panel = stack[i]
+            if not (keepPopovers and panel.popover) then
+                panel.close()
             end
         end
-    end
-
-    -- Invisible full-window backdrop placed under a panel so a click anywhere
-    -- outside it closes the panel. Returns nothing; the panel is added on top.
-    self.showBackdrop = function()
-        local back = Instance.new("TextButton")
-        back.Name = "Backdrop"
-        back.Size = UDim2.new(1, 0, 1, 0)
-        back.BackgroundTransparency = 1
-        back.AutoButtonColor = false
-        back.Text = ""
-        back.ZIndex = 41
-        back.Parent = overlay
-        back.MouseButton1Click:Connect(function()
-            self.closeOverlays()
-        end)
-        return back
     end
 
     -- Keep a floating panel inside the window bounds given its offset and size.
@@ -2876,21 +3812,48 @@ function Interface.new(opts)
 
     -- Hotkey to show/hide the window (RightShift by default).
     self.toggleKey = opts.toggleKey or Enum.KeyCode.RightShift
-    UserInputService.InputBegan:Connect(function(input, gpe)
+    table.insert(self._conns, onKey(function(input, gpe)
         if gpe then return end
         if input.KeyCode == self.toggleKey then
             self:toggle()
         end
-    end)
+    end))
 
-    local scale = Instance.new("UIScale")
+    -- Keep checking the licence while the window lives, a revoked session
+    -- loses its interface instead of running on with a stale check.
+    if licenceFn then
+        table.insert(self._conns, addTicker(licencePeriod, function()
+            if not licenceOk() then self:unload() end
+        end))
+    end
+
+    -- Opening animation, and the scale the show/hide toggle reuses later.
+    local scale = newInstance("UIScale")
     scale.Scale = 0.92
     scale.Parent = window
+    self._scale = scale
     window.BackgroundTransparency = 1
     tween(window, 0.25, { BackgroundTransparency = 0 })
-    tween(scale, 0.32, { Scale = 1 }, Enum.EasingStyle.Back)
+    tween(scale, 0.32, { Scale = 1 }, EASE_POP)
 
     return self
+end
+
+-- Tear the interface down: stop the listeners and timers this window put on the
+-- shared hubs, drop its HUDs and remove the GUI. Call this instead of destroying
+-- the ScreenGui by hand, otherwise the timers keep running with nothing to draw.
+function Window:unload()
+    if self._dead then return end
+    self._dead = true
+    if self._autoSaveName and self._dirty then
+        pcall(function() self:saveConfig(self._autoSaveName, true) end)
+    end
+    for _, stop in ipairs(self._conns) do pcall(stop) end
+    table.clear(self._conns)
+    for _, hud in ipairs(self._huds) do pcall(function() hud:destroy() end) end
+    table.clear(self._huds)
+    table.clear(self._panels)
+    self.screen:Destroy()
 end
 
 Interface.Window = Window
@@ -2957,7 +3920,30 @@ function Interface.showcase()
             if ok and key then win.toggleKey = key end
         end)
         ui:toggle("Rainbow Logo", function() return true end, function() end)
-        ui:button("Unload", function() win.screen:Destroy() end)
+        ui:button("Unload", function() win:unload() end)
+
+        -- Detached overlays: the watermark strip, the keybind list and a HUD
+        -- built from the same rows, all draggable and saved with the config.
+        local overlays = s:card({ title = "Overlays", icon = "layout-dashboard", subtitle = "Detached panels", column = "left" })
+        local wm = win:watermark()
+        local binds = win:keybindList({ position = UDim2.new(0, 16, 0, 70) })
+        local demoHud = win:hud({ title = "Session", logo = true, position = UDim2.new(0, 16, 0, 190) })
+        local startedAt = os.clock()
+        demoHud:row("Uptime", function()
+            local secs = math.floor(os.clock() - startedAt)
+            return string.format("%02d:%02d", secs // 60, secs % 60)
+        end)
+        demoHud:row({ label = "Ping", value = function()
+            local stat = game:GetService("Stats")
+            local ok, ms = pcall(function() return stat.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+            return ok and (math.floor(ms) .. " ms") or "-"
+        end })
+        demoHud:section("Status")
+        demoHud:row({ label = "Farm", dot = function() return (os.clock() % 4) < 2 end, value = "Idle" })
+        demoHud:bar("Progress", function() return (os.clock() % 10) / 10 end)
+        overlays:toggle("Watermark", function() return wm.Visible end, function(v) wm.Visible = v end)
+        overlays:toggle("Keybind List", function() return binds.Visible end, function(v) binds.Visible = v end)
+        overlays:toggle("Session HUD", function() return demoHud.frame.Visible end, function(v) demoHud:setVisible(v) end)
 
         -- Live theme colours: every tagged part recolours instantly.
         local theme = s:card({ title = "Theme", icon = "palette", subtitle = "Colour every part", column = "left" })
@@ -3008,5 +3994,20 @@ if _G.NewRealityShowcase ~= false then
     pcall(Interface.showcase)
 end
 
-return Interface
+-- What the loader receives is a read only view of the module: reads pass
+-- through, writes are refused and the metatable cannot be pulled back, so a
+-- foreign script cannot swap new() for its own copy or walk the internals from
+-- the handle it was given. Sub-tables that are meant to be edited stay open,
+-- Interface.icons[name] = "rbxassetid://.." still works.
+local api = setmetatable({}, {
+    __index = Interface,
+    __newindex = function()
+        error("[NewReality] interface is read only", 2)
+    end,
+    __metatable = "locked",
+    __tostring = function()
+        return "NewReality interface " .. Interface.version
+    end,
+})
 
+return api
