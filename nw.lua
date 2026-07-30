@@ -2,7 +2,7 @@
 -- Sidebar based UI kit for the NW scripts: grouped sidebar tabs with icons, top
 -- sub-tabs, titled cards in two columns, toggles with gear popovers, sliders,
 -- searchable dropdowns, multi keybinds, colour pickers, live theming, saved
--- configs and detached overlays (watermark, keybind panel, custom HUD).
+-- configs, translations and detached overlays (watermark, keybind panel, HUD).
 -- The icon pack is embedded as base64, so the library is self contained.
 --
 -- The full guide with every option lives in docs/interface-lib.md, this header
@@ -26,7 +26,7 @@
 --
 -- CONTROLS (all are methods on a card):
 --   card:toggle(text, get, set [, buildSettings])  -- buildSettings(sc) adds a gear popover; fill sc like a card
---   card:slider(text, min, max, get, set [, decimals])
+--   card:slider(text, min, max, get, set [, decimals, format])
 --   card:dropdown(text, options, get, set [, { search = true, multi = true }])  -- options: table or function
 --   card:keybind(text, get, set [, { multi = true, list = false }])  -- right click / x icon clears it
 --   card:colorpicker(text, getRgb, setRgb [, { alpha = false }])     -- value is { r, g, b, a }, a in 0..1
@@ -35,6 +35,7 @@
 --   card:segmented(text, options, get, set)         -- inline pills, no popover
 --   card:list(options, get, set)                    -- inline searchable list
 --   card:stepper(text, min, max, step, get, set)
+--   card:section(text)                              -- small caption between groups of controls
 --   card:label(text)                                -- wraps to multiple lines
 --   card:divider()
 --
@@ -48,9 +49,17 @@
 --   keys: accent, background, sidebar, card, cardTop, control, controlHover,
 --   track, text, subtext, stroke
 --
+-- TRANSLATIONS: every string the kit draws goes through the phrase table, so a
+--   script can ship more than one language without touching its layout code.
+--   UI.addLocale("ru", { ["Auto Farm"] = "Автофарм", None = "Нет" })
+--   UI.setLocale("ru")            -- re-labels a live interface, no rebuild
+--   win:setLocale("ru")           -- same, and the choice is saved with the config
+--
 -- CONFIGS: win:saveConfig(name) / loadConfig(name) / listConfigs() / deleteConfig(name)
 --   win:setAutoLoad(name|nil) / getAutoLoad()       -- which config loads on launch
 --   win:setAutoSave(name|nil)                        -- auto persists that config a moment after any change
+--   A config holds the flags, the palette with its opacity, the toggle key, the
+--   language and the position and visibility of every detached panel.
 --
 -- OVERLAYS (detached, draggable, positions saved with the config):
 --   win:watermark{...}      -- logo, brand, fps, time strip
@@ -61,6 +70,7 @@
 -- MISC: win:refreshAll() (re-sync every control from its flag), win:toggle()
 --   (show/hide the window), win:unload() (remove everything the library made).
 --   UI.licence(fn [, seconds]) gates window creation on your own check.
+--   UI.setFont(family) swaps the type family for a language the default misses.
 
 -- Services and the executor globals we rely on are captured once, at load time,
 -- before another script in the session can hook them. Everything below uses the
@@ -84,7 +94,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.28.1"
+Interface.version = "2026.07.30.1"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -114,56 +124,238 @@ for k in pairs(PALETTE) do PALETTE_A[k] = 1 end
 Interface.paletteAlpha = PALETTE_A
 
 -- Colour property -> transparency property, so a key's alpha can fade its parts.
+-- UIStroke is in the list as well: an outline that does not follow the opacity
+-- of the surface it wraps is the thing that gives a translucent window away.
 local TRANS_OF = {
     BackgroundColor3 = "BackgroundTransparency",
     TextColor3 = "TextTransparency",
     ImageColor3 = "ImageTransparency",
+    Color = "Transparency",
 }
 
-local FONT = Font.new("rbxasset://fonts/families/Arial.json", Enum.FontWeight.Heavy, Enum.FontStyle.Normal)
-Interface.FontFace = FONT
+-- Type ------------------------------------------------------------------------
+-- Weights instead of one heavy face. The old build drew everything in Arial
+-- Heavy, which the renderer has to thicken itself, and small labels came out
+-- smeared. Gotham Screen Smart is hinted for interface sizes, and a role picks a
+-- weight rather than every label being as loud as the page title.
+--
+-- The family is swappable because a translated build may need glyphs the default
+-- does not carry: UI.setFont("rbxasset://fonts/families/Arial.json") re-faces a
+-- live interface.
+local FONT_FAMILY = "rbxasset://fonts/families/GothamSSm.json"
+local WEIGHTS = {
+    regular = Enum.FontWeight.Regular,
+    medium = Enum.FontWeight.Medium,
+    semibold = Enum.FontWeight.SemiBold,
+    bold = Enum.FontWeight.Bold,
+}
+local FACES = {}
+local function rebuildFaces()
+    for role, weight in pairs(WEIGHTS) do
+        FACES[role] = Font.new(FONT_FAMILY, weight, Enum.FontStyle.Normal)
+    end
+end
+rebuildFaces()
+Interface.fonts = FACES
+
+-- Registry of the text parts that follow the family, so a swap re-faces what is
+-- already on screen. Same shape as the theme registry below.
+local FONT_REG = {}
 
 local function colorOf(rgb)
     return Color3.fromRGB(rgb[1] or 255, rgb[2] or 255, rgb[3] or 255)
 end
 Interface.colorOf = colorOf
 
+-- Tag registries --------------------------------------------------------------
 -- Theme tagging: any element passed to themed(inst, prop, key) follows the
--- palette and is recoloured live by Window:setColor(key, rgb).
+-- palette and is recoloured live by Window:setColor(key, rgb). Fonts work the
+-- same way through faced(inst, role).
 --
--- Tagged parts are held in a per key registry with weak keys instead of instance
--- attributes. Recolouring then touches only the parts that use that key, with no
--- descendant walk over the whole GUI, and nothing about the theme is readable
--- from the instance tree by another script.
-local THEME_REG = {}
-for key in pairs(PALETTE) do
-    THEME_REG[key] = setmetatable({}, { __mode = "k" })
+-- Both registries hold their instances strongly. The previous build used weak
+-- keys, and a part that the builder did not keep a reference to (the accent half
+-- of the logo is the clearest case) was dropped by the collector and silently
+-- stopped following the palette. Entries are pruned while the registry is walked
+-- instead: an instance that has been parented once and is now parentless has
+-- been destroyed, so it goes.
+local function tagAdd(reg, inst, value)
+    local entry = reg[inst]
+    if entry then
+        entry.values[#entry.values + 1] = value
+    else
+        reg[inst] = { values = { value }, seen = inst.Parent ~= nil }
+    end
 end
 
-local function themed(instance, prop, key)
+-- fn(inst, value) for every live entry. Dead entries drop out on the way past.
+local function tagWalk(reg, fn)
+    for inst, entry in pairs(reg) do
+        local parented = inst.Parent ~= nil
+        if parented then
+            entry.seen = true
+        end
+        -- Not parented yet means the builder is still assembling it, so it stays.
+        if entry.seen and not parented then
+            reg[inst] = nil
+        else
+            for _, value in ipairs(entry.values) do
+                pcall(fn, inst, value)
+            end
+        end
+    end
+end
+
+local THEME_REG = {}
+for key in pairs(PALETTE) do
+    THEME_REG[key] = {}
+end
+
+-- Base transparency of a themed part, remembered the first time an opacity below
+-- 1 fades it, so a return to full opacity restores the part's own value and a
+-- part that was hidden on purpose stays hidden.
+local THEME_BASE = {}
+
+-- Fade a part by the opacity of its palette key. The part's own transparency is
+-- kept as the floor, so a card outline at 0.4 under a 50% window reads as 0.7
+-- rather than snapping to a flat 0.5.
+local function fadeProp(inst, prop, alpha)
+    local tp = TRANS_OF[prop]
+    if not tp then return end
+    local bases = THEME_BASE[inst]
+    local base = bases and bases[tp]
+    if base == nil then
+        local ok, current = pcall(function() return inst[tp] end)
+        if not ok or type(current) ~= "number" then return end
+        base = current
+        bases = bases or {}
+        bases[tp] = base
+        THEME_BASE[inst] = bases
+    end
+    if base >= 1 then return end
+    pcall(function() inst[tp] = 1 - (1 - base) * alpha end)
+end
+
+-- themed(inst, prop, key [, opts])
+--   opts.fade = false  the part animates its own transparency between states
+--                      (an inactive sidebar tab, an unselected list row), so the
+--                      palette opacity must not fight the animation.
+local function themed(instance, prop, key, opts)
     instance[prop] = PALETTE[key]
     local reg = THEME_REG[key]
     if reg then
-        local entry = reg[instance]
-        if entry then
-            entry[#entry + 1] = prop
-        else
-            reg[instance] = { prop }
-        end
+        tagAdd(reg, instance, { prop = prop, fade = not (opts and opts.fade == false) })
     end
-    -- Carry the key's alpha onto the matching transparency property (only when
-    -- the key is actually faded, so default parts keep their own transparency).
-    local a = PALETTE_A[key]
-    local tp = TRANS_OF[prop]
-    if a and a < 1 and tp then
-        pcall(function() instance[tp] = 1 - a end)
+    if not (opts and opts.fade == false) then
+        local alpha = PALETTE_A[key]
+        if alpha and alpha < 1 then
+            fadeProp(instance, prop, alpha)
+        end
     end
     return instance
 end
 
--- Base transparency of a themed part, remembered the first time an alpha below 1
--- fades it, so a return to full opacity restores the part's own value.
-local THEME_BASE = setmetatable({}, { __mode = "k" })
+-- faced(inst, role): pick a weight and follow the family.
+local function faced(instance, role)
+    role = role or "regular"
+    instance.FontFace = FACES[role] or FACES.regular
+    tagAdd(FONT_REG, instance, role)
+    return instance
+end
+
+-- Swap the type family for the whole interface (a language the default family
+-- has no glyphs for). Existing labels are re-faced in place.
+function Interface.setFont(family)
+    if type(family) ~= "string" or family == "" then return end
+    FONT_FAMILY = family
+    rebuildFaces()
+    tagWalk(FONT_REG, function(inst, role)
+        inst.FontFace = FACES[role] or FACES.regular
+    end)
+end
+
+-- Translations ----------------------------------------------------------------
+-- Phrases are keyed by their English text, so a script that never calls
+-- addLocale reads exactly as it was written and a translated build only has to
+-- list the strings it wants changed.
+--
+--   UI.addLocale("ru", { ["Auto Farm"] = "Автофарм", None = "Нет" })
+--   UI.setLocale("ru")
+--
+-- Every label the kit draws is registered, so a language change re-labels what
+-- is already on screen instead of asking for a rebuild.
+local LOCALES = {}
+local localeCode = "en"
+local TEXT_REG = {}
+-- Live windows, so a language change can re-sync the controls that build their
+-- text from more than one phrase (a keybind reading "None", a multi dropdown
+-- joining its picks). Cleared entries drop out as windows unload.
+local WINDOWS = {}
+Interface.locales = LOCALES
+
+local function translate(phrase, ...)
+    if type(phrase) ~= "string" then return phrase end
+    local table_ = LOCALES[localeCode]
+    local out = table_ and table_[phrase]
+    if out == nil then out = phrase end
+    if select("#", ...) > 0 then
+        local ok, formatted = pcall(string.format, out, ...)
+        if ok then return formatted end
+    end
+    return out
+end
+Interface.translate = translate
+
+-- Bind a label to a phrase: written now, rewritten on a language change.
+local function localized(instance, prop, phrase, transform)
+    local function write()
+        local value = translate(phrase)
+        if transform then value = transform(value) end
+        instance[prop] = value
+    end
+    write()
+    tagAdd(TEXT_REG, instance, { prop = prop, phrase = phrase, transform = transform })
+    return function(nextPhrase)
+        phrase = nextPhrase
+        write()
+    end
+end
+
+function Interface.addLocale(code, phrases)
+    if type(code) ~= "string" or type(phrases) ~= "table" then return end
+    local target = LOCALES[code]
+    if not target then
+        target = {}
+        LOCALES[code] = target
+    end
+    for phrase, value in pairs(phrases) do
+        target[phrase] = value
+    end
+    if code == localeCode then Interface.setLocale(code) end
+end
+
+function Interface.setLocale(code)
+    if type(code) ~= "string" or code == "" then return end
+    localeCode = code
+    Interface.locale = code
+    tagWalk(TEXT_REG, function(inst, entry)
+        local value = translate(entry.phrase)
+        if entry.transform then value = entry.transform(value) end
+        inst[entry.prop] = value
+    end)
+    for i = #WINDOWS, 1, -1 do
+        local win = WINDOWS[i]
+        if win._dead then
+            table.remove(WINDOWS, i)
+        else
+            pcall(function() win:refreshAll() end)
+        end
+    end
+end
+
+function Interface.getLocale()
+    return localeCode
+end
+Interface.locale = localeCode
 
 -- Session guard ---------------------------------------------------------------
 -- The kit is paid and closed source, so the runtime makes a loaded copy harder
@@ -300,12 +492,32 @@ local function corner(instance, radius)
     return c
 end
 
+-- stroke(inst [, key or Color3, thickness, transparency])
+-- A palette key is the normal call: the outline then follows setColor and fades
+-- with the key's opacity like the surface it wraps. A raw Color3 stays fixed,
+-- which is what the picker cursors want.
 local function stroke(instance, color, thickness, transparency)
     local s = Instance.new("UIStroke")
-    s.Color = color or PALETTE.stroke
     s.Thickness = thickness or 1
     s.Transparency = transparency or 0
     s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    if type(color) == "string" then
+        themed(s, "Color", color)
+    else
+        s.Color = color or PALETTE.stroke
+    end
+    s.Parent = instance
+    return s
+end
+
+-- An outline that a control animates between states (hover, focus, capture). It
+-- follows the palette colour but the opacity is left to the animation.
+local function stateStroke(instance, key, thickness)
+    local s = Instance.new("UIStroke")
+    s.Thickness = thickness or 1
+    s.Transparency = 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    themed(s, "Color", key or "stroke", { fade = false })
     s.Parent = instance
     return s
 end
@@ -351,6 +563,55 @@ local function shadow(instance)
     img.ZIndex = 0
     img.Parent = instance
     return img
+end
+
+-- The grey grid that sits under a translucent colour so 40% opacity reads as
+-- 40% and not as a darker shade. Used by the picker's opacity bar and by the
+-- swatch on the control row.
+--
+-- The grid is laid out from the real pixel size, which a scale sized element
+-- only reports once the layout has run, so it is built again whenever that size
+-- changes and skipped while the size is still zero.
+local function checkerboard(parent, cell, zIndex)
+    cell = cell or 8
+    local holder = Instance.new("Frame")
+    holder.Name = "Checker"
+    holder.Size = UDim2.new(1, 0, 1, 0)
+    holder.BackgroundColor3 = Color3.fromRGB(208, 208, 214)
+    holder.BorderSizePixel = 0
+    holder.ClipsDescendants = true
+    holder.ZIndex = zIndex or 0
+    holder.Parent = parent
+
+    local builtFor = -1
+    local function build()
+        local size = holder.AbsoluteSize
+        if size.X < 1 or size.Y < 1 then return end
+        local signature = math.floor(size.X) * 4096 + math.floor(size.Y)
+        if signature == builtFor then return end
+        builtFor = signature
+        for _, child in ipairs(holder:GetChildren()) do
+            if child:IsA("Frame") then child:Destroy() end
+        end
+        local cols = math.ceil(size.X / cell)
+        local rows = math.ceil(size.Y / cell)
+        for row = 0, rows - 1 do
+            for col = 0, cols - 1 do
+                if (row + col) % 2 == 1 then
+                    local square = Instance.new("Frame")
+                    square.BackgroundColor3 = Color3.fromRGB(150, 150, 158)
+                    square.BorderSizePixel = 0
+                    square.Position = UDim2.new(0, col * cell, 0, row * cell)
+                    square.Size = UDim2.new(0, cell, 0, cell)
+                    square.Parent = holder
+                end
+            end
+        end
+    end
+    build()
+    local conn = holder:GetPropertyChangedSignal("AbsoluteSize"):Connect(build)
+    holder.Destroying:Connect(function() conn:Disconnect() end)
+    return holder
 end
 
 -- Icons: white PNGs loaded once and cached. The icon pack must sit in the
@@ -609,9 +870,12 @@ local function iconAsset(name)
     if not name or name == "" then
         return nil
     end
-    -- Explicit overrides and direct asset ids pass straight through.
-    if Interface.icons[name] then
-        name = Interface.icons[name]
+    -- Explicit overrides and direct asset ids pass straight through. An override
+    -- is meant to be an asset id string, so anything else is ignored rather than
+    -- carried into the string calls below.
+    local override = Interface.icons[name]
+    if type(override) == "string" and override ~= "" then
+        name = override
     end
     if string.sub(name, 1, 3) == "rbx" or string.sub(name, 1, 4) == "http" then
         return name
@@ -659,18 +923,24 @@ function Interface.setIconFolder(folder)
     iconLogged = false
 end
 
-local function makeIcon(parent, name, size, color)
+-- makeIcon(parent, name, size [, key]) where key is a palette key the tint
+-- follows. Passing a Color3 pins the tint instead.
+local function makeIcon(parent, name, size, key)
     local img = newInstance("ImageLabel")
     img.BackgroundTransparency = 1
     img.Size = size or UDim2.new(0, 18, 0, 18)
     img.Image = iconAsset(name) or ""
-    img.ImageColor3 = color or PALETTE.text
     img.ScaleType = Enum.ScaleType.Fit
+    if type(key) == "string" then
+        themed(img, "ImageColor3", key)
+    else
+        img.ImageColor3 = key or PALETTE.text
+    end
     img.Parent = parent
     return img
 end
 
--- The CcodixHub mark: one logo cut into two layers that sit exactly on top of
+-- The NewReality mark: one logo cut into two layers that sit exactly on top of
 -- each other. The C follows the accent colour, the H stays white, so a theme
 -- change repaints half the logo and nothing has to be re-exported.
 local function logoMark(parent, size, opts)
@@ -688,6 +958,9 @@ local function logoMark(parent, size, opts)
     back.Image = iconAsset("logo-c") or ""
     back.ScaleType = Enum.ScaleType.Fit
     back.Parent = holder
+    -- Registered after it is parented, and the registry holds it strongly, so
+    -- the accent half keeps following setColor even though the caller keeps no
+    -- reference of its own.
     themed(back, "ImageColor3", "accent")
 
     local front = newInstance("ImageLabel")
@@ -695,10 +968,14 @@ local function logoMark(parent, size, opts)
     front.BackgroundTransparency = 1
     front.Size = UDim2.new(1, 0, 1, 0)
     front.Image = iconAsset("logo-h") or ""
-    front.ImageColor3 = opts.letterColor or Color3.fromRGB(255, 255, 255)
     front.ScaleType = Enum.ScaleType.Fit
     front.ZIndex = (opts.zIndex or 1) + 1
     front.Parent = holder
+    if opts.letterColor then
+        front.ImageColor3 = opts.letterColor
+    else
+        themed(front, "ImageColor3", "text")
+    end
 
     if opts.zIndex then
         holder.ZIndex = opts.zIndex
@@ -742,12 +1019,16 @@ local function nextOrder(holder)
     return n
 end
 
--- Motion presets. Quint out is the base curve for everything that moves or
--- fades, Back for the parts that should settle with a small overshoot (toggle
--- knob, window open, tab indicator).
+-- Motion ----------------------------------------------------------------------
+-- Four curves, each with a job:
+--   EASE      Quint out, the base curve for anything that travels
+--   EASE_SOFT Sine out, colour and opacity, where an overshoot reads as a glitch
+--   EASE_POP  Back out, parts that should settle: a knob, the window, a panel
+--   EASE_JELLY Back out over a longer beat, the toast stack shifting up
 local EASE = Enum.EasingStyle.Quint
 local EASE_SOFT = Enum.EasingStyle.Sine
 local EASE_POP = Enum.EasingStyle.Back
+local EASE_JELLY = Enum.EasingStyle.Back
 local OUT = Enum.EasingDirection.Out
 
 local function tween(instance, time, props, style, dir)
@@ -762,15 +1043,43 @@ local function tintIcon(img, color)
     tween(img, 0.18, { ImageColor3 = color }, EASE_SOFT)
 end
 
--- Hover helper: fades a part between two colours and returns the setter, so a
--- control can force the resting colour after a click without re-reading state.
-local function hoverFill(part, base, hover, time)
-    part.MouseEnter:Connect(function() tween(part, time or 0.14, { BackgroundColor3 = hover() }, EASE_SOFT) end)
-    part.MouseLeave:Connect(function() tween(part, time or 0.18, { BackgroundColor3 = base() }, EASE_SOFT) end)
+-- Hover on a filled surface. The fill lifts to the hover colour and a faint
+-- outline comes up with it, which is what a flat rectangle needs before it reads
+-- as something you can press. Returns settle(), so a control can force the
+-- resting look after a click without re-reading its own state.
+local function hoverSurface(part, opts)
+    opts = opts or {}
+    local base = opts.base or function() return PALETTE.control end
+    local over = opts.hover or function() return PALETTE.controlHover end
+    local edge = nil
+    if opts.edge ~= false then
+        edge = stateStroke(part, opts.edgeKey or "accent", opts.thickness)
+    end
+    local edgeOn = opts.edgeTransparency or 0.6
+    local hovering = false
+    local function settle(instant)
+        local color = hovering and over() or base()
+        if instant then
+            part.BackgroundColor3 = color
+        else
+            tween(part, hovering and 0.14 or 0.2, { BackgroundColor3 = color }, EASE_SOFT)
+        end
+        if edge then
+            tween(edge, hovering and 0.14 or 0.22, { Transparency = hovering and edgeOn or 1 }, EASE_SOFT)
+        end
+    end
+    part.MouseEnter:Connect(function()
+        hovering = true
+        settle()
+    end)
+    part.MouseLeave:Connect(function()
+        hovering = false
+        settle()
+    end)
+    return settle, edge
 end
 
--- Press feedback: a short squash on mouse down, released on mouse up. Used by
--- buttons and by the pill toggles.
+-- Press feedback: a short squash on mouse down, released on mouse up.
 local function pressScale(button, amount)
     local scale = newInstance("UIScale")
     scale.Parent = button
@@ -778,6 +1087,38 @@ local function pressScale(button, amount)
     button.MouseButton1Up:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_POP) end)
     button.MouseLeave:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_SOFT) end)
     return scale
+end
+
+-- A ring that leaves the point of contact and fades as it crosses the surface.
+-- It is what tells a wide flat button that the click landed, where a colour
+-- change alone is too quiet to notice.
+--
+-- Only the horizontal position comes from the pointer: input coordinates and
+-- absolute positions do not share an origin on every executor, and the vertical
+-- centre reads the same anyway on a control sized row.
+local function pressRipple(button, key)
+    button.ClipsDescendants = true
+    button.InputBegan:Connect(function(input)
+        if not isPointer(input.UserInputType) then return end
+        local size = button.AbsoluteSize
+        local reach = math.max(size.X, size.Y) * 2.4
+        if reach < 8 then return end
+        local ring = newInstance("Frame")
+        ring.Name = randomName()
+        ring.AnchorPoint = Vector2.new(0.5, 0.5)
+        ring.Position = UDim2.new(0, input.Position.X - button.AbsolutePosition.X, 0.5, 0)
+        ring.Size = UDim2.new(0, 0, 0, 0)
+        ring.BackgroundTransparency = 0.82
+        ring.BorderSizePixel = 0
+        ring.ZIndex = button.ZIndex + 1
+        themed(ring, "BackgroundColor3", key or "text", { fade = false })
+        ring.Parent = button
+        corner(ring, 500)
+        tween(ring, 0.45, { Size = UDim2.new(0, reach, 0, reach), BackgroundTransparency = 1 }, EASE)
+        task.delay(0.5, function()
+            if ring.Parent then ring:Destroy() end
+        end)
+    end)
 end
 
 -- Drag a frame by a handle. The frame is kept on screen (a margin of it always
@@ -835,6 +1176,47 @@ local function animateBrand(label)
     return rebuild
 end
 
+-- An accent underline that slides between the buttons of a bar instead of one
+-- line per button blinking on and off. The geometry comes from the buttons'
+-- absolute rectangles because they are auto sized, and the first placement is
+-- deferred until the layout has given them a width.
+local function slidingUnderline(bar, thickness)
+    local line = newInstance("Frame")
+    line.Name = randomName()
+    line.AnchorPoint = Vector2.new(0, 1)
+    line.Position = UDim2.new(0, 0, 1, 0)
+    line.Size = UDim2.new(0, 0, 0, thickness or 2)
+    line.BorderSizePixel = 0
+    line.ZIndex = 3
+    themed(line, "BackgroundColor3", "accent")
+    line.Parent = bar
+    corner(line, 1)
+
+    local current = nil
+    local function place(target, animate)
+        current = target or current
+        if not current or not current.Parent then return end
+        local width = current.AbsoluteSize.X
+        if width < 1 then
+            task.defer(function() place(nil, false) end)
+            return
+        end
+        local x = current.AbsolutePosition.X - bar.AbsolutePosition.X
+        local size = UDim2.new(0, width, 0, thickness or 2)
+        local position = UDim2.new(0, x, 1, 0)
+        if animate then
+            tween(line, 0.28, { Position = position, Size = size }, EASE)
+        else
+            line.Position = position
+            line.Size = size
+        end
+    end
+    -- The bar shifts when the window moves or the sub-tab list is re-laid out.
+    local conn = bar:GetPropertyChangedSignal("AbsolutePosition"):Connect(function() place(nil, false) end)
+    line.Destroying:Connect(function() conn:Disconnect() end)
+    return place
+end
+
 -- Floating panels -------------------------------------------------------------
 -- Dropdown lists, colour pickers and gear popovers are not children of the
 -- control that opens them: they live in the window overlay so they always draw
@@ -881,14 +1263,14 @@ local function openPanel(ctx, cfg)
     panel.Name = randomName()
     panel.Size = UDim2.new(0, width, 0, cfg.height or 0)
     panel.AutomaticSize = Enum.AutomaticSize.Y
-    panel.BackgroundColor3 = PALETTE.card
     panel.BorderSizePixel = 0
     panel.GroupTransparency = 1
     panel.ZIndex = zBase + 1
     panel.Parent = ctx.overlay
+    themed(panel, "BackgroundColor3", "card")
     corner(panel, cfg.radius or 10)
     -- A stroke is not composited by GroupTransparency, so it fades on its own.
-    local edge = stroke(panel, PALETTE.stroke, 1, 1)
+    local edge = stateStroke(panel, "stroke")
 
     local scroller = scrollerOf(anchor)
     local controller, closed = nil, false
@@ -951,14 +1333,15 @@ local function openPanel(ctx, cfg)
 
     place()
     clip()
-    -- Open: fade in with a small settle, position is owned by place() so the
-    -- panel can be moved by a scroll while it is still appearing.
+    -- Open: the panel unfolds from the top edge it is anchored to and fades in
+    -- with it. Position belongs to place(), so it can still be moved by a scroll
+    -- while it is appearing.
     local scale = newInstance("UIScale")
-    scale.Scale = 0.97
+    scale.Scale = 0.94
     scale.Parent = panel
-    tween(panel, 0.16, { GroupTransparency = 0 })
-    tween(edge, 0.18, { Transparency = 0.2 }, EASE_SOFT)
-    tween(scale, 0.22, { Scale = 1 }, EASE_POP)
+    tween(panel, 0.16, { GroupTransparency = 0 }, EASE_SOFT)
+    tween(edge, 0.2, { Transparency = 0.35 }, EASE_SOFT)
+    tween(scale, 0.26, { Scale = 1 }, EASE_POP)
 
     return panel, controller
 end
@@ -980,13 +1363,13 @@ local function rowLabel(row, text, rightInset)
     label.BackgroundTransparency = 1
     label.Position = UDim2.new(0, 0, 0, 0)
     label.Size = UDim2.new(1, -(rightInset or 54), 1, 0)
-    label.FontFace = FONT
-    label.TextSize = 15
-    label.TextColor3 = PALETTE.text
+    label.TextSize = 14
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextTruncate = Enum.TextTruncate.AtEnd
-    label.Text = text
     label.Parent = row
+    faced(label, "medium")
+    themed(label, "TextColor3", "text")
+    localized(label, "Text", text)
     return label
 end
 
@@ -997,17 +1380,17 @@ local function makePill(row, ctx, get, set)
     pill.Size = UDim2.new(0, 44, 0, 22)
     pill.AutoButtonColor = false
     pill.Text = ""
-    pill.BackgroundColor3 = PALETTE.track
     pill.BorderSizePixel = 0
     pill.Parent = row
+    themed(pill, "BackgroundColor3", "track", { fade = false })
     corner(pill, 11)
 
     local knob = Instance.new("Frame")
     knob.Size = UDim2.new(0, 16, 0, 16)
     knob.Position = UDim2.new(0, 3, 0.5, -8)
-    knob.BackgroundColor3 = PALETTE.text
     knob.BorderSizePixel = 0
     knob.Parent = pill
+    themed(knob, "BackgroundColor3", "text")
     corner(knob, 8)
 
     local function render(value)
@@ -1030,6 +1413,11 @@ local function makePill(row, ctx, get, set)
     end)
     pressScale(pill, 0.94)
     pill.MouseButton1Click:Connect(function()
+        -- Without a setter the control is a read out of someone else's value, so
+        -- the press is ignored rather than raising. win:flag returns two values
+        -- and is truncated to the getter when anything follows it, which is the
+        -- usual way a control ends up with no setter.
+        if not set then return end
         local value = not get()
         set(value)
         render(value)
@@ -1045,7 +1433,7 @@ local function gearIcon(row)
     btn.BackgroundTransparency = 1
     btn.Text = ""
     btn.Parent = row
-    local img = makeIcon(btn, "settings", UDim2.new(1, 0, 1, 0), PALETTE.text)
+    local img = makeIcon(btn, "settings", UDim2.new(1, 0, 1, 0), "subtext")
     img.Active = false
     -- Fallback drawn cog if the settings icon file is missing.
     if img.Image == "" then
@@ -1055,8 +1443,8 @@ local function gearIcon(row)
             tooth.Position = UDim2.new(0.5, 0, 0.5, 0)
             tooth.Size = UDim2.new(0, 16, 0, 5)
             tooth.Rotation = i * 60
-            tooth.BackgroundColor3 = PALETTE.text
             tooth.BorderSizePixel = 0
+            themed(tooth, "BackgroundColor3", "subtext")
             corner(tooth, 2)
             tooth.Parent = btn
         end
@@ -1064,19 +1452,13 @@ local function gearIcon(row)
         hole.AnchorPoint = Vector2.new(0.5, 0.5)
         hole.Position = UDim2.new(0.5, 0, 0.5, 0)
         hole.Size = UDim2.new(0, 7, 0, 7)
-        hole.BackgroundColor3 = PALETTE.card
         hole.BorderSizePixel = 0
+        themed(hole, "BackgroundColor3", "card")
         corner(hole, 4)
         hole.Parent = btn
     end
-    btn.MouseEnter:Connect(function()
-        if img.Image ~= "" then tintIcon(img, PALETTE.accent) end
-        tween(img, 0.25, { Rotation = img.Rotation + 45 })
-    end)
-    btn.MouseLeave:Connect(function()
-        if img.Image ~= "" then tintIcon(img, PALETTE.text) end
-        tween(img, 0.3, { Rotation = 0 })
-    end)
+    btn.MouseEnter:Connect(function() tintIcon(img, PALETTE.text) end)
+    btn.MouseLeave:Connect(function() tintIcon(img, PALETTE.subtext) end)
     return btn, img
 end
 
@@ -1093,13 +1475,31 @@ function Controls.label(parent, text)
     label.Size = UDim2.new(1, 0, 0, 0)
     label.AutomaticSize = Enum.AutomaticSize.Y
     label.TextWrapped = true
-    label.FontFace = FONT
     label.TextSize = 13
-    label.TextColor3 = PALETTE.subtext
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Top
-    label.Text = text
+    label.LineHeight = 1.12
     label.Parent = row
+    faced(label, "regular")
+    themed(label, "TextColor3", "subtext")
+    local setPhrase = localized(label, "Text", text)
+    return row, setPhrase
+end
+
+-- A caption that splits a long card into groups. Text only: a coloured tick in
+-- front of a heading is noise once every card already sits on its own surface.
+function Controls.section(parent, text)
+    local row = controlRow(parent, 16)
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Bottom
+    label.Parent = row
+    faced(label, "semibold")
+    themed(label, "TextColor3", "subtext")
+    localized(label, "Text", text, string.upper)
     return row
 end
 
@@ -1144,13 +1544,15 @@ function Controls.toggle(parent, ctx, text, get, set, buildSettings)
             local title = newInstance("TextLabel")
             title.BackgroundTransparency = 1
             title.Size = UDim2.new(1, 0, 0, 18)
-            title.FontFace = FONT
             title.TextSize = 15
-            title.TextColor3 = PALETTE.text
             title.TextXAlignment = Enum.TextXAlignment.Left
-            title.Text = text .. " Settings"
             title.LayoutOrder = nextOrder(body)
             title.Parent = body
+            faced(title, "semibold")
+            themed(title, "TextColor3", "text")
+            localized(title, "Text", text, function(value)
+                return value .. " " .. translate("Settings")
+            end)
             buildSettings(Card.new(body, ctx))
             tween(gearImg, 0.25, { Rotation = 90 })
         end)
@@ -1162,17 +1564,35 @@ function Controls.button(parent, ctx, text, onClick)
     local row = controlRow(parent, 34)
     local button = newInstance("TextButton")
     button.Size = UDim2.new(1, 0, 1, 0)
-    themed(button, "BackgroundColor3", "control")
     button.BorderSizePixel = 0
     button.AutoButtonColor = false
-    button.FontFace = FONT
     button.TextSize = 14
-    button.TextColor3 = PALETTE.text
-    button.Text = text
+    button.Text = ""
     button.Parent = row
-    corner(button, 6)
-    hoverFill(button, function() return PALETTE.control end, function() return PALETTE.controlHover end)
-    pressScale(button, 0.97)
+    themed(button, "BackgroundColor3", "control")
+    corner(button, 8)
+
+    -- The caption is its own label so the ripple can be clipped by the button
+    -- without the text being clipped with it.
+    local caption = newInstance("TextLabel")
+    caption.BackgroundTransparency = 1
+    caption.Size = UDim2.new(1, -20, 1, 0)
+    caption.Position = UDim2.new(0, 10, 0, 0)
+    caption.TextSize = 14
+    caption.TextTruncate = Enum.TextTruncate.AtEnd
+    caption.ZIndex = 3
+    caption.Parent = button
+    faced(caption, "medium")
+    themed(caption, "TextColor3", "text")
+    localized(caption, "Text", text)
+
+    hoverSurface(button, {
+        base = function() return PALETTE.control end,
+        hover = function() return PALETTE.controlHover end,
+        edgeTransparency = 0.55,
+    })
+    pressRipple(button, "accent")
+    pressScale(button, 0.985)
     button.MouseButton1Click:Connect(function()
         if onClick then onClick() end
     end)
@@ -1186,25 +1606,24 @@ function Controls.input(parent, ctx, text, placeholder, get, set)
     box.AnchorPoint = Vector2.new(1, 0.5)
     box.Position = UDim2.new(1, 0, 0.5, 0)
     box.Size = UDim2.new(0, 140, 0, 26)
-    themed(box, "BackgroundColor3", "control")
     box.BorderSizePixel = 0
-    box.FontFace = FONT
     box.TextSize = 13
-    box.TextColor3 = PALETTE.text
-    box.PlaceholderColor3 = PALETTE.subtext
-    box.PlaceholderText = placeholder or ""
     box.Text = (get and get()) or ""
     box.ClearTextOnFocus = false
     box.TextXAlignment = Enum.TextXAlignment.Left
     box.TextTruncate = Enum.TextTruncate.AtEnd
     box.Parent = row
+    faced(box, "regular")
+    themed(box, "BackgroundColor3", "control")
+    themed(box, "TextColor3", "text")
+    themed(box, "PlaceholderColor3", "subtext")
+    localized(box, "PlaceholderText", placeholder or "")
     corner(box, 6)
     padding(box, nil, { left = 10, right = 10 })
     -- The outline lights up in the accent while the box has focus, so it is clear
     -- which field the keyboard is going to.
-    local edge = stroke(box, PALETTE.accent, 1, 1)
+    local edge = stateStroke(box, "accent")
     box.Focused:Connect(function()
-        edge.Color = PALETTE.accent
         tween(edge, 0.16, { Transparency = 0.25 }, EASE_SOFT)
         tween(box, 0.16, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT)
     end)
@@ -1222,52 +1641,65 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Position = UDim2.new(0, 0, 0, 0)
-    label.Size = UDim2.new(1, -54, 0, 20)
-    label.FontFace = FONT
-    label.TextSize = 15
-    label.TextColor3 = PALETTE.text
+    label.Size = UDim2.new(1, -60, 0, 20)
+    label.TextSize = 14
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Text = text
+    label.TextTruncate = Enum.TextTruncate.AtEnd
     label.Parent = row
+    faced(label, "medium")
+    themed(label, "TextColor3", "text")
+    localized(label, "Text", text)
 
     local valueBox = Instance.new("TextBox")
     valueBox.AnchorPoint = Vector2.new(1, 0)
     valueBox.Position = UDim2.new(1, 0, 0, 0)
-    valueBox.Size = UDim2.new(0, 50, 0, 20)
-    themed(valueBox, "BackgroundColor3", "control")
+    valueBox.Size = UDim2.new(0, 54, 0, 21)
     valueBox.BorderSizePixel = 0
-    valueBox.FontFace = FONT
     valueBox.TextSize = 13
-    valueBox.TextColor3 = PALETTE.text
     valueBox.Text = "0"
     valueBox.ClearTextOnFocus = false
     valueBox.TextXAlignment = Enum.TextXAlignment.Center
     valueBox.Parent = row
+    faced(valueBox, "medium")
+    themed(valueBox, "BackgroundColor3", "control")
+    themed(valueBox, "TextColor3", "text")
     corner(valueBox, 5)
+    local valueEdge = stateStroke(valueBox, "accent")
+    valueBox.Focused:Connect(function() tween(valueEdge, 0.16, { Transparency = 0.3 }, EASE_SOFT) end)
 
     local track = Instance.new("TextButton")
-    track.Position = UDim2.new(0, 0, 1, -10)
+    track.AnchorPoint = Vector2.new(0, 1)
+    track.Position = UDim2.new(0, 0, 1, -4)
     track.Size = UDim2.new(1, 0, 0, 6)
-    themed(track, "BackgroundColor3", "track")
     track.BorderSizePixel = 0
     track.AutoButtonColor = false
     track.Text = ""
     track.Parent = row
+    themed(track, "BackgroundColor3", "track")
     corner(track, 3)
 
     local fill = Instance.new("Frame")
-    themed(fill, "BackgroundColor3", "accent")
     fill.BorderSizePixel = 0
     fill.Parent = track
+    themed(fill, "BackgroundColor3", "accent")
     corner(fill, 3)
+    -- A gradient modulates the fill, so the bar reads as a bar and not as a flat
+    -- block, and it keeps doing that after the accent is changed because the
+    -- ramp is a brightness ramp rather than a second colour.
+    local fillGrad = Instance.new("UIGradient")
+    fillGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(92, 92, 92)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
+    })
+    fillGrad.Parent = fill
 
     local knob = Instance.new("Frame")
     knob.AnchorPoint = Vector2.new(0.5, 0.5)
     knob.Size = UDim2.new(0, 12, 0, 12)
-    knob.BackgroundColor3 = PALETTE.text
     knob.BorderSizePixel = 0
     knob.ZIndex = 2
     knob.Parent = track
+    themed(knob, "BackgroundColor3", "text")
     corner(knob, 6)
 
     local function clampValue(value)
@@ -1286,8 +1718,8 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
             fill.Size = UDim2.new(ratio, 0, 1, 0)
             knob.Position = UDim2.new(ratio, 0, 0.5, 0)
         else
-            tween(fill, 0.2, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
-            tween(knob, 0.2, { Position = UDim2.new(ratio, 0, 0.5, 0) }, EASE_SOFT)
+            tween(fill, 0.22, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
+            tween(knob, 0.22, { Position = UDim2.new(ratio, 0, 0.5, 0) }, EASE_SOFT)
         end
         valueBox.Text = format and format(value) or tostring(value)
     end
@@ -1295,7 +1727,8 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
 
     -- The value box accepts a typed number (clamped to range).
     valueBox.FocusLost:Connect(function()
-        local typed = tonumber(string.match(valueBox.Text, "[%-%d%.]+"))
+        tween(valueEdge, 0.2, { Transparency = 1 }, EASE_SOFT)
+        local typed = set and tonumber(string.match(valueBox.Text, "[%-%d%.]+"))
         if typed then
             local value = math.clamp(clampValue(typed), min, max)
             set(value)
@@ -1307,6 +1740,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
 
     local dragging = false
     local function setFromX(x)
+        if not set then return end
         local ratio = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
         local value = clampValue(min + ratio * (max - min))
         set(value)
@@ -1318,12 +1752,14 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
         if not isPointer(input.UserInputType) then return end
         dragging = true
         tween(knob, 0.12, { Size = UDim2.new(0, 16, 0, 16) }, EASE_POP)
+        tween(track, 0.14, { Size = UDim2.new(1, 0, 0, 8) }, EASE_SOFT)
         setFromX(input.Position.X)
         beginDrag({
             move = setFromX,
             stop = function()
                 dragging = false
                 tween(knob, 0.18, { Size = UDim2.new(0, 12, 0, 12) }, EASE_SOFT)
+                tween(track, 0.2, { Size = UDim2.new(1, 0, 0, 6) }, EASE_SOFT)
             end,
         })
     end)
@@ -1342,22 +1778,23 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     local multi = opts.multi
     local row = controlRow(parent, 30)
     rowLabel(row, text, 150)
-    local kbIcon = makeIcon(row, "keyboard", UDim2.new(0, 22, 0, 22), PALETTE.text)
+    local kbIcon = makeIcon(row, "keyboard", UDim2.new(0, 22, 0, 22), "subtext")
     kbIcon.AnchorPoint = Vector2.new(1, 0.5)
     kbIcon.Position = UDim2.new(1, -126, 0.5, 0)
     local button = Instance.new("TextButton")
     button.AnchorPoint = Vector2.new(1, 0.5)
     button.Position = UDim2.new(1, 0, 0.5, 0)
     button.Size = UDim2.new(0, 116, 0, 24)
-    themed(button, "BackgroundColor3", "control")
     button.BorderSizePixel = 0
     button.AutoButtonColor = false
-    button.FontFace = FONT
     button.TextSize = 13
-    button.TextColor3 = PALETTE.text
     button.TextTruncate = Enum.TextTruncate.AtEnd
     button.Parent = row
+    faced(button, "medium")
+    themed(button, "BackgroundColor3", "control")
+    themed(button, "TextColor3", "text", { fade = false })
     corner(button, 6)
+    local captureEdge = stateStroke(button, "accent")
 
     -- A visible clear button (tap to remove the bind) for users who do not know
     -- the right click shortcut and players on mobile / console. Uses the x icon.
@@ -1372,7 +1809,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     clearBtn.ZIndex = 4
     clearBtn.Visible = false
     clearBtn.Parent = button
-    local clearImg = makeIcon(clearBtn, "x", UDim2.new(1, 0, 1, 0), PALETTE.subtext)
+    local clearImg = makeIcon(clearBtn, "x", UDim2.new(1, 0, 1, 0), "subtext")
     clearImg.Active = false
 
     -- Normalise the stored value into a list of key names.
@@ -1388,10 +1825,11 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     end
     local function display()
         local list = keyList()
-        if #list == 0 then return "None" end
+        if #list == 0 then return translate("None") end
         return table.concat(list, " + ")
     end
     local function commit(list)
+        if not setKey then return end
         if multi then
             setKey(list)
         else
@@ -1402,10 +1840,14 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     end
     button.Text = display()
     clearBtn.Visible = #keyList() > 0
+    local function stopCapture()
+        tween(captureEdge, 0.2, { Transparency = 1 }, EASE_SOFT)
+        tween(button, 0.18, { TextColor3 = PALETTE.text }, EASE_SOFT)
+    end
     clearBtn.MouseButton1Click:Connect(function()
         commit({})
-        button.TextColor3 = PALETTE.text
-        tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
+        stopCapture()
+        tween(button, 0.14, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
     end)
     clearBtn.MouseEnter:Connect(function() tintIcon(clearImg, PALETTE.accent) end)
     clearBtn.MouseLeave:Connect(function() tintIcon(clearImg, PALETTE.subtext) end)
@@ -1422,16 +1864,17 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
         return nil
     end
     button.MouseEnter:Connect(function()
-        if not capturing then tween(button, 0.12, { BackgroundColor3 = PALETTE.controlHover }) end
+        if not capturing then tween(button, 0.14, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT) end
     end)
     button.MouseLeave:Connect(function()
-        if not capturing then tween(button, 0.12, { BackgroundColor3 = PALETTE.control }) end
+        if not capturing then tween(button, 0.18, { BackgroundColor3 = PALETTE.control }, EASE_SOFT) end
     end)
     -- Left click: start capturing the next key or mouse button.
     button.MouseButton1Click:Connect(function()
         capturing = true
         button.Text = "..."
-        button.TextColor3 = PALETTE.accent
+        tween(button, 0.16, { TextColor3 = PALETTE.accent }, EASE_SOFT)
+        tween(captureEdge, 0.16, { Transparency = 0.2 }, EASE_SOFT)
     end)
     -- Right click clears the bind, unless a mouse button was just captured (the
     -- capturing right-click is handled by InputBegan, so ignore its release here).
@@ -1439,8 +1882,8 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
         if capturing then return end
         if os.clock() - lastBind < 0.3 then return end
         commit({})
-        button.TextColor3 = PALETTE.text
-        tween(button, 0.12, { BackgroundColor3 = PALETTE.control })
+        stopCapture()
+        tween(button, 0.14, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
     end)
     -- One shared InputBegan feeds every keybind, so a script with fifty binds
     -- still has a single connection on the service.
@@ -1450,7 +1893,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
             if input.UserInputType == Enum.UserInputType.Keyboard then
                 capturing = false
                 lastBind = os.clock()
-                button.TextColor3 = PALETTE.text
+                stopCapture()
                 local name = input.KeyCode.Name
                 if name == "Escape" or name == "Backspace" or name == "Delete" then
                     commit({})
@@ -1470,7 +1913,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
                 -- MouseButton1 is reserved for clicking the button itself.
                 capturing = false
                 lastBind = os.clock()
-                button.TextColor3 = PALETTE.text
+                stopCapture()
                 if multi then
                     local list = keyList()
                     local has = false
@@ -1524,23 +1967,22 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
     button.AnchorPoint = Vector2.new(1, 0.5)
     button.Position = UDim2.new(1, 0, 0.5, 0)
     button.Size = UDim2.new(0, 140, 0, 26)
-    themed(button, "BackgroundColor3", "control")
     button.BorderSizePixel = 0
     button.AutoButtonColor = false
-    button.FontFace = FONT
     button.TextSize = 13
-    button.TextColor3 = PALETTE.text
     button.TextXAlignment = Enum.TextXAlignment.Left
     button.TextTruncate = Enum.TextTruncate.AtEnd
     button.Parent = row
+    faced(button, "regular")
+    themed(button, "BackgroundColor3", "control")
+    themed(button, "TextColor3", "text")
     corner(button, 6)
     padding(button, nil, { left = 10, right = 24 })
 
-    local arrow = makeIcon(row, "chevron-down", UDim2.new(0, 18, 0, 18), PALETTE.text)
+    local arrow = makeIcon(row, "chevron-down", UDim2.new(0, 18, 0, 18), "subtext")
     arrow.AnchorPoint = Vector2.new(1, 0.5)
     arrow.Position = UDim2.new(1, -8, 0.5, 0)
-    button.MouseEnter:Connect(function() tween(button, 0.12, { BackgroundColor3 = PALETTE.controlHover }) end)
-    button.MouseLeave:Connect(function() tween(button, 0.12, { BackgroundColor3 = PALETTE.control }) end)
+    hoverSurface(button, { edgeTransparency = 0.6 })
 
     local selected = {}
     if multi then
@@ -1548,15 +1990,18 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             for _, v in ipairs(get()) do selected[v] = true end
         end
     end
+    -- The stored value is always the option as the script wrote it; only what is
+    -- drawn goes through the phrase table, so a translated build still hands the
+    -- script back the identifier it knows.
     local function labelText()
         if multi then
             local list = {}
             for _, opt in ipairs(getOptions()) do
-                if selected[opt] then table.insert(list, opt) end
+                if selected[opt] then table.insert(list, translate(tostring(opt))) end
             end
-            return #list == 0 and "None" or table.concat(list, ", ")
+            return #list == 0 and translate("None") or table.concat(list, ", ")
         end
-        return tostring(get())
+        return translate(tostring(get()))
     end
     button.Text = labelText()
     if ctx and ctx._refresh then
@@ -1608,26 +2053,26 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             local header = newInstance("Frame")
             header.Name = randomName()
             header.Size = UDim2.new(1, 0, 0, 38)
-            header.BackgroundColor3 = PALETTE.control
             header.BorderSizePixel = 0
             header.LayoutOrder = 0
             header.Parent = panel
-            local sicon = makeIcon(header, "search", UDim2.new(0, 16, 0, 16), PALETTE.subtext)
+            themed(header, "BackgroundColor3", "control")
+            local sicon = makeIcon(header, "search", UDim2.new(0, 16, 0, 16), "subtext")
             sicon.AnchorPoint = Vector2.new(0, 0.5)
             sicon.Position = UDim2.new(0, 12, 0.5, 0)
             searchBox = newInstance("TextBox")
             searchBox.BackgroundTransparency = 1
             searchBox.Position = UDim2.new(0, 36, 0, 0)
             searchBox.Size = UDim2.new(1, -46, 1, 0)
-            searchBox.FontFace = FONT
             searchBox.TextSize = 13
-            searchBox.TextColor3 = PALETTE.text
-            searchBox.PlaceholderColor3 = PALETTE.subtext
-            searchBox.PlaceholderText = "Search.."
             searchBox.Text = ""
             searchBox.ClearTextOnFocus = false
             searchBox.TextXAlignment = Enum.TextXAlignment.Left
             searchBox.Parent = header
+            faced(searchBox, "regular")
+            themed(searchBox, "TextColor3", "text")
+            themed(searchBox, "PlaceholderColor3", "subtext")
+            localized(searchBox, "PlaceholderText", "Search..")
         end
 
         -- The list scrolls on its own. A long list then stays inside the panel,
@@ -1642,10 +2087,10 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         body.AutomaticCanvasSize = Enum.AutomaticSize.Y
         body.ScrollingDirection = Enum.ScrollingDirection.Y
         body.ScrollBarThickness = 3
-        body.ScrollBarImageColor3 = PALETTE.subtext
         body.ScrollBarImageTransparency = 0.4
         body.LayoutOrder = 1
         body.Parent = panel
+        themed(body, "ScrollBarImageColor3", "subtext")
         listLayout(body, 3)
         padding(body, 6)
 
@@ -1663,10 +2108,10 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             local on = (multi and selected[opt] and true) or ((not multi) and tostring(get()) == tostring(opt))
             refs.on = on
             refs.btn.BackgroundColor3 = PALETTE.controlHover
-            tween(refs.btn, 0.12, { BackgroundTransparency = on and 0 or 1 }, EASE_SOFT)
-            tween(refs.label, 0.12, { TextColor3 = on and PALETTE.accent or PALETTE.text }, EASE_SOFT)
+            tween(refs.btn, 0.14, { BackgroundTransparency = on and 0 or 1 }, EASE_SOFT)
+            tween(refs.label, 0.14, { TextColor3 = on and PALETTE.accent or PALETTE.text }, EASE_SOFT)
             if refs.tick then
-                tween(refs.tick, 0.14, { ImageTransparency = on and 0 or 1 }, EASE_SOFT)
+                tween(refs.tick, 0.16, { ImageTransparency = on and 0 or 1 }, EASE_SOFT)
             end
         end
 
@@ -1674,45 +2119,51 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             local optBtn = newInstance("TextButton")
             optBtn.Name = randomName()
             optBtn.Size = UDim2.new(1, 0, 0, 32)
-            optBtn.BackgroundColor3 = PALETTE.controlHover
             optBtn.BackgroundTransparency = 1
             optBtn.BorderSizePixel = 0
             optBtn.AutoButtonColor = false
             optBtn.Text = ""
             optBtn.LayoutOrder = nextOrder(body)
             optBtn.Parent = body
+            themed(optBtn, "BackgroundColor3", "controlHover", { fade = false })
             corner(optBtn, 8)
 
             local optLabel = newInstance("TextLabel")
             optLabel.BackgroundTransparency = 1
             optLabel.Position = UDim2.new(0, 14, 0, 0)
             optLabel.Size = UDim2.new(1, -46, 1, 0)
-            optLabel.FontFace = FONT
             optLabel.TextSize = 13
-            optLabel.TextColor3 = PALETTE.text
             optLabel.TextXAlignment = Enum.TextXAlignment.Left
             optLabel.TextTruncate = Enum.TextTruncate.AtEnd
-            optLabel.Text = tostring(opt)
+            optLabel.ZIndex = 2
             optLabel.Parent = optBtn
+            faced(optLabel, "medium")
+            localized(optLabel, "Text", tostring(opt))
 
             -- A tick on the right of a picked row, so a multi select reads at a
             -- glance without counting highlighted rows.
-            local tick = makeIcon(optBtn, "check", UDim2.new(0, 16, 0, 16), PALETTE.accent)
+            local tick = makeIcon(optBtn, "check", UDim2.new(0, 16, 0, 16), "accent")
             tick.AnchorPoint = Vector2.new(1, 0.5)
             tick.Position = UDim2.new(1, -12, 0.5, 0)
             tick.ImageTransparency = 1
+            tick.ZIndex = 2
             tick.Active = false
 
             local refs = { btn = optBtn, label = optLabel, tick = tick.Image ~= "" and tick or nil, on = false }
             optRows[opt] = refs
             paint(refs, opt)
+            pressRipple(optBtn, "accent")
             optBtn.MouseEnter:Connect(function()
                 if not refs.on then tween(optBtn, 0.12, { BackgroundTransparency = 0.5 }, EASE_SOFT) end
             end)
             optBtn.MouseLeave:Connect(function()
-                if not refs.on then tween(optBtn, 0.14, { BackgroundTransparency = 1 }, EASE_SOFT) end
+                if not refs.on then tween(optBtn, 0.16, { BackgroundTransparency = 1 }, EASE_SOFT) end
             end)
             optBtn.MouseButton1Click:Connect(function()
+                if not set then
+                    if opened then opened.close() end
+                    return
+                end
                 if multi then
                     selected[opt] = not selected[opt] or nil
                     paint(refs, opt)
@@ -1722,7 +2173,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
                     button.Text = labelText()
                 else
                     set(opt)
-                    button.Text = tostring(opt)
+                    button.Text = labelText()
                     if opened then opened.close() end
                 end
             end)
@@ -1733,7 +2184,9 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             searchBox:GetPropertyChangedSignal("Text"):Connect(function()
                 local q = searchBox.Text:lower()
                 for opt, refs in pairs(optRows) do
-                    refs.btn.Visible = q == "" or tostring(opt):lower():find(q, 1, true) ~= nil
+                    local shown = tostring(opt):lower()
+                    local drawn = refs.label.Text:lower()
+                    refs.btn.Visible = q == "" or shown:find(q, 1, true) ~= nil or drawn:find(q, 1, true) ~= nil
                 end
                 fitBody()
             end)
@@ -1755,7 +2208,6 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         return string.format("#%02X%02X%02X", rgb[1] or 0, rgb[2] or 0, rgb[3] or 0)
     end
 
-    -- Palette icon button on the far right (samet style).
     local pipette = Instance.new("TextButton")
     pipette.AnchorPoint = Vector2.new(1, 0.5)
     pipette.Position = UDim2.new(1, 0, 0.5, 0)
@@ -1764,7 +2216,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     pipette.AutoButtonColor = false
     pipette.Text = ""
     pipette.Parent = row
-    local palImg = makeIcon(pipette, "palette", UDim2.new(1, 0, 1, 0), PALETTE.text)
+    local palImg = makeIcon(pipette, "palette", UDim2.new(1, 0, 1, 0), "subtext")
     palImg.Active = false
 
     local hexLabel = Instance.new("TextLabel")
@@ -1772,27 +2224,36 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     hexLabel.Position = UDim2.new(1, -30, 0.5, 0)
     hexLabel.Size = UDim2.new(0, 72, 0, 20)
     hexLabel.BackgroundTransparency = 1
-    hexLabel.FontFace = FONT
-    hexLabel.TextSize = 14
-    hexLabel.TextColor3 = PALETTE.text
+    hexLabel.TextSize = 13
     hexLabel.TextXAlignment = Enum.TextXAlignment.Right
     hexLabel.Text = hexOf(getRgb())
     hexLabel.Parent = row
+    faced(hexLabel, "medium")
+    themed(hexLabel, "TextColor3", "subtext")
 
-    -- Round colour swatch to the left of the hex value.
+    -- Round swatch with the opacity grid under it, so a colour at 30% reads as a
+    -- colour at 30% rather than as a darker shade of itself.
     local swatch = Instance.new("TextButton")
     swatch.AnchorPoint = Vector2.new(1, 0.5)
     swatch.Position = UDim2.new(1, -108, 0.5, 0)
     swatch.Size = UDim2.new(0, 18, 0, 18)
-    swatch.BackgroundColor3 = colorOf(getRgb())
-    swatch.BackgroundTransparency = useAlpha and (1 - alpha) or 0
+    swatch.BackgroundTransparency = 1
     swatch.BorderSizePixel = 0
     swatch.AutoButtonColor = false
     swatch.Text = ""
     swatch.Active = false
+    swatch.ClipsDescendants = true
     swatch.Parent = row
     corner(swatch, 9)
-    stroke(swatch, PALETTE.stroke, 1, 0.2)
+    stroke(swatch, "stroke", 1, 0.2)
+    if useAlpha then checkerboard(swatch, 5, 0) end
+    local swatchFill = Instance.new("Frame")
+    swatchFill.Size = UDim2.new(1, 0, 1, 0)
+    swatchFill.BackgroundColor3 = colorOf(getRgb())
+    swatchFill.BackgroundTransparency = useAlpha and (1 - alpha) or 0
+    swatchFill.BorderSizePixel = 0
+    swatchFill.ZIndex = 2
+    swatchFill.Parent = swatch
 
     local opened = nil
     local h, s, v = colorOf(getRgb()):ToHSV()
@@ -1889,20 +2350,31 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         corner(hueCursor, 2)
         stroke(hueCursor, Color3.fromRGB(0, 0, 0), 1, 0.4)
 
-        -- Opacity (alpha) bar below the SV box.
-        local alphaBar, alphaCursor
+        -- Opacity bar: the grid first, then the colour over it with a
+        -- transparency ramp, so the left end shows the grid straight through.
+        local alphaHolder, alphaBar, alphaCursor
         if useAlpha then
+            alphaHolder = Instance.new("Frame")
+            alphaHolder.Position = UDim2.new(0, 0, 0, 150)
+            alphaHolder.Size = UDim2.new(1, 0, 0, 16)
+            alphaHolder.BackgroundTransparency = 1
+            alphaHolder.BorderSizePixel = 0
+            alphaHolder.ClipsDescendants = true
+            alphaHolder.Parent = panel
+            corner(alphaHolder, 4)
+            checkerboard(alphaHolder, 8, 0)
+
             alphaBar = Instance.new("ImageButton")
-            alphaBar.Position = UDim2.new(0, 0, 0, 150)
-            alphaBar.Size = UDim2.new(1, 0, 0, 16)
+            alphaBar.Size = UDim2.new(1, 0, 1, 0)
             alphaBar.BackgroundColor3 = colorOf(getRgb())
             alphaBar.AutoButtonColor = false
             alphaBar.BorderSizePixel = 0
-            alphaBar.Parent = panel
-            corner(alphaBar, 4)
+            alphaBar.ZIndex = 2
+            alphaBar.Parent = alphaHolder
             local aGrad = Instance.new("UIGradient")
             aGrad.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) })
             aGrad.Parent = alphaBar
+
             alphaCursor = Instance.new("Frame")
             alphaCursor.AnchorPoint = Vector2.new(0.5, 0.5)
             alphaCursor.Size = UDim2.new(0, 4, 1, 4)
@@ -1919,7 +2391,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         local function apply()
             sv.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
             local final = Color3.fromHSV(h, s, v)
-            swatch.BackgroundColor3 = final
+            swatchFill.BackgroundColor3 = final
             svCursor.Position = UDim2.new(s, 0, 1 - v, 0)
             hueCursor.Position = UDim2.new(0.5, 0, h, 0)
             local rgb = { math.floor(final.R * 255 + 0.5), math.floor(final.G * 255 + 0.5), math.floor(final.B * 255 + 0.5) }
@@ -1928,10 +2400,13 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             if useAlpha then
                 alphaBar.BackgroundColor3 = final
                 alphaCursor.Position = UDim2.new(alpha, 0, 0.5, 0)
-                swatch.BackgroundTransparency = 1 - alpha
+                swatchFill.BackgroundTransparency = 1 - alpha
                 rgb[4] = alpha
             end
-            setRgb(rgb)
+            if setRgb then setRgb(rgb) end
+            -- A picker writes through a setter of its own, so the config is told
+            -- by hand that something changed.
+            if ctx and ctx.markDirty then ctx:markDirty() end
         end
         local function updSV(x, y)
             s = math.clamp((x - sv.AbsolutePosition.X) / math.max(sv.AbsoluteSize.X, 1), 0, 1)
@@ -1961,13 +2436,21 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         hue.InputBegan:Connect(function(i)
             if not isPointer(i.UserInputType) then return end
             updHue(i.Position.Y)
-            beginDrag({ move = function(_, y) updHue(y) end })
+            tween(hueCursor, 0.12, { Size = UDim2.new(1, 6, 0, 6) }, EASE_POP)
+            beginDrag({
+                move = function(_, y) updHue(y) end,
+                stop = function() tween(hueCursor, 0.16, { Size = UDim2.new(1, 4, 0, 4) }, EASE_SOFT) end,
+            })
         end)
         if useAlpha then
             alphaBar.InputBegan:Connect(function(i)
                 if not isPointer(i.UserInputType) then return end
                 updAlpha(i.Position.X)
-                beginDrag({ move = function(x) updAlpha(x) end })
+                tween(alphaCursor, 0.12, { Size = UDim2.new(0, 6, 1, 6) }, EASE_POP)
+                beginDrag({
+                    move = function(x) updAlpha(x) end,
+                    stop = function() tween(alphaCursor, 0.16, { Size = UDim2.new(0, 4, 1, 4) }, EASE_SOFT) end,
+                })
             end)
         end
 
@@ -1975,18 +2458,21 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         hexBox.AnchorPoint = Vector2.new(0, 1)
         hexBox.Position = UDim2.new(0, 0, 1, 0)
         hexBox.Size = UDim2.new(1, 0, 0, 28)
-        hexBox.BackgroundColor3 = PALETTE.control
         hexBox.BorderSizePixel = 0
-        hexBox.FontFace = FONT
         hexBox.TextSize = 14
-        hexBox.TextColor3 = PALETTE.text
-        hexBox.PlaceholderColor3 = PALETTE.subtext
         hexBox.PlaceholderText = "#RRGGBB"
         hexBox.Text = hexLabel.Text
         hexBox.ClearTextOnFocus = false
         hexBox.Parent = panel
+        faced(hexBox, "medium")
+        themed(hexBox, "BackgroundColor3", "control")
+        themed(hexBox, "TextColor3", "text")
+        themed(hexBox, "PlaceholderColor3", "subtext")
         corner(hexBox, 6)
+        local hexEdge = stateStroke(hexBox, "accent")
+        hexBox.Focused:Connect(function() tween(hexEdge, 0.16, { Transparency = 0.3 }, EASE_SOFT) end)
         hexBox.FocusLost:Connect(function()
+            tween(hexEdge, 0.2, { Transparency = 1 }, EASE_SOFT)
             local hx = string.gsub(hexBox.Text, "#", "")
             if #hx == 6 then
                 local r = tonumber(string.sub(hx, 1, 2), 16)
@@ -2002,18 +2488,19 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         end)
     end
     pipette.MouseButton1Click:Connect(openPicker)
+    swatch.Active = true
     pipette.MouseEnter:Connect(function() tintIcon(palImg, PALETTE.accent) end)
-    pipette.MouseLeave:Connect(function() tintIcon(palImg, PALETTE.text) end)
+    pipette.MouseLeave:Connect(function() tintIcon(palImg, PALETTE.subtext) end)
     -- Keep the swatch and hex in sync when the value changes externally (theme reset).
     if ctx and ctx._refresh then
         table.insert(ctx._refresh, function()
             local c = colorOf(getRgb())
-            swatch.BackgroundColor3 = c
+            swatchFill.BackgroundColor3 = c
             hexLabel.Text = hexOf(getRgb())
             h, s, v = c:ToHSV()
             if useAlpha then
                 alpha = (getRgb() or {})[4] or alpha
-                swatch.BackgroundTransparency = 1 - alpha
+                swatchFill.BackgroundTransparency = 1 - alpha
             end
         end)
     end
@@ -2021,6 +2508,8 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
 end
 
 -- Segmented control: a row of mutually exclusive pills (Toggle / Hold / Always).
+-- One accent block slides between them instead of each pill repainting itself,
+-- which is what makes the change read as one movement.
 function Controls.segmented(parent, ctx, text, options, get, set)
     local row = controlRow(parent, 30)
     if text and text ~= "" then
@@ -2030,37 +2519,89 @@ function Controls.segmented(parent, ctx, text, options, get, set)
     holder.AnchorPoint = Vector2.new(1, 0.5)
     holder.Position = UDim2.new(1, 0, 0.5, 0)
     holder.Size = UDim2.new(0, math.min(60 * #options, 220), 1, -4)
-    holder.BackgroundTransparency = 1
+    holder.BorderSizePixel = 0
     holder.Parent = row
-    listLayout(holder, 6, Enum.FillDirection.Horizontal)
+    themed(holder, "BackgroundColor3", "control")
+    corner(holder, 7)
+    padding(holder, 3)
+    listLayout(holder, 4, Enum.FillDirection.Horizontal)
+
+    -- The marker is a sibling of the pill strip rather than a child of it: the
+    -- strip is padded, and a padded parent would offset the marker a second time
+    -- on top of the rectangle it was measured from.
+    local marker = Instance.new("Frame")
+    marker.Name = randomName()
+    marker.Size = UDim2.new(0, 0, 0, 0)
+    marker.Position = UDim2.new(0, 0, 0, 0)
+    marker.BorderSizePixel = 0
+    marker.ZIndex = 1
+    marker.Parent = row
+    themed(marker, "BackgroundColor3", "accent")
+    corner(marker, 5)
+
     local buttons = {}
-    local function render()
+    local function place(btn, animate)
+        if not btn or btn.AbsoluteSize.X < 1 then
+            task.defer(function()
+                local current = buttons[get()]
+                if current then place(current, false) end
+            end)
+            return
+        end
+        local origin = row.AbsolutePosition
+        local at = btn.AbsolutePosition
+        local size = btn.AbsoluteSize
+        local target = {
+            Position = UDim2.new(0, at.X - origin.X, 0, at.Y - origin.Y),
+            Size = UDim2.new(0, size.X, 0, size.Y),
+        }
+        if animate then
+            tween(marker, 0.26, target, EASE)
+        else
+            marker.Position = target.Position
+            marker.Size = target.Size
+        end
+    end
+    local function render(animate)
         local current = get()
         for value, btn in pairs(buttons) do
             local on = value == current
-            tween(btn, 0.14, { BackgroundColor3 = on and PALETTE.accent or PALETTE.control })
-            btn.TextColor3 = PALETTE.text
+            tween(btn, 0.16, { TextColor3 = on and PALETTE.background or PALETTE.subtext }, EASE_SOFT)
         end
+        place(buttons[current], animate)
     end
     for _, option in ipairs(options) do
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0, 54, 1, 0)
-        btn.BackgroundColor3 = PALETTE.control
+        btn.Size = UDim2.new(0, 52, 1, 0)
+        btn.BackgroundTransparency = 1
         btn.BorderSizePixel = 0
         btn.AutoButtonColor = false
-        btn.FontFace = FONT
         btn.TextSize = 13
-        btn.Text = tostring(option)
+        btn.ZIndex = 2
         btn.Parent = holder
-        corner(btn, 6)
+        faced(btn, "medium")
+        localized(btn, "Text", tostring(option))
         buttons[option] = btn
+        pressScale(btn, 0.94)
+        btn.MouseEnter:Connect(function()
+            if get() ~= option then tween(btn, 0.14, { TextColor3 = PALETTE.text }, EASE_SOFT) end
+        end)
+        btn.MouseLeave:Connect(function()
+            if get() ~= option then tween(btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT) end
+        end)
         btn.MouseButton1Click:Connect(function()
+            if not set then return end
             set(option)
-            render()
+            render(true)
         end)
     end
-    render()
-    if ctx and ctx._refresh then table.insert(ctx._refresh, render) end
+    render(false)
+    -- The row only knows its real width once the layout has run.
+    local conn = row:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+        place(buttons[get()], false)
+    end)
+    row.Destroying:Connect(function() conn:Disconnect() end)
+    if ctx and ctx._refresh then table.insert(ctx._refresh, function() render(true) end) end
     return row
 end
 
@@ -2080,72 +2621,80 @@ function Controls.list(parent, ctx, options, get, set, opts)
     if opts.search ~= false then
         local search = Instance.new("Frame")
         search.Size = UDim2.new(1, 0, 0, 30)
-        search.BackgroundColor3 = PALETTE.control
         search.BorderSizePixel = 0
         search.LayoutOrder = nextOrder(container)
         search.Parent = container
+        themed(search, "BackgroundColor3", "control")
         corner(search, 8)
-        local sicon = makeIcon(search, "search", UDim2.new(0, 15, 0, 15), PALETTE.subtext)
+        local sicon = makeIcon(search, "search", UDim2.new(0, 15, 0, 15), "subtext")
         sicon.AnchorPoint = Vector2.new(0, 0.5)
         sicon.Position = UDim2.new(0, 10, 0.5, 0)
         searchBox = Instance.new("TextBox")
         searchBox.BackgroundTransparency = 1
         searchBox.Position = UDim2.new(0, 32, 0, 0)
         searchBox.Size = UDim2.new(1, -42, 1, 0)
-        searchBox.FontFace = FONT
         searchBox.TextSize = 13
-        searchBox.TextColor3 = PALETTE.text
-        searchBox.PlaceholderColor3 = PALETTE.subtext
-        searchBox.PlaceholderText = "Search.."
         searchBox.Text = ""
         searchBox.ClearTextOnFocus = false
         searchBox.TextXAlignment = Enum.TextXAlignment.Left
         searchBox.Parent = search
+        faced(searchBox, "regular")
+        themed(searchBox, "TextColor3", "text")
+        themed(searchBox, "PlaceholderColor3", "subtext")
+        localized(searchBox, "PlaceholderText", "Search..")
     end
 
     local function render()
         local current = get()
         for value, refs in pairs(rows) do
             local on = value == current
-            refs.label.TextColor3 = on and PALETTE.accent or PALETTE.text
-            refs.row.BackgroundColor3 = PALETTE.controlHover
-            refs.row.BackgroundTransparency = on and 0 or 1
             refs.on = on
+            tween(refs.label, 0.14, { TextColor3 = on and PALETTE.accent or PALETTE.text }, EASE_SOFT)
+            refs.row.BackgroundColor3 = PALETTE.controlHover
+            tween(refs.row, 0.14, { BackgroundTransparency = on and 0 or 1 }, EASE_SOFT)
+            if refs.tick then
+                tween(refs.tick, 0.16, { ImageTransparency = on and 0 or 1 }, EASE_SOFT)
+            end
         end
     end
     for _, option in ipairs(options) do
         local optRow = Instance.new("TextButton")
         optRow.Size = UDim2.new(1, 0, 0, 32)
-        optRow.BackgroundColor3 = PALETTE.controlHover
         optRow.BackgroundTransparency = 1
+        optRow.BorderSizePixel = 0
         optRow.AutoButtonColor = false
         optRow.Text = ""
         optRow.LayoutOrder = nextOrder(container)
         optRow.Parent = container
+        themed(optRow, "BackgroundColor3", "controlHover", { fade = false })
         corner(optRow, 8)
         local label = Instance.new("TextLabel")
         label.BackgroundTransparency = 1
         label.Position = UDim2.new(0, 14, 0, 0)
-        label.Size = UDim2.new(1, -24, 1, 0)
-        label.FontFace = FONT
+        label.Size = UDim2.new(1, -46, 1, 0)
         label.TextSize = 14
-        label.TextColor3 = PALETTE.text
         label.TextXAlignment = Enum.TextXAlignment.Left
         label.TextTruncate = Enum.TextTruncate.AtEnd
-        label.Text = tostring(option)
+        label.ZIndex = 2
         label.Parent = optRow
-        rows[option] = { label = label, row = optRow, on = false }
+        faced(label, "medium")
+        localized(label, "Text", tostring(option))
+        local tick = makeIcon(optRow, "check", UDim2.new(0, 16, 0, 16), "accent")
+        tick.AnchorPoint = Vector2.new(1, 0.5)
+        tick.Position = UDim2.new(1, -12, 0.5, 0)
+        tick.ImageTransparency = 1
+        tick.ZIndex = 2
+        tick.Active = false
+        rows[option] = { label = label, row = optRow, tick = tick.Image ~= "" and tick or nil, on = false }
+        pressRipple(optRow, "accent")
         optRow.MouseEnter:Connect(function()
-            if get() ~= option then
-                tween(optRow, 0.1, { BackgroundTransparency = 0.5, BackgroundColor3 = PALETTE.controlHover })
-            end
+            if get() ~= option then tween(optRow, 0.12, { BackgroundTransparency = 0.5 }, EASE_SOFT) end
         end)
         optRow.MouseLeave:Connect(function()
-            if get() ~= option then
-                tween(optRow, 0.1, { BackgroundTransparency = 1 })
-            end
+            if get() ~= option then tween(optRow, 0.16, { BackgroundTransparency = 1 }, EASE_SOFT) end
         end)
         optRow.MouseButton1Click:Connect(function()
+            if not set then return end
             set(option)
             render()
         end)
@@ -2156,7 +2705,9 @@ function Controls.list(parent, ctx, options, get, set, opts)
         searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             local q = searchBox.Text:lower()
             for opt, refs in pairs(rows) do
-                refs.row.Visible = q == "" or tostring(opt):lower():find(q, 1, true) ~= nil
+                local shown = tostring(opt):lower()
+                local drawn = refs.label.Text:lower()
+                refs.row.Visible = q == "" or shown:find(q, 1, true) ~= nil or drawn:find(q, 1, true) ~= nil
             end
         end)
     end
@@ -2173,9 +2724,9 @@ function Controls.stepper(parent, ctx, text, min, max, step, get, set)
     holder.AnchorPoint = Vector2.new(1, 0.5)
     holder.Position = UDim2.new(1, 0, 0.5, 0)
     holder.Size = UDim2.new(0, 100, 0, 24)
-    themed(holder, "BackgroundColor3", "control")
     holder.BorderSizePixel = 0
     holder.Parent = row
+    themed(holder, "BackgroundColor3", "control")
     corner(holder, 6)
 
     local function mkArrow(symbol, x, anchorX)
@@ -2185,13 +2736,14 @@ function Controls.stepper(parent, ctx, text, min, max, step, get, set)
         b.Size = UDim2.new(0, 26, 1, 0)
         b.BackgroundTransparency = 1
         b.AutoButtonColor = false
-        b.FontFace = FONT
-        b.TextSize = 18
-        b.TextColor3 = PALETTE.subtext
+        b.TextSize = 17
         b.Text = symbol
         b.Parent = holder
-        b.MouseEnter:Connect(function() b.TextColor3 = PALETTE.accent end)
-        b.MouseLeave:Connect(function() b.TextColor3 = PALETTE.subtext end)
+        faced(b, "semibold")
+        themed(b, "TextColor3", "subtext", { fade = false })
+        pressScale(b, 0.86)
+        b.MouseEnter:Connect(function() tween(b, 0.14, { TextColor3 = PALETTE.accent }, EASE_SOFT) end)
+        b.MouseLeave:Connect(function() tween(b, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT) end)
         return b
     end
     local minus = mkArrow("-", 0, 0)
@@ -2202,21 +2754,29 @@ function Controls.stepper(parent, ctx, text, min, max, step, get, set)
     value.Position = UDim2.new(0.5, 0, 0.5, 0)
     value.Size = UDim2.new(0, 48, 1, 0)
     value.BackgroundTransparency = 1
-    value.FontFace = FONT
     value.TextSize = 14
-    value.TextColor3 = PALETTE.text
     value.Text = tostring(get())
     value.ClearTextOnFocus = false
     value.TextXAlignment = Enum.TextXAlignment.Center
     value.Parent = holder
+    faced(value, "medium")
+    themed(value, "TextColor3", "text")
 
-    local function apply(v)
+    -- The number leaves in the direction it was pushed, so a step reads as a step
+    -- and a held button reads as a run.
+    local function bump(direction)
+        value.Position = UDim2.new(0.5, direction * 5, 0.5, 0)
+        tween(value, 0.22, { Position = UDim2.new(0.5, 0, 0.5, 0) }, EASE_POP)
+    end
+    local function apply(v, direction)
+        if not set then return end
         v = math.clamp(v, min, max)
         set(v)
         value.Text = tostring(v)
+        if direction then bump(direction) end
     end
-    minus.MouseButton1Click:Connect(function() apply(get() - step) end)
-    plus.MouseButton1Click:Connect(function() apply(get() + step) end)
+    minus.MouseButton1Click:Connect(function() apply(get() - step, -1) end)
+    plus.MouseButton1Click:Connect(function() apply(get() + step, 1) end)
     value.FocusLost:Connect(function()
         local typed = tonumber(string.match(value.Text, "[%-%d%.]+"))
         if typed then apply(typed) else value.Text = tostring(get()) end
@@ -2224,13 +2784,17 @@ function Controls.stepper(parent, ctx, text, min, max, step, get, set)
     if ctx and ctx._refresh then table.insert(ctx._refresh, function() value.Text = tostring(get()) end) end
     return row
 end
--- and owning window as context.
+
+-- Card: a titled surface that hosts controls. Built by a sub-page, and reused as
+-- the body of a gear popover so a popover takes the same builders as a card,
+-- with the same parent frame and owning window as context.
 Card = {}
 Card.__index = Card
 function Card.new(frame, ctx)
     return setmetatable({ _frame = frame, _ctx = ctx }, Card)
 end
 function Card:label(text) return Controls.label(self._frame, text) end
+function Card:section(text) return Controls.section(self._frame, text) end
 function Card:button(text, fn) return Controls.button(self._frame, self._ctx, text, fn) end
 function Card:input(text, placeholder, get, set) return Controls.input(self._frame, self._ctx, text, placeholder, get, set) end
 function Card:toggle(text, get, set, settings) return Controls.toggle(self._frame, self._ctx, text, get, set, settings) end
@@ -2245,11 +2809,11 @@ function Card:stepper(text, min, max, step, get, set) return Controls.stepper(se
 function Card:divider()
     local line = Instance.new("Frame")
     line.Size = UDim2.new(1, 0, 0, 1)
-    line.BackgroundColor3 = PALETTE.stroke
     line.BackgroundTransparency = 0.4
     line.BorderSizePixel = 0
     line.LayoutOrder = nextOrder(self._frame)
     line.Parent = self._frame
+    themed(line, "BackgroundColor3", "stroke")
     return line
 end
 
@@ -2272,12 +2836,12 @@ function Sub:card(title, column)
     local cardFrame = Instance.new("Frame")
     cardFrame.Size = UDim2.new(1, 0, 0, 0)
     cardFrame.AutomaticSize = Enum.AutomaticSize.Y
-    themed(cardFrame, "BackgroundColor3", "card")
     cardFrame.BorderSizePixel = 0
     cardFrame.LayoutOrder = nextOrder(col)
     cardFrame.Parent = col
+    themed(cardFrame, "BackgroundColor3", "card")
     corner(cardFrame, 12)
-    stroke(cardFrame, PALETTE.stroke, 1, 0.4)
+    stroke(cardFrame, "stroke", 1, 0.4)
 
     local body = Instance.new("Frame")
     body.BackgroundTransparency = 1
@@ -2290,56 +2854,60 @@ function Sub:card(title, column)
     if cfg.title then
         -- Header row: optional icon, title with optional subtitle, optional enable toggle.
         local header = Instance.new("Frame")
-        header.Size = UDim2.new(1, 0, 0, cfg.subtitle and 36 or 20)
+        header.Size = UDim2.new(1, 0, 0, cfg.subtitle and 36 or 22)
         header.BackgroundTransparency = 1
         header.LayoutOrder = nextOrder(body)
         header.Parent = body
 
         local textX = 0
         if cfg.icon then
-            local hicon = makeIcon(header, cfg.icon, UDim2.new(0, 26, 0, 26), PALETTE.text)
+            local hicon = makeIcon(header, cfg.icon, UDim2.new(0, 24, 0, 24), "text")
             hicon.AnchorPoint = Vector2.new(0, 0.5)
             hicon.Position = UDim2.new(0, 0, 0.5, 0)
-            textX = 36
+            textX = 34
         end
 
         local titleLabel = Instance.new("TextLabel")
         titleLabel.BackgroundTransparency = 1
         titleLabel.Position = UDim2.new(0, textX, 0, 0)
-        titleLabel.Size = UDim2.new(1, -textX - (cfg.toggle and 54 or 0), 0, 20)
-        titleLabel.FontFace = FONT
-        titleLabel.TextSize = 17
-        titleLabel.TextColor3 = PALETTE.text
+        titleLabel.Size = UDim2.new(1, -textX - (cfg.toggle and 54 or 0), 0, cfg.subtitle and 20 or 22)
+        titleLabel.TextSize = 16
         titleLabel.TextXAlignment = Enum.TextXAlignment.Left
         titleLabel.TextYAlignment = cfg.subtitle and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center
-        titleLabel.Text = cfg.title
+        titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
         titleLabel.Parent = header
+        faced(titleLabel, "semibold")
+        themed(titleLabel, "TextColor3", "text")
+        localized(titleLabel, "Text", cfg.title)
 
         if cfg.subtitle then
             local subLabel = Instance.new("TextLabel")
             subLabel.BackgroundTransparency = 1
             subLabel.Position = UDim2.new(0, textX, 0, 20)
             subLabel.Size = UDim2.new(1, -textX - (cfg.toggle and 54 or 0), 0, 16)
-            subLabel.FontFace = FONT
             subLabel.TextSize = 12
-            subLabel.TextColor3 = PALETTE.subtext
             subLabel.TextXAlignment = Enum.TextXAlignment.Left
-            subLabel.Text = cfg.subtitle
+            subLabel.TextTruncate = Enum.TextTruncate.AtEnd
             subLabel.Parent = header
+            faced(subLabel, "regular")
+            themed(subLabel, "TextColor3", "subtext")
+            localized(subLabel, "Text", cfg.subtitle)
         end
 
         if cfg.toggle then
-            makePill(header, self._ctx, cfg.toggle.get, cfg.toggle.set)
+            -- Either shape is accepted: { get = , set = } or the pair win:flag
+            -- hands back, which reads as toggle = { win:flag("key", false) }.
+            makePill(header, self._ctx, cfg.toggle.get or cfg.toggle[1], cfg.toggle.set or cfg.toggle[2])
         end
 
         -- Divider under the header to separate it from the controls.
         local line = Instance.new("Frame")
         line.Size = UDim2.new(1, 0, 0, 1)
-        line.BackgroundColor3 = PALETTE.stroke
         line.BackgroundTransparency = 0.4
         line.BorderSizePixel = 0
         line.LayoutOrder = nextOrder(body)
         line.Parent = body
+        themed(line, "BackgroundColor3", "stroke")
     end
     return Card.new(body, self._ctx)
 end
@@ -2354,25 +2922,16 @@ function Tab:sub(name)
     btn.Size = UDim2.new(0, 0, 1, 0)
     btn.BackgroundTransparency = 1
     btn.AutoButtonColor = false
-    btn.FontFace = FONT
-    btn.TextSize = 15
-    btn.TextColor3 = PALETTE.subtext
-    btn.Text = name
+    btn.TextSize = 14
     btn.LayoutOrder = order
     btn.Parent = self._subBar
+    faced(btn, "medium")
+    themed(btn, "TextColor3", "subtext", { fade = false })
+    localized(btn, "Text", name)
     local bpad = Instance.new("UIPadding")
     bpad.PaddingLeft = UDim.new(0, 2)
     bpad.PaddingRight = UDim.new(0, 2)
     bpad.Parent = btn
-
-    local underline = Instance.new("Frame")
-    underline.AnchorPoint = Vector2.new(0, 1)
-    underline.Position = UDim2.new(0, 0, 1, 0)
-    underline.Size = UDim2.new(1, 0, 0, 2)
-    themed(underline, "BackgroundColor3", "accent")
-    underline.BorderSizePixel = 0
-    underline.Visible = false
-    underline.Parent = btn
 
     local page = Instance.new("CanvasGroup")
     page.Size = UDim2.new(1, 0, 1, 0)
@@ -2406,23 +2965,37 @@ function Tab:sub(name)
     local leftCol = makeColumn("Left", 0)
     local rightCol = makeColumn("Right", 0.5)
 
-    local sub = { name = name, btn = btn, underline = underline, page = page }
+    local sub = { name = name, btn = btn, page = page, columns = columns }
     table.insert(self._subs, sub)
 
     local function activate()
         for _, other in ipairs(self._subs) do
             other.page.Visible = false
-            other.underline.Visible = false
-            tween(other.btn, 0.15, { TextColor3 = PALETTE.subtext })
+            tween(other.btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
         end
         if self._ctx.closeOverlays then self._ctx.closeOverlays() end
         page.Visible = true
         page.GroupTransparency = 1
-        tween(page, 0.2, { GroupTransparency = 0 })
-        underline.Visible = true
-        tween(btn, 0.15, { TextColor3 = PALETTE.text })
+        columns.Position = UDim2.new(0, 0, 0, 10)
+        tween(page, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
+        tween(columns, 0.3, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        tween(btn, 0.16, { TextColor3 = PALETTE.text }, EASE_SOFT)
+        self._placeUnderline(btn, true)
     end
+    btn.MouseEnter:Connect(function()
+        if not page.Visible then tween(btn, 0.14, { TextColor3 = PALETTE.text }, EASE_SOFT) end
+    end)
+    btn.MouseLeave:Connect(function()
+        if not page.Visible then tween(btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT) end
+    end)
     btn.MouseButton1Click:Connect(activate)
+    -- A palette change repaints from the registry, which does not know which
+    -- sub-tab is open, so the open one claims its colour back afterwards.
+    if self._ctx._refresh then
+        table.insert(self._ctx._refresh, function()
+            btn.TextColor3 = page.Visible and PALETTE.text or PALETTE.subtext
+        end)
+    end
     if #self._subs == 1 then
         activate()
     end
@@ -2438,14 +3011,14 @@ function Window:tab(opts)
     if groupName and not self.groups[groupName] then
         local header = Instance.new("TextLabel")
         header.BackgroundTransparency = 1
-        header.Size = UDim2.new(1, 0, 0, 22)
-        header.FontFace = FONT
-        header.TextSize = 12
-        header.TextColor3 = PALETTE.subtext
+        header.Size = UDim2.new(1, 0, 0, 24)
+        header.TextSize = 11
         header.TextXAlignment = Enum.TextXAlignment.Left
-        header.Text = string.upper(groupName)
         header.LayoutOrder = nextOrder(self.sidebarList)
         header.Parent = self.sidebarList
+        faced(header, "semibold")
+        themed(header, "TextColor3", "subtext")
+        localized(header, "Text", groupName, string.upper)
         local hpad = Instance.new("UIPadding")
         hpad.PaddingLeft = UDim.new(0, 12)
         hpad.PaddingTop = UDim.new(0, 8)
@@ -2455,7 +3028,6 @@ function Window:tab(opts)
 
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, 0, 0, 38)
-    themed(btn, "BackgroundColor3", "accent")
     btn.BackgroundTransparency = 1
     btn.AutoButtonColor = false
     btn.Text = ""
@@ -2463,39 +3035,46 @@ function Window:tab(opts)
     btn.LayoutOrder = nextOrder(self.sidebarList)
     btn.Parent = self.sidebarList
     corner(btn, 8)
-    -- Active tab fill: accent on the left fading to transparent on the right.
-    local btnGrad = Instance.new("UIGradient")
-    btnGrad.Transparency = NumberSequence.new({
+
+    -- The active tab is marked by the fill alone. The old build also drew a short
+    -- accent bar on the left edge, which repeated what the fill already said and
+    -- read as an artefact once the fill was there.
+    --
+    -- The fill is its own frame rather than the button's background: the button
+    -- animates between three states, and a palette opacity written onto the same
+    -- property would fight that animation.
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(1, 0, 1, 0)
+    fill.BackgroundTransparency = 1
+    fill.BorderSizePixel = 0
+    fill.Parent = btn
+    themed(fill, "BackgroundColor3", "accent", { fade = false })
+    corner(fill, 8)
+    local fillGrad = Instance.new("UIGradient")
+    fillGrad.Transparency = NumberSequence.new({
         NumberSequenceKeypoint.new(0, 0.35),
         NumberSequenceKeypoint.new(0.65, 1),
         NumberSequenceKeypoint.new(1, 1),
     })
-    btnGrad.Parent = btn
+    fillGrad.Parent = fill
 
-    local icon = makeIcon(btn, opts.icon, UDim2.new(0, 24, 0, 24), PALETTE.text)
+    local icon = makeIcon(btn, opts.icon, UDim2.new(0, 24, 0, 24), "subtext")
     icon.AnchorPoint = Vector2.new(0, 0.5)
     icon.Position = UDim2.new(0, 14, 0.5, 0)
-
-    -- Left accent bar shown only on the active tab.
-    local indicator = Instance.new("Frame")
-    indicator.AnchorPoint = Vector2.new(0, 0.5)
-    indicator.Position = UDim2.new(0, 0, 0.5, 0)
-    indicator.Size = UDim2.new(0, 3, 0, 0)
-    themed(indicator, "BackgroundColor3", "accent")
-    indicator.BorderSizePixel = 0
-    indicator.Parent = btn
-    corner(indicator, 2)
+    icon.ZIndex = 2
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Position = UDim2.new(0, 48, 0, 0)
     label.Size = UDim2.new(1, -56, 1, 0)
-    label.FontFace = FONT
-    label.TextSize = 15
-    label.TextColor3 = PALETTE.subtext
+    label.TextSize = 14
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Text = opts.name
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.ZIndex = 2
     label.Parent = btn
+    faced(label, "medium")
+    themed(label, "TextColor3", "subtext", { fade = false })
+    localized(label, "Text", opts.name)
 
     local tabPage = Instance.new("CanvasGroup")
     tabPage.Size = UDim2.new(1, 0, 1, 0)
@@ -2504,18 +3083,30 @@ function Window:tab(opts)
     tabPage.Visible = false
     tabPage.Parent = self.pages
 
+    -- The bar sits in a holder so the underline has somewhere to live: the bar
+    -- itself is laid out by a UIListLayout, and a line parented into it would be
+    -- arranged as one more sub-tab.
+    local subBarHolder = Instance.new("Frame")
+    subBarHolder.Size = UDim2.new(1, 0, 0, 34)
+    subBarHolder.BackgroundTransparency = 1
+    subBarHolder.Parent = tabPage
+
     local subBar = Instance.new("Frame")
     subBar.Size = UDim2.new(1, 0, 0, 30)
     subBar.BackgroundTransparency = 1
-    subBar.Parent = tabPage
+    subBar.Parent = subBarHolder
     listLayout(subBar, 16, Enum.FillDirection.Horizontal)
+    -- One underline that travels between the sub-tabs, instead of a line per
+    -- button appearing and disappearing where it stands.
+    local placeUnderline = slidingUnderline(subBarHolder, 2)
+
     local subDivider = Instance.new("Frame")
     subDivider.Position = UDim2.new(0, 0, 0, 34)
     subDivider.Size = UDim2.new(1, 0, 0, 1)
-    subDivider.BackgroundColor3 = PALETTE.stroke
     subDivider.BackgroundTransparency = 0.3
     subDivider.BorderSizePixel = 0
     subDivider.Parent = tabPage
+    themed(subDivider, "BackgroundColor3", "stroke")
 
     local subPages = Instance.new("Frame")
     subPages.Position = UDim2.new(0, 0, 0, 44)
@@ -2525,42 +3116,65 @@ function Window:tab(opts)
 
     local tabObj = setmetatable({
         _ctx = self, _subBar = subBar, _subPages = subPages, _subs = {},
+        _placeUnderline = placeUnderline,
         name = opts.name, btn = btn, icon = icon, label = label, page = tabPage,
-        indicator = indicator,
     }, Tab)
     table.insert(self.tabs, tabObj)
 
     local function activate()
         for _, other in ipairs(self.tabs) do
-            other.page.Visible = false
-            tween(other.btn, 0.15, { BackgroundTransparency = 1 })
-            tween(other.label, 0.15, { TextColor3 = PALETTE.subtext })
-            if other.indicator then
-                tween(other.indicator, 0.15, { Size = UDim2.new(0, 3, 0, 0) })
+            if other ~= tabObj then
+                other.page.Visible = false
+                if other.fill then tween(other.fill, 0.18, { BackgroundTransparency = 1 }, EASE_SOFT) end
+                tween(other.label, 0.18, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
+                tintIcon(other.icon, PALETTE.subtext)
             end
         end
         if self.closeOverlays then self.closeOverlays() end
         tabPage.Visible = true
         tabPage.GroupTransparency = 1
-        tabPage.Position = UDim2.new(0, 0, 0, 12)
-        tween(tabPage, 0.22, { GroupTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
-        tween(btn, 0.15, { BackgroundTransparency = 0 })
-        tween(label, 0.15, { TextColor3 = PALETTE.text })
-        -- Slide the accent gradient fill in from the left as the section opens.
-        btnGrad.Offset = Vector2.new(-1, 0)
-        tween(btnGrad, 0.35, { Offset = Vector2.new(0, 0) }, Enum.EasingStyle.Quint)
-        tween(indicator, 0.2, { Size = UDim2.new(0, 3, 0, 20) }, Enum.EasingStyle.Back)
-        self.title.Text = opts.name
+        tabPage.Position = UDim2.new(0, 0, 0, 10)
+        tween(tabPage, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
+        tween(tabPage, 0.3, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        -- The fill slides in from the left as the section opens.
+        fillGrad.Offset = Vector2.new(-0.6, 0)
+        tween(fill, 0.2, { BackgroundTransparency = 0 }, EASE_SOFT)
+        tween(fillGrad, 0.4, { Offset = Vector2.new(0, 0) }, EASE)
+        tween(label, 0.18, { TextColor3 = PALETTE.text }, EASE_SOFT)
+        tintIcon(icon, PALETTE.text)
+        self.title.Text = translate(opts.name)
+        self._titlePhrase = opts.name
         if self.subtitle then
-            self.subtitle.Text = opts.subtitle or opts.group or ""
+            self._subtitlePhrase = opts.subtitle or opts.group or ""
+            self.subtitle.Text = translate(self._subtitlePhrase)
         end
+        -- The bar was hidden while the page was, so the underline is placed once
+        -- the layout has measured the buttons again.
+        task.defer(function() placeUnderline(nil, false) end)
     end
+    tabObj.fill = fill
     btn.MouseButton1Click:Connect(activate)
     btn.MouseEnter:Connect(function()
-        if not tabPage.Visible then tween(btn, 0.12, { BackgroundTransparency = 0.6 }) end
+        if not tabPage.Visible then
+            tween(fill, 0.14, { BackgroundTransparency = 0.55 }, EASE_SOFT)
+            tween(label, 0.14, { TextColor3 = PALETTE.text }, EASE_SOFT)
+            tintIcon(icon, PALETTE.text)
+        end
     end)
     btn.MouseLeave:Connect(function()
-        if not tabPage.Visible then tween(btn, 0.12, { BackgroundTransparency = 1 }) end
+        if not tabPage.Visible then
+            tween(fill, 0.18, { BackgroundTransparency = 1 }, EASE_SOFT)
+            tween(label, 0.18, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
+            tintIcon(icon, PALETTE.subtext)
+        end
+    end)
+    -- Same as the sub-tabs: the registry repaints every tab to the resting
+    -- colour, so the open one is restored on the pass after it.
+    table.insert(self._refresh, function()
+        local open = tabPage.Visible
+        label.TextColor3 = open and PALETTE.text or PALETTE.subtext
+        icon.ImageColor3 = open and PALETTE.text or PALETTE.subtext
+        fill.BackgroundTransparency = open and 0 or 1
     end)
     if #self.tabs == 1 then
         activate()
@@ -2568,8 +3182,14 @@ function Window:tab(opts)
     return tabObj
 end
 
--- Show or hide the window. Opening settles it up from just under full size,
--- closing shrinks it away first instead of blinking out.
+-- Show or hide the window.
+--
+-- The whole window is one CanvasGroup, so opening and closing fades every part
+-- of it by the same amount. The old build faded the root frame only, which left
+-- the sidebar solid while the content area went see-through, and the scale grew
+-- from the top left corner so the window appeared to unroll to the right. The
+-- group is centred on its anchor now, so it settles out of and back into its own
+-- middle.
 function Window:toggle(show)
     local window = self.window
     if show == nil then show = not window.Visible end
@@ -2579,16 +3199,20 @@ function Window:toggle(show)
     if self.closeOverlays then self.closeOverlays() end
 
     local scale = self._scale
+    local body = self._body
+    local shade = self._shadow
     if show then
         window.Visible = true
         if scale then
-            scale.Scale = 0.94
-            tween(scale, 0.32, { Scale = 1 }, EASE_POP)
+            scale.Scale = 0.9
+            tween(scale, 0.34, { Scale = 1 }, EASE_POP)
         end
-        tween(window, 0.18, { BackgroundTransparency = 0 }, EASE_SOFT)
+        if body then tween(body, 0.16, { GroupTransparency = 0 }, EASE_SOFT) end
+        if shade then tween(shade, 0.24, { ImageTransparency = 0.55 }, EASE_SOFT) end
     else
-        tween(window, 0.16, { BackgroundTransparency = 1 }, EASE_SOFT)
-        local out = scale and tween(scale, 0.16, { Scale = 0.94 }, EASE_SOFT)
+        if body then tween(body, 0.16, { GroupTransparency = 1 }, EASE_SOFT) end
+        if shade then tween(shade, 0.14, { ImageTransparency = 1 }, EASE_SOFT) end
+        local out = scale and tween(scale, 0.2, { Scale = 0.9 }, EASE)
         if out then
             out.Completed:Once(function()
                 if not self._open then window.Visible = false end
@@ -2613,37 +3237,12 @@ function Window:setColor(key, rgb)
     PALETTE[key] = new
     PALETTE_A[key] = alpha
 
-    -- Map the key's alpha onto a part's transparency. The part's own original
-    -- transparency is remembered once so a return to full opacity restores it,
-    -- and parts that are fully hidden stay hidden.
-    local function applyAlpha(inst, prop)
-        local tp = TRANS_OF[prop]
-        if not tp then return end
-        local bases = THEME_BASE[inst]
-        local base = bases and bases[tp]
-        if alpha < 1 then
-            if base == nil then
-                local ok, cur = pcall(function() return inst[tp] end)
-                if not ok or type(cur) ~= "number" then return end
-                base = cur
-                bases = bases or {}
-                bases[tp] = base
-                THEME_BASE[inst] = bases
-            end
-            if base >= 1 then return end
-            pcall(function() inst[tp] = 1 - alpha end)
-        elseif base ~= nil then
-            pcall(function() inst[tp] = base end)
-            bases[tp] = nil
+    tagWalk(reg, function(inst, entry)
+        inst[entry.prop] = new
+        if entry.fade then
+            fadeProp(inst, entry.prop, alpha)
         end
-    end
-
-    for inst, props in pairs(reg) do
-        for _, prop in ipairs(props) do
-            pcall(function() inst[prop] = new end)
-            applyAlpha(inst, prop)
-        end
-    end
+    end)
     if self._refresh then
         for _, fn in ipairs(self._refresh) do pcall(fn) end
     end
@@ -2666,6 +3265,22 @@ end
 -- config so toggles, sliders, dropdowns reflect the loaded state).
 function Window:refreshAll()
     for _, fn in ipairs(self._refresh) do pcall(fn) end
+    -- The page heading is not a control, so it is re-read here as well: a
+    -- language change goes through this path too.
+    if self.title and self._titlePhrase then self.title.Text = translate(self._titlePhrase) end
+    if self.subtitle and self._subtitlePhrase then self.subtitle.Text = translate(self._subtitlePhrase) end
+end
+
+-- Language for this window. The phrase table is shared by the whole session, so
+-- this sets the session language and remembers the choice with the config.
+function Window:setLocale(code)
+    Interface.setLocale(code)
+    self.locale = code
+    self._dirty = true
+end
+
+function Window:getLocale()
+    return Interface.getLocale()
 end
 
 -- Bind a control to a saved flag. Returns get and set backed by window.flags so
@@ -2702,24 +3317,38 @@ local function ensureConfigDir()
     end)
 end
 
+-- What a config holds: the flags, the palette with its opacity, the show/hide
+-- key, the language and the position and visibility of every detached panel.
+-- The window's own position is left out on purpose so it always opens centred.
 function Window:saveConfig(name, silent)
     if type(name) ~= "string" or name == "" then return false end
     if type(writefile) ~= "function" then warn("[NewReality] executor has no writefile") return false end
-    -- Snapshot the current theme so colours are restored on load too.
+    -- Snapshot the current theme so colours are restored on load too. The fourth
+    -- number is the key's opacity, which the old format dropped and which is the
+    -- difference between a translucent window and an opaque one.
     local theme = {}
     for key in pairs(DEFAULTS) do
         local c = PALETTE[key]
-        theme[key] = { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) }
+        theme[key] = {
+            math.floor(c.R * 255 + 0.5),
+            math.floor(c.G * 255 + 0.5),
+            math.floor(c.B * 255 + 0.5),
+            PALETTE_A[key] or 1,
+        }
     end
-    local payload = { flags = self.flags, theme = theme }
-    -- Persist the dragged position of every detached part (watermark, keybind
-    -- list, each HUD by its id). The main window is left out on purpose so it
-    -- always opens centred.
+    local payload = {
+        flags = self.flags,
+        theme = theme,
+        toggleKey = (typeof(self.toggleKey) == "EnumItem") and self.toggleKey.Name or nil,
+        locale = Interface.getLocale(),
+    }
+    -- Persist the dragged position and the visibility of every detached part
+    -- (watermark, keybind list, each HUD by its id).
     local overlays = {}
     for key, frame in pairs(self._overlays) do
         if frame and frame.Parent then
             local p = frame.Position
-            overlays[key] = { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset }
+            overlays[key] = { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset, frame.Visible and 1 or 0 }
         end
     end
     payload.overlays = overlays
@@ -2760,10 +3389,17 @@ function Window:loadConfig(name)
         return false
     end
     if type(data) ~= "table" then return false end
-    -- New format is { flags = , theme = }; old format was just the flags table.
+    -- New format is { flags = , theme = , ... }; old format was just the flags table.
     local flags = (type(data.flags) == "table") and data.flags or data
     for k, v in pairs(flags) do self.flags[k] = v end
-    -- Restore the saved theme colours through the themed registry.
+    -- The language first, so every label the theme pass repaints is already in
+    -- the right words.
+    if type(data.locale) == "string" and data.locale ~= "" then
+        Interface.setLocale(data.locale)
+        self.locale = data.locale
+    end
+    -- Restore the saved theme colours through the themed registry. A three
+    -- number entry comes from an older config and means full opacity.
     if type(data.theme) == "table" then
         for key, rgb in pairs(data.theme) do
             if DEFAULTS[key] and type(rgb) == "table" then
@@ -2771,14 +3407,21 @@ function Window:loadConfig(name)
             end
         end
     end
+    if type(data.toggleKey) == "string" then
+        local okKey, key = pcall(function() return Enum.KeyCode[data.toggleKey] end)
+        if okKey and key then self.toggleKey = key end
+    end
     -- Restore the saved positions of detached parts. Kept for later too, so an
     -- overlay created after this load still picks its spot up.
     if type(data.overlays) == "table" then
         self._overlayPos = data.overlays
-        for name, t in pairs(data.overlays) do
-            local frame = self._overlays[name]
-            if frame and frame.Parent and type(t) == "table" and #t == 4 then
-                pcall(function() frame.Position = UDim2.new(t[1], t[2], t[3], t[4]) end)
+        for key, t in pairs(data.overlays) do
+            local frame = self._overlays[key]
+            if frame and frame.Parent and type(t) == "table" and #t >= 4 then
+                pcall(function()
+                    frame.Position = UDim2.new(t[1], t[2], t[3], t[4])
+                    if t[5] ~= nil then self:showOverlay(frame, t[5] == 1, true) end
+                end)
             end
         end
     end
@@ -2859,117 +3502,198 @@ function Window:setAutoSave(name)
     end
 end
 
--- Toast notification, slides in at the bottom right and auto dismisses.
--- Usage: window:notify({ title = "Aimbot", text = "Enabled", duration = 3, icon = "bolt" })
+-- Which config auto save is writing to, or nil while it is off.
+function Window:getAutoSave()
+    return self._autoSaveName
+end
+
+-- Notifications ---------------------------------------------------------------
+-- Toasts come in from off the right edge of the screen and stack upward from the
+-- bottom right corner. The stack is positioned by hand rather than by a layout:
+-- a layout would move the older toasts in one frame, and the point of the stack
+-- is that they are pushed up, with a little weight behind them.
+--
+-- Both axes live in one Position, so every animation writes the full value: the
+-- entry slide, the shift upward and the exit all target the same property and
+-- the newest tween simply wins.
+local TOAST_WIDTH = 286
+local TOAST_GAP = 8
+local TOAST_MAX = 6
+
 function Window:notify(opts)
     if type(opts) == "string" then opts = { title = opts } end
     opts = opts or {}
     if not self._toasts then
-        local holder = Instance.new("Frame")
-        holder.Name = "Toasts"
+        local holder = newInstance("Frame")
+        holder.Name = randomName()
         holder.AnchorPoint = Vector2.new(1, 1)
-        holder.Position = UDim2.new(1, -16, 1, -16)
-        holder.Size = UDim2.new(0, 290, 1, -32)
+        holder.Position = UDim2.new(1, -18, 1, -18)
+        holder.Size = UDim2.new(0, TOAST_WIDTH, 1, -36)
         holder.BackgroundTransparency = 1
         holder.ZIndex = 200
         holder.Parent = self.screen
-        local l = Instance.new("UIListLayout")
-        l.VerticalAlignment = Enum.VerticalAlignment.Bottom
-        l.HorizontalAlignment = Enum.HorizontalAlignment.Right
-        l.Padding = UDim.new(0, 8)
-        l.SortOrder = Enum.SortOrder.LayoutOrder
-        l.Parent = holder
         self._toasts = holder
+        self._toastStack = {}
     end
 
-    local toast = Instance.new("CanvasGroup")
-    toast.Size = UDim2.new(0, 270, 0, opts.text and 56 or 40)
-    toast.BackgroundColor3 = PALETTE.card
+    local stack = self._toastStack
+    local hasText = opts.text ~= nil and opts.text ~= ""
+    local height = hasText and 58 or 42
+    local offscreen = TOAST_WIDTH + 48
+
+    local toast = newInstance("CanvasGroup")
+    toast.Name = randomName()
+    toast.AnchorPoint = Vector2.new(1, 1)
+    toast.Size = UDim2.new(0, TOAST_WIDTH, 0, height)
+    toast.Position = UDim2.new(1, offscreen, 1, 0)
     toast.BorderSizePixel = 0
     toast.GroupTransparency = 1
     toast.ZIndex = 200
     toast.Parent = self._toasts
+    themed(toast, "BackgroundColor3", "card")
     corner(toast, 10)
-    -- Border stroke is not composited by GroupTransparency, so fade it manually.
-    local st = stroke(toast, PALETTE.stroke, 1, 1)
+    -- The outline is not composited by GroupTransparency, so it is faded with the
+    -- group by hand.
+    local edge = stateStroke(toast, "stroke")
 
-    local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(0, 4, 1, -16)
-    bar.Position = UDim2.new(0, 8, 0, 8)
-    bar.BackgroundColor3 = PALETTE.accent
-    bar.BorderSizePixel = 0
-    bar.Parent = toast
-    corner(bar, 2)
-
-    local textX = 22
+    local textX = 16
     if opts.icon then
-        local ic = makeIcon(toast, opts.icon, UDim2.new(0, 20, 0, 20), PALETTE.text)
-        ic.AnchorPoint = Vector2.new(0, 0.5)
-        ic.Position = UDim2.new(0, 22, 0.5, 0)
-        textX = 50
+        local badge = newInstance("Frame")
+        badge.AnchorPoint = Vector2.new(0, 0.5)
+        badge.Position = UDim2.new(0, 14, 0.5, 0)
+        badge.Size = UDim2.new(0, 26, 0, 26)
+        badge.BackgroundTransparency = 0.86
+        badge.BorderSizePixel = 0
+        badge.Parent = toast
+        themed(badge, "BackgroundColor3", "accent", { fade = false })
+        corner(badge, 13)
+        local ic = makeIcon(badge, opts.icon, UDim2.new(0, 16, 0, 16), "text")
+        ic.AnchorPoint = Vector2.new(0.5, 0.5)
+        ic.Position = UDim2.new(0.5, 0, 0.5, 0)
+        if ic.Image == "" then
+            badge:Destroy()
+        else
+            textX = 50
+        end
     end
 
-    local title = Instance.new("TextLabel")
+    local title = newInstance("TextLabel")
     title.BackgroundTransparency = 1
-    title.Position = UDim2.new(0, textX, 0, opts.text and 8 or 0)
-    title.Size = UDim2.new(1, -textX - 12, 0, opts.text and 18 or 40)
-    title.FontFace = FONT
-    title.TextSize = 15
-    title.TextColor3 = PALETTE.text
+    title.Position = UDim2.new(0, textX, 0, hasText and 9 or 0)
+    title.Size = UDim2.new(1, -textX - 14, 0, hasText and 18 or height)
+    title.TextSize = 14
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextYAlignment = opts.text and Enum.TextYAlignment.Center or Enum.TextYAlignment.Center
-    title.Text = opts.title or "Notification"
+    title.TextYAlignment = Enum.TextYAlignment.Center
+    title.TextTruncate = Enum.TextTruncate.AtEnd
     title.Parent = toast
+    faced(title, "semibold")
+    themed(title, "TextColor3", "text")
+    localized(title, "Text", opts.title or "Notification")
 
-    if opts.text then
-        local msg = Instance.new("TextLabel")
+    if hasText then
+        local msg = newInstance("TextLabel")
         msg.BackgroundTransparency = 1
         msg.Position = UDim2.new(0, textX, 0, 28)
-        msg.Size = UDim2.new(1, -textX - 12, 0, 18)
-        msg.FontFace = FONT
+        msg.Size = UDim2.new(1, -textX - 14, 0, 18)
         msg.TextSize = 13
-        msg.TextColor3 = PALETTE.subtext
         msg.TextXAlignment = Enum.TextXAlignment.Left
         msg.TextTruncate = Enum.TextTruncate.AtEnd
-        msg.Text = opts.text
         msg.Parent = toast
+        faced(msg, "regular")
+        themed(msg, "TextColor3", "subtext")
+        localized(msg, "Text", opts.text)
     end
 
-    tween(toast, 0.2, { GroupTransparency = 0 })
-    tween(st, 0.2, { Transparency = 0.3 })
-    task.delay(opts.duration or 3, function()
-        if toast and toast.Parent then
-            tween(st, 0.25, { Transparency = 1 })
-            tween(toast, 0.25, { GroupTransparency = 1 }).Completed:Once(function()
-                toast:Destroy()
-            end)
+    local entry = { frame = toast, height = height, y = 0, offX = 0, edge = edge }
+
+    -- Lay the stack out from the bottom up. The newest toast is at index one, so
+    -- adding one pushes the rest along with a small settle at the end of the
+    -- travel rather than snapping them into their new slot.
+    local function relayout(animate)
+        local y = 0
+        for i = 1, #stack do
+            local item = stack[i]
+            item.y = -y
+            local target = UDim2.new(1, item.offX, 1, item.y)
+            if animate and item ~= entry then
+                tween(item.frame, 0.5, { Position = target }, EASE_JELLY)
+            elseif not animate then
+                item.frame.Position = target
+            end
+            y += item.height + TOAST_GAP
         end
-    end)
+    end
+
+    local dismissed = false
+    local function dismiss()
+        if dismissed then return end
+        dismissed = true
+        for i = #stack, 1, -1 do
+            if stack[i] == entry then table.remove(stack, i) end
+        end
+        entry.offX = offscreen
+        tween(edge, 0.2, { Transparency = 1 }, EASE_SOFT)
+        tween(toast, 0.28, { GroupTransparency = 1 }, EASE_SOFT)
+        local out = tween(toast, 0.34, { Position = UDim2.new(1, offscreen, 1, entry.y) }, EASE)
+        out.Completed:Once(function() toast:Destroy() end)
+        relayout(true)
+    end
+
+    table.insert(stack, 1, entry)
+    -- Older toasts move first, then the new one comes in over the gap it made.
+    relayout(true)
+    tween(toast, 0.42, { Position = UDim2.new(1, 0, 1, entry.y) }, EASE)
+    tween(toast, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
+    tween(edge, 0.26, { Transparency = 0.35 }, EASE_SOFT)
+
+    -- Anywhere on the toast dismisses it early.
+    local hit = newInstance("TextButton")
+    hit.Size = UDim2.new(1, 0, 1, 0)
+    hit.BackgroundTransparency = 1
+    hit.AutoButtonColor = false
+    hit.Text = ""
+    hit.ZIndex = 10
+    hit.Parent = toast
+    hit.MouseButton1Click:Connect(dismiss)
+
+    -- A run of toasts should not climb off the top of the screen.
+    while #stack > TOAST_MAX do
+        local oldest = stack[#stack]
+        if oldest and oldest.dismiss then oldest.dismiss() else break end
+    end
+
+    entry.dismiss = dismiss
+    task.delay(opts.duration or 3, dismiss)
     return toast
 end
 
 -- Detached overlays -----------------------------------------------------------
 -- The watermark, the keybind panel and custom HUDs are the same shell: a small
 -- themed card that lives on the screen instead of inside the window, can be
--- dragged anywhere and has its position saved with the config under its name.
+-- dragged anywhere and has its position and visibility saved with the config.
+--
+-- The shell is a CanvasGroup so showing and hiding it fades the whole panel at
+-- once, the way the window does, instead of the surface fading while the rows on
+-- it stay solid.
 local OVERLAY_Z = 150
 
 local function overlayShell(self, name, opts)
-    local frame = newInstance("Frame")
+    local frame = newInstance("CanvasGroup")
     frame.Name = randomName()
     frame.Size = opts.size or UDim2.new(0, 0, 0, 34)
     frame.AutomaticSize = opts.autoSize or Enum.AutomaticSize.X
     frame.Position = opts.position or UDim2.new(0, 16, 0, 16)
-    themed(frame, "BackgroundColor3", "card")
     frame.BorderSizePixel = 0
+    frame.GroupTransparency = 1
     frame.ZIndex = OVERLAY_Z
     frame.Parent = self.screen
+    themed(frame, "BackgroundColor3", "card")
     corner(frame, opts.radius or 8)
-    stroke(frame, PALETTE.stroke, 1, 0.3)
+    stroke(frame, "stroke", 1, 0.3)
 
     -- A position saved in the config wins over the default one.
     local saved = self._overlayPos and self._overlayPos[name]
-    if type(saved) == "table" and #saved == 4 then
+    if type(saved) == "table" and #saved >= 4 then
         frame.Position = UDim2.new(saved[1], saved[2], saved[3], saved[4])
     end
     self._overlays[name] = frame
@@ -2979,8 +3703,60 @@ local function overlayShell(self, name, opts)
     local scale = newInstance("UIScale")
     scale.Scale = 0.94
     scale.Parent = frame
-    tween(scale, 0.3, { Scale = 1 }, EASE_POP)
+
+    -- Show and hide with the same fade the panel came in with. Registered on the
+    -- window so win:showOverlay works on a watermark as well as on a HUD.
+    --
+    -- The first call is the panel appearing, which is not a change the user made,
+    -- so it does not mark the config dirty and trigger a write on startup.
+    local settled = false
+    self._overlayFade[frame] = function(visible, instant)
+        if visible then
+            frame.Visible = true
+            if instant then
+                frame.GroupTransparency = 0
+                scale.Scale = 1
+            else
+                tween(frame, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
+                tween(scale, 0.3, { Scale = 1 }, EASE_POP)
+            end
+        elseif instant then
+            frame.GroupTransparency = 1
+            frame.Visible = false
+        else
+            tween(scale, 0.2, { Scale = 0.94 }, EASE)
+            tween(frame, 0.18, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
+                if frame.GroupTransparency > 0.9 then frame.Visible = false end
+            end)
+        end
+        if settled then self._dirty = true end
+        settled = true
+    end
+
+    -- A visibility saved in the config wins over the caller's default, the same
+    -- way the saved position does.
+    local startVisible = opts.visible ~= false
+    if saved and saved[5] ~= nil then startVisible = saved[5] == 1 end
+    if startVisible then
+        self._overlayFade[frame](true)
+    else
+        frame.Visible = false
+        frame.GroupTransparency = 1
+        settled = true
+    end
     return frame
+end
+
+-- Show or hide any detached panel with the shell's own fade. Frames the library
+-- did not build fall back to a plain visibility flip.
+function Window:showOverlay(frame, visible, instant)
+    if not frame then return end
+    local fade = self._overlayFade[frame]
+    if fade then
+        fade(visible ~= false, instant)
+    else
+        frame.Visible = visible ~= false
+    end
 end
 
 -- Title row shared by the keybind panel and the HUDs: optional logo or icon,
@@ -3005,7 +3781,7 @@ local function overlayHeader(body, cfg)
             textX = 24
         end
     elseif cfg.icon then
-        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 16, 0, 16), PALETTE.text)
+        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 16, 0, 16), "text")
         ic.AnchorPoint = Vector2.new(0, 0.5)
         ic.Position = UDim2.new(0, 0, 0.5, 0)
         ic.ZIndex = OVERLAY_Z
@@ -3016,23 +3792,24 @@ local function overlayHeader(body, cfg)
     title.BackgroundTransparency = 1
     title.Position = UDim2.new(0, textX, 0, 0)
     title.Size = UDim2.new(1, -textX, 1, 0)
-    title.FontFace = FONT
-    title.TextSize = 15
-    title.TextColor3 = PALETTE.text
+    title.TextSize = 14
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Text = cfg.title or ""
+    title.TextTruncate = Enum.TextTruncate.AtEnd
     title.ZIndex = OVERLAY_Z
     title.Parent = row
+    faced(title, "semibold")
+    themed(title, "TextColor3", "text")
+    local setPhrase = localized(title, "Text", cfg.title or "")
 
     local divider = newInstance("Frame")
     divider.Size = UDim2.new(1, 0, 0, 1)
-    divider.BackgroundColor3 = PALETTE.stroke
     divider.BackgroundTransparency = 0.4
     divider.BorderSizePixel = 0
     divider.ZIndex = OVERLAY_Z
     divider.LayoutOrder = nextOrder(body)
     divider.Parent = body
-    return title
+    themed(divider, "BackgroundColor3", "stroke")
+    return title, setPhrase
 end
 
 -- Draggable watermark: logo + animated NewReality brand | FPS | time.
@@ -3056,25 +3833,25 @@ function Window:watermark(opts)
     local function sep()
         local f = newInstance("Frame")
         f.Size = UDim2.new(0, 1, 0, 16)
-        f.BackgroundColor3 = PALETTE.stroke
         f.BorderSizePixel = 0
         f.ZIndex = OVERLAY_Z
         f.LayoutOrder = nextO()
         f.Parent = wm
+        themed(f, "BackgroundColor3", "stroke")
     end
-    local function textSeg(initial)
+    local function textSeg(initial, role)
         local t = newInstance("TextLabel")
         t.AutomaticSize = Enum.AutomaticSize.X
         t.Size = UDim2.new(0, 0, 1, 0)
         t.BackgroundTransparency = 1
-        t.FontFace = FONT
-        t.TextSize = 14
-        t.TextColor3 = PALETTE.text
+        t.TextSize = 13
         t.TextYAlignment = Enum.TextYAlignment.Center
         t.Text = initial
         t.ZIndex = OVERLAY_Z
         t.LayoutOrder = nextO()
         t.Parent = wm
+        faced(t, role or "medium")
+        themed(t, "TextColor3", "text")
         return t
     end
 
@@ -3084,7 +3861,7 @@ function Window:watermark(opts)
         if empty then mark:Destroy() end
     end
     if show.brand ~= false then
-        local brand = textSeg(opts.brand or "NewReality")
+        local brand = textSeg(opts.brand or "NewReality", "bold")
         brand.TextSize = 15
         table.insert(self._refresh, animateBrand(brand))
     end
@@ -3159,38 +3936,38 @@ function Window:keybindList(opts)
         dot.AnchorPoint = Vector2.new(0, 0.5)
         dot.Position = UDim2.new(0, 1, 0.5, 0)
         dot.Size = UDim2.new(0, 7, 0, 7)
-        dot.BackgroundColor3 = PALETTE.subtext
         dot.BorderSizePixel = 0
         dot.ZIndex = OVERLAY_Z
         dot.Parent = row
+        themed(dot, "BackgroundColor3", "subtext", { fade = false })
         corner(dot, 4)
 
         local lbl = newInstance("TextLabel")
         lbl.BackgroundTransparency = 1
         lbl.Position = UDim2.new(0, 16, 0, 0)
         lbl.Size = UDim2.new(1, -76, 1, 0)
-        lbl.FontFace = FONT
         lbl.TextSize = 13
-        lbl.TextColor3 = PALETTE.text
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.TextTruncate = Enum.TextTruncate.AtEnd
-        lbl.Text = bind.label
         lbl.ZIndex = OVERLAY_Z
         lbl.Parent = row
+        faced(lbl, "medium")
+        themed(lbl, "TextColor3", "subtext", { fade = false })
+        localized(lbl, "Text", bind.label)
 
         local keyLbl = newInstance("TextLabel")
         keyLbl.AnchorPoint = Vector2.new(1, 0.5)
         keyLbl.Position = UDim2.new(1, 0, 0.5, 0)
         keyLbl.Size = UDim2.new(0, 58, 1, 0)
         keyLbl.BackgroundTransparency = 1
-        keyLbl.FontFace = FONT
         keyLbl.TextSize = 13
-        keyLbl.TextColor3 = PALETTE.subtext
         keyLbl.TextXAlignment = Enum.TextXAlignment.Right
         keyLbl.TextTruncate = Enum.TextTruncate.AtEnd
         keyLbl.Text = ""
         keyLbl.ZIndex = OVERLAY_Z
         keyLbl.Parent = row
+        faced(keyLbl, "regular")
+        themed(keyLbl, "TextColor3", "subtext")
 
         rows[#rows + 1] = { row = row, dot = dot, lbl = lbl, key = keyLbl, bind = bind }
     end
@@ -3206,7 +3983,7 @@ function Window:keybindList(opts)
         if not panel.Visible then return end
         for _, r in ipairs(rows) do
             local keys = (r.bind.keys and r.bind.keys()) or {}
-            local text = (#keys > 0) and table.concat(keys, "+") or "None"
+            local text = (#keys > 0) and table.concat(keys, "+") or translate("None")
             if text ~= r.lastKey then
                 r.lastKey = text
                 r.key.Text = text
@@ -3214,8 +3991,8 @@ function Window:keybindList(opts)
             local active = (r.bind.active and r.bind.active()) or false
             if active ~= r.lastActive then
                 r.lastActive = active
-                tween(r.dot, 0.16, { BackgroundColor3 = active and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
-                tween(r.lbl, 0.16, { TextColor3 = active and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
+                tween(r.dot, 0.18, { BackgroundColor3 = active and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
+                tween(r.lbl, 0.18, { TextColor3 = active and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
                 r.row.Visible = showInactive or active
             end
         end
@@ -3250,7 +4027,7 @@ local function hudText(value)
         if value % 1 == 0 then return tostring(math.floor(value)) end
         return string.format("%.2f", value)
     elseif kind == "boolean" then
-        return value and "On" or "Off"
+        return value and translate("On") or translate("Off")
     end
     return tostring(value)
 end
@@ -3298,14 +4075,14 @@ function Hud:row(label, value, opts)
         dot.AnchorPoint = Vector2.new(0, 0.5)
         dot.Position = UDim2.new(0, 1, 0.5, 0)
         dot.Size = UDim2.new(0, 7, 0, 7)
-        dot.BackgroundColor3 = PALETTE.subtext
         dot.BorderSizePixel = 0
         dot.ZIndex = OVERLAY_Z
         dot.Parent = row
+        themed(dot, "BackgroundColor3", "subtext", { fade = false })
         corner(dot, 4)
         textX = 16
     elseif cfg.icon then
-        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 15, 0, 15), PALETTE.subtext)
+        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 15, 0, 15), "subtext")
         ic.AnchorPoint = Vector2.new(0, 0.5)
         ic.Position = UDim2.new(0, 0, 0.5, 0)
         ic.ZIndex = OVERLAY_Z
@@ -3316,28 +4093,32 @@ function Hud:row(label, value, opts)
     labelText.BackgroundTransparency = 1
     labelText.Position = UDim2.new(0, textX, 0, 0)
     labelText.Size = UDim2.new(1, -textX - 70, 1, 0)
-    labelText.FontFace = FONT
     labelText.TextSize = 13
-    labelText.TextColor3 = PALETTE.text
     labelText.TextXAlignment = Enum.TextXAlignment.Left
     labelText.TextTruncate = Enum.TextTruncate.AtEnd
-    labelText.Text = cfg.label or ""
     labelText.ZIndex = OVERLAY_Z
     labelText.Parent = row
+    faced(labelText, "medium")
+    themed(labelText, "TextColor3", "text", { fade = false })
+    local setLabelPhrase = localized(labelText, "Text", cfg.label or "")
 
     local valueText = newInstance("TextLabel")
     valueText.AnchorPoint = Vector2.new(1, 0.5)
     valueText.Position = UDim2.new(1, 0, 0.5, 0)
     valueText.Size = UDim2.new(0, 68, 1, 0)
     valueText.BackgroundTransparency = 1
-    valueText.FontFace = FONT
     valueText.TextSize = 13
-    valueText.TextColor3 = cfg.color and colorOf(cfg.color) or PALETTE.subtext
     valueText.TextXAlignment = Enum.TextXAlignment.Right
     valueText.TextTruncate = Enum.TextTruncate.AtEnd
     valueText.Text = hudText(hudRead(cfg.value))
     valueText.ZIndex = OVERLAY_Z
     valueText.Parent = row
+    faced(valueText, "regular")
+    if cfg.color then
+        valueText.TextColor3 = colorOf(cfg.color)
+    else
+        themed(valueText, "TextColor3", "subtext")
+    end
 
     local handle = {
         frame = row,
@@ -3346,7 +4127,7 @@ function Hud:row(label, value, opts)
             valueText.Text = hudText(hudRead(v))
         end,
         setLabel = function(_, v)
-            labelText.Text = tostring(v or "")
+            setLabelPhrase(tostring(v or ""))
         end,
         setVisible = function(_, v)
             row.Visible = v ~= false
@@ -3371,8 +4152,8 @@ function Hud:row(label, value, opts)
                     local on = hudRead(cfg.dot) and true or false
                     if on ~= handle._lastDot then
                         handle._lastDot = on
-                        tween(dot, 0.16, { BackgroundColor3 = on and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
-                        tween(labelText, 0.16, { TextColor3 = on and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
+                        tween(dot, 0.18, { BackgroundColor3 = on and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
+                        tween(labelText, 0.18, { TextColor3 = on and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
                     end
                 end
             end,
@@ -3390,36 +4171,36 @@ function Hud:bar(label, getRatio, opts)
     local labelText = newInstance("TextLabel")
     labelText.BackgroundTransparency = 1
     labelText.Size = UDim2.new(1, -60, 0, 15)
-    labelText.FontFace = FONT
     labelText.TextSize = 13
-    labelText.TextColor3 = PALETTE.text
     labelText.TextXAlignment = Enum.TextXAlignment.Left
     labelText.TextTruncate = Enum.TextTruncate.AtEnd
-    labelText.Text = label or ""
     labelText.ZIndex = OVERLAY_Z
     labelText.Parent = row
+    faced(labelText, "medium")
+    themed(labelText, "TextColor3", "text")
+    local setLabelPhrase = localized(labelText, "Text", label or "")
 
     local valueText = newInstance("TextLabel")
     valueText.AnchorPoint = Vector2.new(1, 0)
     valueText.Position = UDim2.new(1, 0, 0, 0)
     valueText.Size = UDim2.new(0, 58, 0, 15)
     valueText.BackgroundTransparency = 1
-    valueText.FontFace = FONT
     valueText.TextSize = 13
-    valueText.TextColor3 = PALETTE.subtext
     valueText.TextXAlignment = Enum.TextXAlignment.Right
     valueText.Text = ""
     valueText.ZIndex = OVERLAY_Z
     valueText.Parent = row
+    faced(valueText, "regular")
+    themed(valueText, "TextColor3", "subtext")
 
     local track = newInstance("Frame")
     track.AnchorPoint = Vector2.new(0, 1)
     track.Position = UDim2.new(0, 0, 1, 0)
     track.Size = UDim2.new(1, 0, 0, 6)
-    themed(track, "BackgroundColor3", "track")
     track.BorderSizePixel = 0
     track.ZIndex = OVERLAY_Z
     track.Parent = row
+    themed(track, "BackgroundColor3", "track")
     corner(track, 3)
 
     local fill = newInstance("Frame")
@@ -3439,7 +4220,7 @@ function Hud:bar(label, getRatio, opts)
         ratio = math.clamp(tonumber(ratio) or 0, 0, 1)
         if last and math.abs(ratio - last) < 0.005 then return end
         last = ratio
-        tween(fill, 0.18, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
+        tween(fill, 0.2, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
         valueText.Text = opts.text and tostring(opts.text(ratio)) or (math.floor(ratio * 100 + 0.5) .. "%")
     end
     apply(hudRead(getRatio) or 0)
@@ -3447,7 +4228,7 @@ function Hud:bar(label, getRatio, opts)
     local handle = {
         frame = row,
         set = function(_, v) apply(v) end,
-        setLabel = function(_, v) labelText.Text = tostring(v or "") end,
+        setLabel = function(_, v) setLabelPhrase(tostring(v or "")) end,
         setVisible = function(_, v) row.Visible = v ~= false end,
         remove = function() row:Destroy() end,
     }
@@ -3466,15 +4247,15 @@ function Hud:section(text)
     local label = newInstance("TextLabel")
     label.BackgroundTransparency = 1
     label.Size = UDim2.new(1, 0, 1, 0)
-    label.FontFace = FONT
     label.TextSize = 11
-    label.TextColor3 = PALETTE.subtext
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Bottom
-    label.Text = string.upper(tostring(text or ""))
     label.ZIndex = OVERLAY_Z
     label.Parent = row
-    return { frame = row, setLabel = function(_, v) label.Text = string.upper(tostring(v or "")) end }
+    faced(label, "semibold")
+    themed(label, "TextColor3", "subtext")
+    local setPhrase = localized(label, "Text", tostring(text or ""), string.upper)
+    return { frame = row, setLabel = function(_, v) setPhrase(tostring(v or "")) end }
 end
 
 -- Full width line of text, wraps over several lines when it is long.
@@ -3486,13 +4267,13 @@ function Hud:text(value)
     label.Size = UDim2.new(1, 0, 0, 0)
     label.AutomaticSize = Enum.AutomaticSize.Y
     label.TextWrapped = true
-    label.FontFace = FONT
     label.TextSize = 13
-    label.TextColor3 = PALETTE.subtext
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.Text = hudText(hudRead(value))
     label.ZIndex = OVERLAY_Z
     label.Parent = row
+    faced(label, "regular")
+    themed(label, "TextColor3", "subtext")
 
     local handle = {
         frame = row,
@@ -3518,21 +4299,25 @@ end
 function Hud:divider()
     local line = newInstance("Frame")
     line.Size = UDim2.new(1, 0, 0, 1)
-    line.BackgroundColor3 = PALETTE.stroke
     line.BackgroundTransparency = 0.4
     line.BorderSizePixel = 0
     line.ZIndex = OVERLAY_Z
     line.LayoutOrder = nextOrder(self._body)
     line.Parent = self._body
+    themed(line, "BackgroundColor3", "stroke")
     return line
 end
 
 function Hud:setTitle(text)
-    if self._title then self._title.Text = tostring(text or "") end
+    if self._setTitlePhrase then
+        self._setTitlePhrase(tostring(text or ""))
+    elseif self._title then
+        self._title.Text = tostring(text or "")
+    end
 end
 
-function Hud:setVisible(visible)
-    self.frame.Visible = visible ~= false
+function Hud:setVisible(visible, instant)
+    self._ctx:showOverlay(self.frame, visible ~= false, instant)
 end
 
 -- Drop every row but keep the panel and its title.
@@ -3559,6 +4344,7 @@ function Window:hud(opts)
         size = UDim2.new(0, opts.width or 190, 0, 0),
         autoSize = Enum.AutomaticSize.Y,
         radius = opts.radius or 8,
+        visible = opts.visible,
     })
 
     local body = newInstance("Frame")
@@ -3580,10 +4366,9 @@ function Window:hud(opts)
     }, Hud)
 
     if opts.title or opts.logo or opts.icon then
-        hud._title = overlayHeader(body, { title = opts.title or "", icon = opts.icon, logo = opts.logo })
+        hud._title, hud._setTitlePhrase = overlayHeader(body, { title = opts.title or "", icon = opts.icon, logo = opts.logo })
         hud._headerRow = hud._title.Parent
     end
-    if opts.visible == false then frame.Visible = false end
 
     -- One timer per HUD walks its polled rows, and a row that was removed drops
     -- out of the list on the next pass.
@@ -3620,11 +4405,13 @@ function Interface.new(opts)
         tabs = {}, groups = {}, flags = {},
         _refresh = {}, _binds = {},
         -- Open floating panels (dropdowns, pickers, gear popovers), the shared
-        -- listeners this window owns, the detached overlays by config name and
-        -- the HUDs built through win:hud.
-        _panels = {}, _conns = {}, _overlays = {}, _huds = {},
+        -- listeners this window owns, the detached overlays by config name, the
+        -- fade helper of each of them and the HUDs built through win:hud.
+        _panels = {}, _conns = {}, _overlays = {}, _overlayFade = {}, _huds = {},
         _open = true,
+        locale = Interface.getLocale(),
     }, Window)
+    WINDOWS[#WINDOWS + 1] = self
 
     local screen = newInstance("ScreenGui")
     screen.Name = randomName()
@@ -3652,30 +4439,45 @@ function Interface.new(opts)
         table.insert(self._conns, function() guard:Disconnect() end)
     end
 
+    -- The root frame carries no paint of its own: it is the anchor the window
+    -- scales around and the coordinate space the floating panels are placed in.
+    -- Everything you can see is inside the body group, which is what lets a fade
+    -- take the whole window down evenly, outlines included.
     local window = newInstance("Frame")
     window.Name = randomName()
+    window.AnchorPoint = Vector2.new(0.5, 0.5)
     window.Size = UDim2.new(0, 900, 0, 580)
-    window.Position = UDim2.new(0.5, -450, 0.5, -290)
-    themed(window, "BackgroundColor3", "background")
+    window.Position = UDim2.new(0.5, 0, 0.5, 0)
+    window.BackgroundTransparency = 1
     window.BorderSizePixel = 0
     window.Parent = screen
-    corner(window, 14)
-    shadow(window)
     self.window = window
+    self._shadow = shadow(window)
+
+    local body = newInstance("CanvasGroup")
+    body.Name = randomName()
+    body.Size = UDim2.new(1, 0, 1, 0)
+    body.BorderSizePixel = 0
+    body.GroupTransparency = 1
+    body.ZIndex = 1
+    body.Parent = window
+    themed(body, "BackgroundColor3", "background")
+    corner(body, 14)
+    self._body = body
 
     -- Sidebar
     local sidebar = Instance.new("Frame")
     sidebar.Size = UDim2.new(0, 230, 1, 0)
-    themed(sidebar, "BackgroundColor3", "sidebar")
     sidebar.BorderSizePixel = 0
-    sidebar.Parent = window
+    sidebar.Parent = body
+    themed(sidebar, "BackgroundColor3", "sidebar")
     corner(sidebar, 14)
     local sidebarMask = Instance.new("Frame")
     sidebarMask.Size = UDim2.new(0, 12, 1, 0)
     sidebarMask.Position = UDim2.new(1, -12, 0, 0)
-    themed(sidebarMask, "BackgroundColor3", "sidebar")
     sidebarMask.BorderSizePixel = 0
     sidebarMask.Parent = sidebar
+    themed(sidebarMask, "BackgroundColor3", "sidebar")
 
     local brandRow = Instance.new("Frame")
     brandRow.Size = UDim2.new(1, -28, 0, 48)
@@ -3691,7 +4493,7 @@ function Interface.new(opts)
         mark:Destroy()
         mark = nil
         if iconAsset(opts.icon or "logo") then
-            mark = makeIcon(brandRow, opts.icon or "logo", UDim2.new(0, 40, 0, 40), Color3.fromRGB(255, 255, 255))
+            mark = makeIcon(brandRow, opts.icon or "logo", UDim2.new(0, 40, 0, 40), "text")
             mark.AnchorPoint = Vector2.new(0, 0.5)
             mark.Position = UDim2.new(0, 0, 0.5, 0)
         end
@@ -3701,12 +4503,12 @@ function Interface.new(opts)
     brand.BackgroundTransparency = 1
     brand.Position = UDim2.new(0, hasLogo and 50 or 0, 0, 0)
     brand.Size = UDim2.new(1, hasLogo and -50 or 0, 1, 0)
-    brand.FontFace = FONT
-    brand.TextSize = 23
-    brand.TextColor3 = PALETTE.text
+    brand.TextSize = 22
     brand.TextXAlignment = Enum.TextXAlignment.Left
-    brand.Text = "NewReality"
+    brand.Text = opts.brand or "NewReality"
     brand.Parent = brandRow
+    faced(brand, "bold")
+    themed(brand, "TextColor3", "text")
     local rebuildBrand = animateBrand(brand)
     table.insert(self._refresh, rebuildBrand)
 
@@ -3727,10 +4529,10 @@ function Interface.new(opts)
     content.Position = UDim2.new(0, 230, 0, 0)
     content.Size = UDim2.new(1, -230, 1, 0)
     content.BackgroundTransparency = 1
-    content.Parent = window
+    content.Parent = body
 
     -- Drag handle sits behind the header so the title bar is draggable, but the
-    -- gear and close buttons (created after it) stay on top and remain clickable.
+    -- labels (created after it) stay on top.
     local topDrag = Instance.new("Frame")
     topDrag.Size = UDim2.new(1, 0, 0, 56)
     topDrag.BackgroundTransparency = 1
@@ -3738,26 +4540,28 @@ function Interface.new(opts)
 
     local title = Instance.new("TextLabel")
     title.BackgroundTransparency = 1
-    title.Position = UDim2.new(0, 24, 0, 14)
+    title.Position = UDim2.new(0, 24, 0, 13)
     title.Size = UDim2.new(1, -48, 0, 24)
-    title.FontFace = FONT
-    title.TextSize = 22
-    title.TextColor3 = PALETTE.text
+    title.TextSize = 21
     title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextTruncate = Enum.TextTruncate.AtEnd
     title.Text = ""
     title.Parent = content
+    faced(title, "bold")
+    themed(title, "TextColor3", "text")
     self.title = title
 
     local subtitle = Instance.new("TextLabel")
     subtitle.BackgroundTransparency = 1
     subtitle.Position = UDim2.new(0, 24, 0, 37)
     subtitle.Size = UDim2.new(1, -48, 0, 16)
-    subtitle.FontFace = FONT
     subtitle.TextSize = 13
-    subtitle.TextColor3 = PALETTE.subtext
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
+    subtitle.TextTruncate = Enum.TextTruncate.AtEnd
     subtitle.Text = ""
     subtitle.Parent = content
+    faced(subtitle, "regular")
+    themed(subtitle, "TextColor3", "subtext")
     self.subtitle = subtitle
 
     local pages = Instance.new("Frame")
@@ -3767,7 +4571,10 @@ function Interface.new(opts)
     pages.Parent = content
     self.pages = pages
 
-    -- Overlay for popovers, dropdown lists and colour pickers.
+    -- Overlay for popovers, dropdown lists and colour pickers. It is a sibling of
+    -- the body group rather than a child: a CanvasGroup rasterises its children
+    -- into its own rectangle, and a dropdown that opens above a low window has to
+    -- be free to draw outside it.
     local overlay = Instance.new("Frame")
     overlay.Size = UDim2.new(1, 0, 1, 0)
     overlay.BackgroundTransparency = 1
@@ -3827,14 +4634,16 @@ function Interface.new(opts)
         end))
     end
 
-    -- Opening animation, and the scale the show/hide toggle reuses later.
+    -- Opening: the group fades up while the window settles out of its own centre.
+    -- The scale is kept because the show/hide toggle reuses it.
     local scale = newInstance("UIScale")
-    scale.Scale = 0.92
+    scale.Scale = 0.9
     scale.Parent = window
     self._scale = scale
-    window.BackgroundTransparency = 1
-    tween(window, 0.25, { BackgroundTransparency = 0 })
-    tween(scale, 0.32, { Scale = 1 }, EASE_POP)
+    self._shadow.ImageTransparency = 1
+    tween(body, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
+    tween(self._shadow, 0.3, { ImageTransparency = 0.55 }, EASE_SOFT)
+    tween(scale, 0.36, { Scale = 1 }, EASE_POP)
 
     return self
 end
@@ -3865,20 +4674,30 @@ function Interface.showcase()
     local win = Interface.new({ icon = "logo" })
 
     -- A neutral component demo. This is only a preview of the kit, it is not a
-    -- product layout, so it just shows each control type once.
+    -- product layout, so it just shows each control type once. The worked example
+    -- of a real layout lives in examples/interface-demo.luau.
     local home = win:tab({ name = "Dashboard", icon = "layout-dashboard", group = "Main", subtitle = "Overview of every control" })
     do
         local s = home:sub("Controls")
         local basics = s:card({ title = "Basics", icon = "adjustments", subtitle = "Buttons and toggles", column = "left" })
-        basics:button("Run Action", function() end)
+        basics:button("Run Action", function() win:notify({ title = "Action", text = "Button clicked", icon = "bolt" }) end)
         do
             local g, set = win:flag("simpleToggle", true)
             basics:toggle("Simple Toggle", g, set)
         end
-        basics:toggle("Toggle With Settings", function() return false end, function() end, function(set)
-            set:slider("Inner Value", 0, 100, function() return 40 end, function() end, 0)
-            set:toggle("Inner Toggle", function() return true end, function() end)
-        end)
+        -- get and set are unpacked into locals wherever another argument follows
+        -- them: a call takes only the first value of a multi value expression
+        -- unless it is the last argument, so passing win:flag() mid-list would
+        -- quietly drop the setter.
+        do
+            local gearGet, gearSet = win:flag("gearToggle", false)
+            basics:toggle("Toggle With Settings", gearGet, gearSet, function(sc)
+                local innerGet, innerSet = win:flag("gearValue", 40)
+                sc:slider("Inner Value", 0, 100, innerGet, innerSet, 0)
+                sc:toggle("Inner Toggle", win:flag("gearInner", true))
+                sc:label("Everything a card takes works in here too.")
+            end)
+        end
         do
             -- Multi keybind that can also be cleared (right click) and fires a callback.
             local g, set = win:flag("bindKeys", { "F" })
@@ -3886,10 +4705,16 @@ function Interface.showcase()
         end
 
         local values = s:card({ title = "Values", icon = "gauge", subtitle = "Sliders and steppers", column = "right" })
-        do local g, set = win:flag("speed", 50) values:slider("Speed", 16, 200, g, set, 0) end
-        do local g, set = win:flag("multiplier", 1.5) values:slider("Multiplier", 0, 5, g, set, 1) end
-        do local g, set = win:flag("count", 3) values:stepper("Count", 0, 10, 1, g, set) end
-        do local g, set = win:flag("mode", "Hold") values:segmented("Mode", { "Off", "Hold", "On" }, g, set) end
+        do
+            local get, set = win:flag("speed", 50)
+            values:slider("Speed", 16, 200, get, set, 0)
+        end
+        do
+            local get, set = win:flag("multiplier", 1.5)
+            values:slider("Multiplier", 0, 5, get, set, 1)
+        end
+        values:stepper("Count", 0, 10, 1, win:flag("count", 3))
+        values:segmented("Mode", { "Off", "Hold", "On" }, win:flag("mode", "Hold"))
 
         local more = home:sub("More")
         more:card({ title = "Labels", icon = "info-circle", column = "left" }):label("This sub-tab proves the top tabs switch correctly.")
@@ -3899,16 +4724,22 @@ function Interface.showcase()
     do
         local s = lists:sub("Selectors")
         local pick = s:card({ title = "Pickers", icon = "filter", column = "left" })
-        local single = "Alpha"
-        pick:dropdown("Single", { "Alpha", "Beta", "Gamma" }, function() return single end, function(v) single = v end, { search = true })
-        local multi = { "Pink" }
-        pick:dropdown("Multi", { "Red", "Green", "Blue", "Pink" }, function() return multi end, function(v) multi = v end, { multi = true, search = true })
-        local accent = { 251, 149, 255 }
-        pick:colorpicker("Accent", function() return accent end, function(v) accent = v end)
+        do
+            local get, set = win:flag("single", "Alpha")
+            pick:dropdown("Single", { "Alpha", "Beta", "Gamma" }, get, set, { search = true })
+        end
+        do
+            local get, set = win:flag("multi", { "Pink" })
+            pick:dropdown("Multi", { "Red", "Green", "Blue", "Pink" }, get, set, { multi = true, search = true })
+        end
+        local accent = { 251, 149, 255, 1 }
+        pick:colorpicker("Colour", function() return accent end, function(v) accent = v end)
 
         local conf = s:card({ title = "Config List", icon = "device-floppy", column = "right" })
-        local cfgSel = "Default"
-        conf:list({ "Default", "Rage", "Legit", "Custom" }, function() return cfgSel end, function(v) cfgSel = v end, { search = true })
+        do
+            local get, set = win:flag("preset", "Default")
+            conf:list({ "Default", "Rage", "Legit", "Custom" }, get, set, { search = true })
+        end
     end
 
     local settings = win:tab({ name = "Settings", icon = "settings", group = "Other", subtitle = "Interface options" })
@@ -3917,9 +4748,11 @@ function Interface.showcase()
         local ui = s:card({ title = "Interface", icon = "settings", subtitle = "Window behaviour", column = "left" })
         ui:keybind("Toggle UI", function() return win.toggleKey.Name end, function(k)
             local ok, key = pcall(function() return Enum.KeyCode[k] end)
-            if ok and key then win.toggleKey = key end
+            if ok and key then
+                win.toggleKey = key
+                win:markDirty()
+            end
         end)
-        ui:toggle("Rainbow Logo", function() return true end, function() end)
         ui:button("Unload", function() win:unload() end)
 
         -- Detached overlays: the watermark strip, the keybind list and a HUD
@@ -3933,29 +4766,23 @@ function Interface.showcase()
             local secs = math.floor(os.clock() - startedAt)
             return string.format("%02d:%02d", secs // 60, secs % 60)
         end)
-        demoHud:row({ label = "Ping", value = function()
-            local stat = game:GetService("Stats")
-            local ok, ms = pcall(function() return stat.Network.ServerStatsItem["Data Ping"]:GetValue() end)
-            return ok and (math.floor(ms) .. " ms") or "-"
-        end })
         demoHud:section("Status")
         demoHud:row({ label = "Farm", dot = function() return (os.clock() % 4) < 2 end, value = "Idle" })
         demoHud:bar("Progress", function() return (os.clock() % 10) / 10 end)
-        overlays:toggle("Watermark", function() return wm.Visible end, function(v) wm.Visible = v end)
-        overlays:toggle("Keybind List", function() return binds.Visible end, function(v) binds.Visible = v end)
+        overlays:toggle("Watermark", function() return wm.Visible end, function(v) win:showOverlay(wm, v) end)
+        overlays:toggle("Keybind List", function() return binds.Visible end, function(v) win:showOverlay(binds, v) end)
         overlays:toggle("Session HUD", function() return demoHud.frame.Visible end, function(v) demoHud:setVisible(v) end)
 
         -- Live theme colours: every tagged part recolours instantly.
         local theme = s:card({ title = "Theme", icon = "palette", subtitle = "Colour every part", column = "left" })
         local function themePicker(label, key)
-            theme:colorpicker(label, function() return win:getColor(key) end, function(rgb) win:setColor(key, rgb) end, { alpha = true })
+            theme:colorpicker(label, function() return win:getColor(key) end, function(rgb) win:setColor(key, rgb) end)
         end
         themePicker("Accent", "accent")
         themePicker("Background", "background")
         themePicker("Sidebar", "sidebar")
         themePicker("Cards", "card")
         themePicker("Controls", "control")
-        themePicker("Track", "track")
         theme:button("Reset Theme", function() win:resetTheme() end)
 
         local cfg = s:card({ title = "Save Manager", icon = "device-floppy", subtitle = "Configurations", column = "right" })
@@ -3968,24 +4795,8 @@ function Interface.showcase()
             return list
         end
         cfg:dropdown("Config", cfgList, function() return cfgSel end, function(v) cfgSel = v end, { search = true })
-        local newName = ""
-        cfg:input("Name", "new config name", function() return newName end, function(v) newName = v end)
-        cfg:button("Create", function()
-            if newName ~= "" and win:saveConfig(newName) then
-                cfgSel = newName
-                newName = ""
-                win:refreshAll()
-            end
-        end)
         cfg:button("Save", function() win:saveConfig(cfgSel) end)
         cfg:button("Load", function() win:loadConfig(cfgSel) end)
-        cfg:button("Delete", function()
-            if cfgSel ~= "default" and win:deleteConfig(cfgSel) then
-                cfgSel = "default"
-                win:refreshAll()
-            end
-        end)
-        cfg:toggle("Auto Load Config", function() return false end, function() end)
     end
     return win
 end
