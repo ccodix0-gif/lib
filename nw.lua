@@ -96,7 +96,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.30.3"
+Interface.version = "2026.07.30.4"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -1091,9 +1091,30 @@ local function tween(instance, time, props, style, dir)
     return t
 end
 
+-- How far below its resting place the window starts and ends. Kept in one place so
+-- opening and closing cannot drift apart.
+local WINDOW_RISE = 34
+local function WINDOW_LIFT(resting)
+    return UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + WINDOW_RISE)
+end
+
 -- Gentle icon colour transition.
 local function tintIcon(img, color)
     tween(img, 0.18, { ImageColor3 = color }, EASE_SOFT)
+end
+
+-- The shading on a filled bar. A gradient modulates the fill it sits on, so this
+-- is a brightness ramp rather than a second colour and it keeps working after the
+-- accent is changed. Every bar in the kit uses it, sliders and progress rows
+-- alike: one bar shaded and the next one flat reads as a mistake.
+local function barRamp(fill)
+    local ramp = newInstance("UIGradient")
+    ramp.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(122, 122, 122)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
+    })
+    ramp.Parent = fill
+    return ramp
 end
 
 -- Hover on a filled surface: the fill lifts to the hover colour and nothing else
@@ -1368,12 +1389,16 @@ local function openPanel(ctx, cfg)
         backdrop.Visible = want
         shield.Visible = want
         if want then
+            -- Comes back the way it opened, so returning to a panel and opening one
+            -- are the same movement.
             panel.Visible = true
-            tween(panel, 0.18, { GroupTransparency = 0 }, EASE_SOFT)
-            tween(edge, 0.18, { Transparency = 0.35 }, EASE_SOFT)
+            panel.Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset - 10)
+            tween(panel, 0.26, { Position = resting }, EASE)
+            tween(panel, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
+            tween(edge, 0.2, { Transparency = 0.35 }, EASE_SOFT)
         else
-            tween(edge, 0.14, { Transparency = 1 }, EASE_SOFT)
-            tween(panel, 0.14, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
+            tween(edge, 0.16, { Transparency = 1 }, EASE_SOFT)
+            tween(panel, 0.16, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
                 if not shown and not closed then panel.Visible = false end
             end)
         end
@@ -1568,7 +1593,10 @@ function Controls.label(parent, text)
     label.Size = UDim2.new(1, 0, 0, 0)
     label.AutomaticSize = Enum.AutomaticSize.Y
     label.TextWrapped = true
-    label.TextSize = 13
+    -- A bold face needs a little more room than a light one before the stems of
+    -- adjacent letters start closing up, so the running text in the kit sits a
+    -- point above where it would with a regular weight.
+    label.TextSize = 14
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Top
     label.Parent = row
@@ -1585,7 +1613,7 @@ function Controls.section(parent, text)
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Size = UDim2.new(1, 0, 1, 0)
-    label.TextSize = 11
+    label.TextSize = 12
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Bottom
     label.Parent = row
@@ -1756,15 +1784,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     fill.Parent = track
     themed(fill, "BackgroundColor3", "accent")
     corner(fill, 3)
-    -- A gradient modulates the fill, so the bar reads as a bar and not as a flat
-    -- block, and it keeps doing that after the accent is changed because the
-    -- ramp is a brightness ramp rather than a second colour.
-    local fillGrad = Instance.new("UIGradient")
-    fillGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(92, 92, 92)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
-    })
-    fillGrad.Parent = fill
+    barRamp(fill)
 
     local knob = Instance.new("Frame")
     knob.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -1867,7 +1887,9 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     themed(button, "BackgroundColor3", "control")
     themed(button, "TextColor3", "text", { fade = false })
     corner(button, 6)
-    local captureEdge = stateStroke(button, "accent")
+    -- Capture is shown by the accent coloured dots in the field, not by a ring
+    -- around it. Same reasoning as a focused text field: the row already has an
+    -- edge, and a second one reads as a defect rather than as a state.
 
     -- A visible clear button (tap to remove the bind) for users who do not know
     -- the right click shortcut and players on mobile / console. Uses the x icon.
@@ -1914,7 +1936,6 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     button.Text = display()
     clearBtn.Visible = #keyList() > 0
     local function stopCapture()
-        tween(captureEdge, 0.2, { Transparency = 1 }, EASE_SOFT)
         tween(button, 0.18, { TextColor3 = PALETTE.text }, EASE_SOFT)
     end
     clearBtn.MouseButton1Click:Connect(function()
@@ -1947,7 +1968,6 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
         capturing = true
         button.Text = "..."
         tween(button, 0.16, { TextColor3 = PALETTE.accent }, EASE_SOFT)
-        tween(captureEdge, 0.16, { Transparency = 0.2 }, EASE_SOFT)
     end)
     -- Right click clears the bind, unless a mouse button was just captured (the
     -- capturing right-click is handled by InputBegan, so ignore its release here).
@@ -2296,7 +2316,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     hexLabel.Position = UDim2.new(1, -30, 0.5, 0)
     hexLabel.Size = UDim2.new(0, 72, 0, 20)
     hexLabel.BackgroundTransparency = 1
-    hexLabel.TextSize = 13
+    hexLabel.TextSize = 14
     hexLabel.TextXAlignment = Enum.TextXAlignment.Right
     hexLabel.Text = hexOf(getRgb())
     hexLabel.Parent = row
@@ -3009,7 +3029,7 @@ function Sub:card(title, column)
             subLabel.BackgroundTransparency = 1
             subLabel.Position = UDim2.new(0, textX, 0, 20)
             subLabel.Size = UDim2.new(1, -textX - (cfg.toggle and 54 or 0), 0, 16)
-            subLabel.TextSize = 12
+            subLabel.TextSize = 13
             subLabel.TextXAlignment = Enum.TextXAlignment.Left
             subLabel.TextTruncate = Enum.TextTruncate.AtEnd
             subLabel.Parent = header
@@ -3347,22 +3367,24 @@ function Window:toggle(show)
     local shade = self._shadow
     if show and not self._resting then self._resting = window.Position end
     local resting = self._resting or window.Position
-    local lifted = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + 26)
 
     if show then
         window.Visible = true
-        window.Position = lifted
-        tween(window, 0.36, { Position = resting }, EASE)
-        if body then tween(body, 0.2, { GroupTransparency = 0 }, EASE_SOFT) end
-        if shade then tween(shade, 0.28, { ImageTransparency = 0.55 }, EASE_SOFT) end
+        window.Position = WINDOW_LIFT(resting)
+        -- Back out, so it arrives with a little weight and settles rather than
+        -- gliding to a stop.
+        tween(window, 0.44, { Position = resting }, EASE_POP)
+        if body then tween(body, 0.28, { GroupTransparency = 0 }, EASE_SOFT) end
+        if shade then tween(shade, 0.34, { ImageTransparency = 0.55 }, EASE_SOFT) end
     else
         -- Where it sits now is where it should come back to.
         self._resting = window.Position
         resting = self._resting
-        lifted = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + 26)
         if body then tween(body, 0.18, { GroupTransparency = 1 }, EASE_SOFT) end
         if shade then tween(shade, 0.16, { ImageTransparency = 1 }, EASE_SOFT) end
-        local out = tween(window, 0.24, { Position = lifted }, EASE)
+        -- Leaving accelerates away instead of easing out, which is what stops a
+        -- close from feeling like it is being dragged shut.
+        local out = tween(window, 0.2, { Position = WINDOW_LIFT(resting) }, EASE, Enum.EasingDirection.In)
         out.Completed:Once(function()
             if not self._open then
                 window.Visible = false
@@ -3380,20 +3402,79 @@ end
 -- Only parts passed to themed(inst, prop, key) follow the palette, and they are
 -- read from that key's registry, so one colour never bleeds onto unrelated
 -- elements and no walk over the GUI tree is needed.
+-- The repaint eases into the new colour rather than snapping to it.
+--
+-- The palette value itself is updated at once, because everything that reads
+-- PALETTE while building or animating has to see the value it is heading for. Only
+-- the walk over the registry is interpolated, on the shared frame driver, which is
+-- one pass per key per frame for about a tenth of a second. A second change to the
+-- same key while the first is still running picks up from the colour that is
+-- actually on screen, so dragging a colour picker trails the pointer smoothly
+-- instead of stepping.
+local THEME_FADE = 0.12
+local themeFade = {}
+local themeFadeStop = nil
+
+local function paintKey(key, color, alpha)
+    local reg = THEME_REG[key]
+    if not reg then return end
+    tagWalk(reg, function(inst, entry)
+        inst[entry.prop] = color
+        if entry.fade then
+            fadeProp(inst, entry.prop, alpha)
+        end
+    end)
+end
+
+local function driveThemeFade(dt)
+    local running = false
+    for key, state in pairs(themeFade) do
+        state.t = math.min(state.t + dt / THEME_FADE, 1)
+        -- Ease out, so the last part of the change is the gentle part.
+        local a = 1 - (1 - state.t) * (1 - state.t)
+        state.shown = state.from:Lerp(state.to, a)
+        state.shownAlpha = state.alphaFrom + (state.alphaTo - state.alphaFrom) * a
+        paintKey(key, state.shown, state.shownAlpha)
+        if state.t >= 1 then
+            themeFade[key] = nil
+        else
+            running = true
+        end
+    end
+    if not running and themeFadeStop then
+        themeFadeStop()
+        themeFadeStop = nil
+    end
+end
+
 function Window:setColor(key, rgb)
     local reg = THEME_REG[key]
     if not reg then return end
     local new = (typeof(rgb) == "Color3") and rgb or colorOf(rgb)
     local alpha = (type(rgb) == "table" and rgb[4]) or PALETTE_A[key] or 1
+
+    local running = themeFade[key]
+    local from = (running and running.shown) or PALETTE[key]
+    local alphaFrom = (running and running.shownAlpha) or PALETTE_A[key] or 1
+
     PALETTE[key] = new
     PALETTE_A[key] = alpha
 
-    tagWalk(reg, function(inst, entry)
-        inst[entry.prop] = new
-        if entry.fade then
-            fadeProp(inst, entry.prop, alpha)
+    if from == new and alphaFrom == alpha then
+        themeFade[key] = nil
+        paintKey(key, new, alpha)
+    else
+        themeFade[key] = {
+            from = from, to = new,
+            alphaFrom = alphaFrom, alphaTo = alpha,
+            shown = from, shownAlpha = alphaFrom,
+            t = 0,
+        }
+        if not themeFadeStop then
+            themeFadeStop = addTicker(0, driveThemeFade)
         end
-    end)
+    end
+
     if self._refresh then
         for _, fn in ipairs(self._refresh) do pcall(fn) end
     end
@@ -3498,7 +3579,10 @@ function Window:saveConfig(name, silent)
     local overlays = {}
     for key, frame in pairs(self._overlays) do
         if frame and frame.Parent then
-            local p = frame.Position
+            -- The resting place, not wherever the show/hide animation has the frame
+            -- at this instant. Writing the live position could persist a panel
+            -- halfway through leaving.
+            local p = self._overlayRest[key] or frame.Position
             overlays[key] = { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset, frame.Visible and 1 or 0 }
         end
     end
@@ -3570,7 +3654,9 @@ function Window:loadConfig(name)
             local frame = self._overlays[key]
             if frame and frame.Parent and type(t) == "table" and #t >= 4 then
                 pcall(function()
-                    frame.Position = UDim2.new(t[1], t[2], t[3], t[4])
+                    local at = UDim2.new(t[1], t[2], t[3], t[4])
+                    self._overlayRest[key] = at
+                    frame.Position = at
                     if t[5] ~= nil then self:showOverlay(frame, t[5] == 1, true) end
                 end)
             end
@@ -3740,7 +3826,7 @@ function Window:notify(opts)
         msg.BackgroundTransparency = 1
         msg.Position = UDim2.new(0, textX, 0, 28)
         msg.Size = UDim2.new(1, -textX - 14, 0, 18)
-        msg.TextSize = 13
+        msg.TextSize = 14
         msg.TextXAlignment = Enum.TextXAlignment.Left
         msg.TextTruncate = Enum.TextTruncate.AtEnd
         msg.Parent = toast
@@ -3848,8 +3934,21 @@ local function overlayShell(self, name, opts)
         frame.Position = UDim2.new(saved[1], saved[2], saved[3], saved[4])
     end
     self._overlays[name] = frame
+
+    -- Where the panel belongs, held here rather than read back off the frame.
+    --
+    -- The show and hide animation moves the frame, so reading frame.Position to
+    -- find the resting place gives a mid-animation value whenever a toggle
+    -- interrupts one. Each interrupted toggle then adopted that value as the new
+    -- resting place and the panel walked down the screen a few pixels at a time,
+    -- and auto save wrote the walk to the config. This is the only thing the
+    -- animation and the config agree to read.
+    self._overlayRest[name] = frame.Position
     -- Dropping it marks the config dirty, so auto save keeps the new spot.
-    makeDraggable(frame, frame, function() self._dirty = true end)
+    makeDraggable(frame, frame, function(dropped)
+        self._overlayRest[name] = dropped.Position
+        self._dirty = true
+    end)
 
     -- Show and hide with the same fade the panel came in with. Registered on the
     -- window so win:showOverlay works on a watermark as well as on a HUD.
@@ -3866,38 +3965,38 @@ local function overlayShell(self, name, opts)
     -- switched off. Only the group's own position moves, and the resting place is
     -- restored the moment the tween is done, because that position is what the
     -- config stores and what a drag starts from.
-    local LIFT = 14
-    local function restingOf()
-        local p = frame.Position
-        return UDim2.new(p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset)
+    local LIFT = 12
+    local function liftedFrom(resting)
+        return UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + LIFT)
     end
     self._overlayFade[frame] = function(visible, instant)
+        local resting = self._overlayRest[name] or frame.Position
         if visible then
-            local resting = restingOf()
             frame.Visible = true
             if instant then
+                frame.Position = resting
                 frame.GroupTransparency = 0
                 edge.Transparency = 0.3
             else
-                frame.Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + LIFT)
-                tween(frame, 0.32, { Position = resting }, EASE)
-                tween(frame, 0.24, { GroupTransparency = 0 }, EASE_SOFT)
-                tween(edge, 0.24, { Transparency = 0.3 }, EASE_SOFT)
+                frame.Position = liftedFrom(resting)
+                tween(frame, 0.34, { Position = resting }, EASE)
+                tween(frame, 0.26, { GroupTransparency = 0 }, EASE_SOFT)
+                tween(edge, 0.26, { Transparency = 0.3 }, EASE_SOFT)
             end
         elseif instant then
+            frame.Position = resting
             frame.GroupTransparency = 1
             edge.Transparency = 1
             frame.Visible = false
         else
-            local resting = restingOf()
             tween(edge, 0.2, { Transparency = 1 }, EASE_SOFT)
             tween(frame, 0.2, { GroupTransparency = 1 }, EASE_SOFT)
-            local out = tween(frame, 0.26, {
-                Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + LIFT),
-            }, EASE)
+            local out = tween(frame, 0.24, { Position = liftedFrom(resting) }, EASE, Enum.EasingDirection.In)
             out.Completed:Once(function()
                 if frame.GroupTransparency > 0.9 then frame.Visible = false end
-                frame.Position = resting
+                -- Back to the resting place either way, so an interrupted hide
+                -- cannot leave the panel parked on the lifted offset.
+                frame.Position = self._overlayRest[name] or resting
             end)
         end
         if settled then self._dirty = true end
@@ -4015,7 +4114,7 @@ function Window:watermark(opts)
         t.AutomaticSize = Enum.AutomaticSize.X
         t.Size = UDim2.new(0, 0, 1, 0)
         t.BackgroundTransparency = 1
-        t.TextSize = 13
+        t.TextSize = 14
         t.TextYAlignment = Enum.TextYAlignment.Center
         t.Text = initial
         t.ZIndex = OVERLAY_Z
@@ -4404,6 +4503,10 @@ function Hud:bar(label, getRatio, opts)
     else
         themed(fill, "BackgroundColor3", "accent")
     end
+    -- The same brightness ramp a slider fill carries, so the two kinds of bar in
+    -- the kit read as the same object. One with a ramp next to one without looks
+    -- like one of them is shaded by mistake.
+    barRamp(fill)
 
     local last = nil
     local function apply(ratio)
@@ -4597,7 +4700,7 @@ function Interface.new(opts)
         -- Open floating panels (dropdowns, pickers, gear popovers), the shared
         -- listeners this window owns, the detached overlays by config name, the
         -- fade helper of each of them and the HUDs built through win:hud.
-        _panels = {}, _conns = {}, _overlays = {}, _overlayFade = {}, _huds = {},
+        _panels = {}, _conns = {}, _overlays = {}, _overlayFade = {}, _overlayRest = {}, _huds = {},
         _open = true,
         locale = Interface.getLocale(),
     }, Window)
@@ -4751,7 +4854,7 @@ function Interface.new(opts)
     subtitle.BackgroundTransparency = 1
     subtitle.Position = UDim2.new(0, 24, 0, 37)
     subtitle.Size = UDim2.new(1, -48, 0, 16)
-    subtitle.TextSize = 13
+    subtitle.TextSize = 14
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
     subtitle.TextTruncate = Enum.TextTruncate.AtEnd
     subtitle.Text = ""
@@ -4837,14 +4940,11 @@ function Interface.new(opts)
     -- Same motion the show/hide toggle uses, and for the same reason it is a
     -- travel and not a scale.
     self._resting = window.Position
-    window.Position = UDim2.new(
-        self._resting.X.Scale, self._resting.X.Offset,
-        self._resting.Y.Scale, self._resting.Y.Offset + 26
-    )
+    window.Position = WINDOW_LIFT(self._resting)
     self._shadow.ImageTransparency = 1
-    tween(window, 0.4, { Position = self._resting }, EASE)
-    tween(body, 0.24, { GroupTransparency = 0 }, EASE_SOFT)
-    tween(self._shadow, 0.32, { ImageTransparency = 0.55 }, EASE_SOFT)
+    tween(window, 0.46, { Position = self._resting }, EASE_POP)
+    tween(body, 0.3, { GroupTransparency = 0 }, EASE_SOFT)
+    tween(self._shadow, 0.36, { ImageTransparency = 0.55 }, EASE_SOFT)
 
     return self
 end
