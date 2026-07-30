@@ -69,10 +69,18 @@
 --   win:hud{...}            -- custom panel built from rows, bars and sections
 --   win:notify({ title, text, icon, duration })
 --
+-- SEARCH: a field at the top of the sidebar. Every named control indexes itself as
+--   the interface is built, and picking a result opens its tab and sub-page, scrolls
+--   to the control and flashes it. Nothing to declare.
+--
 -- MISC: win:refreshAll() (re-sync every control from its flag), win:toggle()
 --   (show/hide the window), win:unload() (remove everything the library made).
+--   win:refit() re-fits to the screen, and it already runs on a timer.
+--   win:applyTheme(name) / UI.themeNames() for the palette presets.
+--   win:exportConfig() / win:importConfig(text) move a config through the clipboard.
 --   UI.licence(fn [, seconds]) gates window creation on your own check.
 --   UI.setFont(family) swaps the type family for a language the default misses.
+--   UI.setLogger(fn) receives the diagnostics; nothing is printed without it.
 
 -- Services and the executor globals we rely on are captured once, at load time,
 -- before another script in the session can hook them. Everything below uses the
@@ -96,7 +104,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.30.6"
+Interface.version = "2026.07.31.1"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -110,14 +118,101 @@ local PALETTE = {
     stroke = Color3.fromRGB(58, 58, 68),
     text = Color3.fromRGB(255, 255, 255),
     subtext = Color3.fromRGB(150, 150, 162),
+    -- Marks rather than text: icons, the toggle knob, the slider knob. They start
+    -- white and they have their own keys on purpose. They used to follow text and
+    -- subtext, so recolouring the text turned every icon and every knob in the
+    -- interface that colour too, which is not what anyone means by "text colour".
+    icon = Color3.fromRGB(255, 255, 255),
+    iconDim = Color3.fromRGB(150, 150, 162),
+    knob = Color3.fromRGB(255, 255, 255),
     accent = Color3.fromRGB(0, 255, 255),
 }
 Interface.palette = PALETTE
 
--- Snapshot of the default palette so the theme can be reverted.
+-- Snapshot of the default palette so the theme can be reverted. Derived keys are
+-- added after this snapshot, which is what keeps them out of getColor, resetTheme
+-- and the saved config: they are computed, not chosen.
 local DEFAULTS = {}
 for k, v in pairs(PALETTE) do DEFAULTS[k] = v end
 Interface.defaults = DEFAULTS
+
+-- accentSoft is the accent corrected for legibility against the window background.
+-- It is recomputed whenever either of those changes, never set directly.
+PALETTE.accentSoft = PALETTE.accent
+
+-- Theme presets ---------------------------------------------------------------
+-- A preset is a partial palette: only the keys it names are applied, so a scheme
+-- can change the accent alone and leave the greys as they are. Add your own with
+-- UI.addTheme(name, keys) and apply one with win:applyTheme(name).
+local THEMES = {
+    ["NewReality"] = {
+        sidebar = { 24, 24, 28 }, background = { 31, 31, 36 },
+        card = { 38, 38, 44 }, cardTop = { 44, 44, 51 },
+        control = { 48, 48, 56 }, controlHover = { 58, 58, 67 },
+        track = { 58, 58, 67 }, stroke = { 58, 58, 68 },
+        text = { 255, 255, 255 }, subtext = { 150, 150, 162 },
+        icon = { 255, 255, 255 }, iconDim = { 150, 150, 162 },
+        knob = { 255, 255, 255 }, accent = { 0, 255, 255 },
+    },
+    Graphite = {
+        sidebar = { 22, 22, 24 }, background = { 30, 30, 32 },
+        card = { 38, 38, 41 }, cardTop = { 44, 44, 47 },
+        control = { 49, 49, 53 }, controlHover = { 60, 60, 64 },
+        track = { 60, 60, 64 }, stroke = { 62, 62, 66 },
+        text = { 244, 244, 246 }, subtext = { 146, 146, 152 },
+        icon = { 255, 255, 255 }, iconDim = { 146, 146, 152 },
+        knob = { 255, 255, 255 }, accent = { 118, 168, 255 },
+    },
+    Midnight = {
+        sidebar = { 16, 18, 30 }, background = { 21, 24, 39 },
+        card = { 28, 32, 50 }, cardTop = { 33, 38, 58 },
+        control = { 37, 42, 64 }, controlHover = { 47, 53, 78 },
+        track = { 47, 53, 78 }, stroke = { 50, 57, 84 },
+        text = { 236, 240, 255 }, subtext = { 138, 146, 178 },
+        icon = { 255, 255, 255 }, iconDim = { 138, 146, 178 },
+        knob = { 255, 255, 255 }, accent = { 124, 138, 255 },
+    },
+    Ember = {
+        sidebar = { 26, 21, 20 }, background = { 33, 27, 26 },
+        card = { 42, 34, 32 }, cardTop = { 48, 39, 37 },
+        control = { 54, 44, 41 }, controlHover = { 66, 53, 50 },
+        track = { 66, 53, 50 }, stroke = { 68, 55, 52 },
+        text = { 253, 245, 242 }, subtext = { 168, 150, 144 },
+        icon = { 255, 255, 255 }, iconDim = { 168, 150, 144 },
+        knob = { 255, 255, 255 }, accent = { 255, 138, 76 },
+    },
+    Moss = {
+        sidebar = { 20, 26, 23 }, background = { 26, 33, 29 },
+        card = { 33, 42, 37 }, cardTop = { 38, 48, 42 },
+        control = { 43, 54, 47 }, controlHover = { 53, 66, 58 },
+        track = { 53, 66, 58 }, stroke = { 55, 68, 60 },
+        text = { 240, 248, 243 }, subtext = { 146, 166, 153 },
+        icon = { 255, 255, 255 }, iconDim = { 146, 166, 153 },
+        knob = { 255, 255, 255 }, accent = { 116, 224, 152 },
+    },
+    Paper = {
+        sidebar = { 232, 232, 236 }, background = { 244, 244, 247 },
+        card = { 255, 255, 255 }, cardTop = { 248, 248, 251 },
+        control = { 234, 234, 239 }, controlHover = { 222, 222, 229 },
+        track = { 218, 218, 226 }, stroke = { 208, 208, 216 },
+        text = { 26, 26, 32 }, subtext = { 108, 108, 120 },
+        icon = { 48, 48, 56 }, iconDim = { 128, 128, 140 },
+        knob = { 255, 255, 255 }, accent = { 0, 132, 168 },
+    },
+}
+Interface.themes = THEMES
+
+function Interface.addTheme(name, keys)
+    if type(name) ~= "string" or type(keys) ~= "table" then return end
+    THEMES[name] = keys
+end
+
+function Interface.themeNames()
+    local out = {}
+    for name in pairs(THEMES) do out[#out + 1] = name end
+    table.sort(out)
+    return out
+end
 
 -- Per key opacity (1 = fully opaque). Colour pickers may carry an alpha that is
 -- mapped onto the matching transparency property when a themed part is painted.
@@ -173,18 +268,67 @@ local function colorOf(rgb)
 end
 Interface.colorOf = colorOf
 
+local function luminance(color)
+    return 0.2126 * color.R + 0.7152 * color.G + 0.0722 * color.B
+end
+
 -- Black or white, whichever can be read on top of the given colour. Anything the
 -- kit prints on an accent filled shape goes through this: the accent is the one
 -- palette key a user is certain to change, and a label that assumes a bright
 -- accent disappears the moment someone picks a dark one.
 local function contrastOn(color)
-    local luma = 0.2126 * color.R + 0.7152 * color.G + 0.0722 * color.B
-    if luma > 0.55 then
+    if luminance(color) > 0.55 then
         return Color3.fromRGB(16, 16, 20)
     end
     return Color3.fromRGB(255, 255, 255)
 end
 Interface.contrastOn = contrastOn
+
+-- Recently used colours, shared by every picker in the session and saved with the
+-- config. Theming an interface means going back and forth between a handful of
+-- colours, and typing a hex code again each time is the slow way round.
+local RECENT_MAX = 8
+local recentColors = {}
+Interface.recentColors = recentColors
+
+local function pushRecent(rgb)
+    local hex = string.format("%02X%02X%02X", rgb[1] or 0, rgb[2] or 0, rgb[3] or 0)
+    for i = #recentColors, 1, -1 do
+        if recentColors[i] == hex then table.remove(recentColors, i) end
+    end
+    table.insert(recentColors, 1, hex)
+    while #recentColors > RECENT_MAX do table.remove(recentColors) end
+end
+
+-- The accent, lifted or dropped until it can be seen against the surface it is
+-- drawn on. Used only by the thin marks: a two pixel underline, a sixteen pixel
+-- tick, a seven pixel dot. Those vanish outright when someone picks an accent close
+-- to their background, and there is not enough of them on screen for the shift to
+-- be noticed as a different colour.
+--
+-- Large filled areas keep the literal accent. Correcting those would be answering
+-- a colour the user chose with a colour the library preferred.
+local MIN_MARK_CONTRAST = 0.18
+local function legibleOn(color, surface)
+    local gap = luminance(color) - luminance(surface)
+    if math.abs(gap) >= MIN_MARK_CONTRAST then return color end
+    local h, s, v = color:ToHSV()
+    -- Away from the surface: lighter on a dark one, darker on a light one.
+    local up = luminance(surface) < 0.5
+    for _ = 1, 12 do
+        v = up and math.min(v + 0.08, 1) or math.max(v - 0.08, 0)
+        if s > 0 and up and v >= 1 then s = math.max(s - 0.12, 0) end
+        local tryColor = Color3.fromHSV(h, s, v)
+        if math.abs(luminance(tryColor) - luminance(surface)) >= MIN_MARK_CONTRAST then
+            return tryColor
+        end
+        if (up and v >= 1 and s <= 0) or (not up and v <= 0) then
+            return tryColor
+        end
+    end
+    return Color3.fromHSV(h, s, v)
+end
+Interface.legibleOn = legibleOn
 
 -- Tag registries --------------------------------------------------------------
 -- Theme tagging: any element passed to themed(inst, prop, key) follows the
@@ -444,6 +588,24 @@ function Interface.licence(fn, period)
     if type(period) == "number" and period >= 10 then licencePeriod = period end
 end
 
+-- Diagnostics ----------------------------------------------------------------
+-- The library writes nothing to the console. A product script shares that console
+-- with the game and with whatever else the session is running, and a UI kit
+-- announcing that it loaded is noise in someone else's output.
+--
+-- What it used to print is still available, it just has to be asked for:
+--   UI.setLogger(function(level, message) print(level, message) end)
+-- level is "info" or "warn". Passing nil turns it back off.
+local logger = nil
+local function log(level, message)
+    if not logger then return end
+    pcall(logger, level, "[NewReality] " .. tostring(message))
+end
+
+function Interface.setLogger(fn)
+    logger = type(fn) == "function" and fn or nil
+end
+
 -- Input hub -------------------------------------------------------------------
 -- One connection per input signal for the whole library. Controls register a
 -- listener instead of connecting on their own, so a window with a few hundred
@@ -474,7 +636,7 @@ end
 UserInputService.InputBegan:Connect(function(input, gpe)
     for fn in pairs(keyListeners) do
         local ok, err = pcall(fn, input, gpe)
-        if not ok then warn("[NewReality] input listener: " .. tostring(err)) end
+        if not ok then log("warn", "input listener: " .. tostring(err)) end
     end
 end)
 
@@ -516,7 +678,7 @@ local function addTicker(interval, fn)
                     local ok, err = pcall(e.fn, step)
                     if not ok then
                         tickers[e] = nil
-                        warn("[NewReality] timer stopped: " .. tostring(err))
+                        log("warn", "timer stopped: " .. tostring(err))
                     end
                 end
             end
@@ -529,6 +691,36 @@ end
 local function viewport()
     local cam = workspace.CurrentCamera
     return (cam and cam.ViewportSize) or Vector2.new(1920, 1080)
+end
+
+-- How big the window should be on this screen.
+--
+-- A fixed 900 by 580 covered almost all of a 1366 by 768 laptop and looked like a
+-- postage stamp on a 4K monitor. This takes a share of the viewport and clamps it,
+-- so the window is the same shape everywhere and always leaves the game visible
+-- around it. Whole pixels, because the window is a CanvasGroup.
+local function windowFit(view)
+    local w = math.clamp(math.floor(view.X * 0.66), 620, 1000)
+    local h = math.clamp(math.floor(view.Y * 0.76), 400, 660)
+    w = math.min(w, math.max(320, view.X - 32))
+    h = math.min(h, math.max(260, view.Y - 32))
+    return w, h
+end
+
+-- The sidebar takes a quarter of the window, within reason: below about 180 the tab
+-- names start truncating, above 240 it is just empty space.
+local function sidebarFit(windowWidth)
+    return math.clamp(math.floor(windowWidth * 0.25), 180, 240)
+end
+
+-- Keep a detached panel on screen. A config written on a large monitor puts panels
+-- where a smaller one has no pixels, and a panel that cannot be reached cannot be
+-- dragged back. A strip of it always stays grabbable.
+local function clampToView(position, size, view)
+    local w = (size and size.X or 0)
+    local ox = math.clamp(position.X.Offset, 60 - w, math.max(60 - w, view.X - 60))
+    local oy = math.clamp(position.Y.Offset, 0, math.max(0, view.Y - 28))
+    return UDim2.new(position.X.Scale, math.floor(ox + 0.5), position.Y.Scale, math.floor(oy + 0.5))
 end
 
 -- Element helpers
@@ -959,9 +1151,9 @@ local function iconAsset(name)
         local count = 0
         for _ in pairs(ICON_DATA) do count += 1 end
         if count > 0 then
-            print("[NewReality] embedded icons: " .. count)
+            log("info", "embedded icons: " .. count)
         else
-            warn("[NewReality] no embedded icons present")
+            log("warn", "no embedded icons present")
         end
     end
     iconCache[name] = result
@@ -1027,7 +1219,7 @@ local function logoMark(parent, size, opts)
     if opts.letterColor then
         front.ImageColor3 = opts.letterColor
     else
-        themed(front, "ImageColor3", "text")
+        themed(front, "ImageColor3", "icon")
     end
 
     if opts.zIndex then
@@ -1127,7 +1319,9 @@ local function hoverSurface(part, opts)
     local base = opts.base or function() return PALETTE.control end
     local over = opts.hover or function() return PALETTE.controlHover end
     local hovering = false
-    local function settle(instant)
+    local queued = false
+
+    local function apply(instant)
         local color = hovering and over() or base()
         if instant then
             part.BackgroundColor3 = color
@@ -1135,6 +1329,28 @@ local function hoverSurface(part, opts)
             tween(part, hovering and 0.14 or 0.2, { BackgroundColor3 = color }, EASE_SOFT)
         end
     end
+
+    -- Enter and leave are coalesced into one repaint per frame.
+    --
+    -- Clicking a button quickly makes the engine deliver several enter and leave
+    -- pairs in a single frame, and sometimes out of order. Acting on each one starts
+    -- a tween that the next one immediately supersedes, and the surface flickers or
+    -- ends up stuck on whichever colour the last stray event asked for. Recording
+    -- the state and repainting once, from the state, cannot be knocked out of order.
+    local function settle(instant)
+        if instant then
+            queued = false
+            apply(true)
+            return
+        end
+        if queued then return end
+        queued = true
+        task.defer(function()
+            queued = false
+            if part.Parent then apply(false) end
+        end)
+    end
+
     part.MouseEnter:Connect(function()
         hovering = true
         settle()
@@ -1157,9 +1373,23 @@ end
 local function pressScale(button, amount)
     local scale = newInstance("UIScale")
     scale.Parent = button
-    button.MouseButton1Down:Connect(function() tween(scale, 0.08, { Scale = amount or 0.97 }, EASE_SOFT) end)
-    button.MouseButton1Up:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_POP) end)
-    button.MouseLeave:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_SOFT) end)
+    local down = amount or 0.97
+    -- One tween at a time. Pressing repeatedly used to stack a squash on a release
+    -- on a squash, and the overlapping tweens fought over the same property until
+    -- the clicking stopped.
+    local held = false
+    button.MouseButton1Down:Connect(function()
+        if held then return end
+        held = true
+        tween(scale, 0.08, { Scale = down }, EASE_SOFT)
+    end)
+    local function release(curve)
+        if not held then return end
+        held = false
+        tween(scale, 0.18, { Scale = 1 }, curve)
+    end
+    button.MouseButton1Up:Connect(function() release(EASE_POP) end)
+    button.MouseLeave:Connect(function() release(EASE_SOFT) end)
     return scale
 end
 
@@ -1233,7 +1463,7 @@ local function slidingUnderline(bar, thickness)
     line.Size = UDim2.new(0, 0, 0, thickness or 2)
     line.BorderSizePixel = 0
     line.ZIndex = 3
-    themed(line, "BackgroundColor3", "accent")
+    themed(line, "BackgroundColor3", "accentSoft")
     line.Parent = bar
     corner(line, 1)
 
@@ -1531,12 +1761,16 @@ local function makePill(row, ctx, get, set)
     themed(pill, "BackgroundColor3", "track", { fade = false })
     corner(pill, 11)
 
+    -- The knob is painted by render() alone and is deliberately not in the theme
+    -- registry. Its colour depends on the state of the toggle, because on the accent
+    -- it has to be legible against the accent, and a registry that also writes it
+    -- would take turns with render() and leave whichever ran last on screen.
     local knob = Instance.new("Frame")
     knob.Size = UDim2.new(0, 16, 0, 16)
     knob.Position = UDim2.new(0, 3, 0.5, -8)
+    knob.BackgroundColor3 = PALETTE.knob
     knob.BorderSizePixel = 0
     knob.Parent = pill
-    themed(knob, "BackgroundColor3", "text")
     corner(knob, 8)
 
     local function render(value)
@@ -1544,7 +1778,7 @@ local function makePill(row, ctx, get, set)
         -- The knob sits on the accent once the pill is on, so its colour is picked
         -- against the accent. A white knob on a pale accent has nothing to stand
         -- against.
-        tween(knob, 0.2, { BackgroundColor3 = value and contrastOn(PALETTE.accent) or PALETTE.text }, EASE_SOFT)
+        tween(knob, 0.2, { BackgroundColor3 = value and contrastOn(PALETTE.accent) or PALETTE.knob }, EASE_SOFT)
         -- Back easing gives the knob a small settle at the end of the travel.
         tween(knob, 0.28, { Position = value and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8) }, EASE_POP)
     end
@@ -1583,7 +1817,7 @@ local function gearIcon(row)
     btn.BackgroundTransparency = 1
     btn.Text = ""
     btn.Parent = row
-    local img = makeIcon(btn, "settings", UDim2.new(1, 0, 1, 0), "subtext")
+    local img = makeIcon(btn, "settings", UDim2.new(1, 0, 1, 0), "iconDim")
     img.Active = false
     -- Fallback drawn cog if the settings icon file is missing.
     if img.Image == "" then
@@ -1607,8 +1841,8 @@ local function gearIcon(row)
         corner(hole, 4)
         hole.Parent = btn
     end
-    btn.MouseEnter:Connect(function() tintIcon(img, PALETTE.text) end)
-    btn.MouseLeave:Connect(function() tintIcon(img, PALETTE.subtext) end)
+    btn.MouseEnter:Connect(function() tintIcon(img, PALETTE.icon) end)
+    btn.MouseLeave:Connect(function() tintIcon(img, PALETTE.iconDim) end)
     return btn, img
 end
 
@@ -1829,7 +2063,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     knob.BorderSizePixel = 0
     knob.ZIndex = 2
     knob.Parent = track
-    themed(knob, "BackgroundColor3", "text")
+    themed(knob, "BackgroundColor3", "knob")
     corner(knob, 6)
 
     local function clampValue(value)
@@ -1911,7 +2145,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     -- the control text size fills 116 pixels once the clear button has taken its
     -- corner, and a bind that shows as "MouseButt.." is worse than a wider field.
     rowLabel(row, text, 158)
-    local kbIcon = makeIcon(row, "keyboard", UDim2.new(0, 22, 0, 22), "subtext")
+    local kbIcon = makeIcon(row, "keyboard", UDim2.new(0, 22, 0, 22), "iconDim")
     kbIcon.AnchorPoint = Vector2.new(1, 0.5)
     kbIcon.Position = UDim2.new(1, -134, 0.5, 0)
     local button = Instance.new("TextButton")
@@ -1944,7 +2178,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     clearBtn.ZIndex = 4
     clearBtn.Visible = false
     clearBtn.Parent = button
-    local clearImg = makeIcon(clearBtn, "x", UDim2.new(1, 0, 1, 0), "subtext")
+    local clearImg = makeIcon(clearBtn, "x", UDim2.new(1, 0, 1, 0), "iconDim")
     clearImg.Active = false
 
     -- Normalise the stored value into a list of key names.
@@ -1984,7 +2218,7 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
         tween(button, 0.14, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
     end)
     clearBtn.MouseEnter:Connect(function() tintIcon(clearImg, PALETTE.accent) end)
-    clearBtn.MouseLeave:Connect(function() tintIcon(clearImg, PALETTE.subtext) end)
+    clearBtn.MouseLeave:Connect(function() tintIcon(clearImg, PALETTE.iconDim) end)
 
     local capturing = false
     -- Timestamp of the last successful capture, so the right-click that binds a
@@ -2112,7 +2346,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
     corner(button, 6)
     padding(button, nil, { left = 10, right = 24 })
 
-    local arrow = makeIcon(row, "chevron-down", UDim2.new(0, 18, 0, 18), "subtext")
+    local arrow = makeIcon(row, "chevron-down", UDim2.new(0, 18, 0, 18), "iconDim")
     arrow.AnchorPoint = Vector2.new(1, 0.5)
     arrow.Position = UDim2.new(1, -8, 0.5, 0)
     hoverSurface(button)
@@ -2190,7 +2424,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             header.LayoutOrder = 0
             header.Parent = panel
             themed(header, "BackgroundColor3", "control")
-            local sicon = makeIcon(header, "search", UDim2.new(0, 16, 0, 16), "subtext")
+            local sicon = makeIcon(header, "search", UDim2.new(0, 16, 0, 16), "iconDim")
             sicon.AnchorPoint = Vector2.new(0, 0.5)
             sicon.Position = UDim2.new(0, 12, 0.5, 0)
             searchBox = newInstance("TextBox")
@@ -2242,7 +2476,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             refs.on = on
             refs.btn.BackgroundColor3 = PALETTE.controlHover
             tween(refs.btn, 0.14, { BackgroundTransparency = on and 0 or 1 }, EASE_SOFT)
-            tween(refs.label, 0.14, { TextColor3 = on and PALETTE.accent or PALETTE.text }, EASE_SOFT)
+            tween(refs.label, 0.14, { TextColor3 = on and PALETTE.accentSoft or PALETTE.text }, EASE_SOFT)
             if refs.tick then
                 tween(refs.tick, 0.16, { ImageTransparency = on and 0 or 1 }, EASE_SOFT)
             end
@@ -2275,7 +2509,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
 
             -- A tick on the right of a picked row, so a multi select reads at a
             -- glance without counting highlighted rows.
-            local tick = makeIcon(optBtn, "check", UDim2.new(0, 16, 0, 16), "accent")
+            local tick = makeIcon(optBtn, "check", UDim2.new(0, 16, 0, 16), "accentSoft")
             tick.AnchorPoint = Vector2.new(1, 0.5)
             tick.Position = UDim2.new(1, -12, 0.5, 0)
             tick.ImageTransparency = 1
@@ -2348,7 +2582,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     pipette.AutoButtonColor = false
     pipette.Text = ""
     pipette.Parent = row
-    local palImg = makeIcon(pipette, "palette", UDim2.new(1, 0, 1, 0), "subtext")
+    local palImg = makeIcon(pipette, "palette", UDim2.new(1, 0, 1, 0), "iconDim")
     palImg.Active = false
 
     local hexLabel = Instance.new("TextLabel")
@@ -2399,7 +2633,8 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             return
         end
         if ctx.closeOverlays then ctx.closeOverlays(true) end
-        local panelH = useAlpha and 226 or 196
+        -- The extra 30 is the row of recent colours above the hex field.
+        local panelH = (useAlpha and 226 or 196) + 30
         local panel, controller = openPanel(ctx, {
             anchor = swatch,
             width = 232,
@@ -2522,6 +2757,10 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         end
 
         local hexBox
+        -- Assigned once the recent row exists, further down. The drag handlers below
+        -- call it when a drag ends: recording every intermediate colour a drag
+        -- passes through would fill the row with a gradient.
+        local commitRecent
         local function apply()
             sv.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
             local final = Color3.fromHSV(h, s, v)
@@ -2564,7 +2803,10 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             tween(svCursor, 0.12, { Size = UDim2.new(0, 13, 0, 13) }, EASE_POP)
             beginDrag({
                 move = updSV,
-                stop = function() tween(svCursor, 0.16, { Size = UDim2.new(0, 10, 0, 10) }, EASE_SOFT) end,
+                stop = function()
+                    tween(svCursor, 0.16, { Size = UDim2.new(0, 10, 0, 10) }, EASE_SOFT)
+                    if commitRecent then commitRecent() end
+                end,
             })
         end)
         hue.InputBegan:Connect(function(i)
@@ -2573,7 +2815,10 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             tween(hueCursor, 0.12, { Size = UDim2.new(1, 6, 0, 6) }, EASE_POP)
             beginDrag({
                 move = function(_, y) updHue(y) end,
-                stop = function() tween(hueCursor, 0.16, { Size = UDim2.new(1, 4, 0, 4) }, EASE_SOFT) end,
+                stop = function()
+                    tween(hueCursor, 0.16, { Size = UDim2.new(1, 4, 0, 4) }, EASE_SOFT)
+                    if commitRecent then commitRecent() end
+                end,
             })
         end)
         if useAlpha then
@@ -2583,10 +2828,61 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
                 tween(alphaCursor, 0.12, { Size = UDim2.new(0, 6, 1, 6) }, EASE_POP)
                 beginDrag({
                     move = function(x) updAlpha(x) end,
-                    stop = function() tween(alphaCursor, 0.16, { Size = UDim2.new(0, 4, 1, 4) }, EASE_SOFT) end,
+                    stop = function()
+                        tween(alphaCursor, 0.16, { Size = UDim2.new(0, 4, 1, 4) }, EASE_SOFT)
+                        if commitRecent then commitRecent() end
+                    end,
                 })
             end)
         end
+
+        -- Recent colours, above the hex field. Rebuilt rather than reordered: eight
+        -- swatches is cheaper to make again than to keep in sync.
+        local recentRow = Instance.new("Frame")
+        recentRow.AnchorPoint = Vector2.new(0, 1)
+        recentRow.Position = UDim2.new(0, 0, 1, -34)
+        recentRow.Size = UDim2.new(1, 0, 0, 22)
+        recentRow.BackgroundTransparency = 1
+        recentRow.Parent = panel
+        listLayout(recentRow, 4, Enum.FillDirection.Horizontal)
+
+        local function applyHsv(color)
+            h, s, v = color:ToHSV()
+            apply()
+        end
+        local function drawRecent()
+            for _, child in ipairs(recentRow:GetChildren()) do
+                if child:IsA("GuiObject") then child:Destroy() end
+            end
+            for index, hex in ipairs(recentColors) do
+                local r = tonumber(string.sub(hex, 1, 2), 16)
+                local g = tonumber(string.sub(hex, 3, 4), 16)
+                local b = tonumber(string.sub(hex, 5, 6), 16)
+                if r and g and b then
+                    local chip = Instance.new("TextButton")
+                    chip.Size = UDim2.new(0, 22, 0, 22)
+                    chip.BackgroundColor3 = Color3.fromRGB(r, g, b)
+                    chip.BorderSizePixel = 0
+                    chip.AutoButtonColor = false
+                    chip.Text = ""
+                    chip.LayoutOrder = index
+                    chip.Parent = recentRow
+                    corner(chip, 5)
+                    stroke(chip, "stroke", 1, 0.35)
+                    chip.MouseButton1Click:Connect(function()
+                        applyHsv(Color3.fromRGB(r, g, b))
+                    end)
+                end
+            end
+        end
+        commitRecent = function()
+            local rgb = getRgb()
+            if type(rgb) == "table" then
+                pushRecent(rgb)
+                drawRecent()
+            end
+        end
+        drawRecent()
 
         hexBox = Instance.new("TextBox")
         hexBox.AnchorPoint = Vector2.new(0, 1)
@@ -2612,8 +2908,8 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
                 local g = tonumber(string.sub(hx, 3, 4), 16)
                 local b = tonumber(string.sub(hx, 5, 6), 16)
                 if r and g and b then
-                    h, s, v = Color3.fromRGB(r, g, b):ToHSV()
-                    apply()
+                    applyHsv(Color3.fromRGB(r, g, b))
+                    commitRecent()
                     return
                 end
             end
@@ -2623,7 +2919,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     pipette.MouseButton1Click:Connect(openPicker)
     swatch.Active = true
     pipette.MouseEnter:Connect(function() tintIcon(palImg, PALETTE.accent) end)
-    pipette.MouseLeave:Connect(function() tintIcon(palImg, PALETTE.subtext) end)
+    pipette.MouseLeave:Connect(function() tintIcon(palImg, PALETTE.iconDim) end)
     -- Keep the swatch and hex in sync when the value changes externally (theme reset).
     if ctx and ctx._refresh then
         table.insert(ctx._refresh, function()
@@ -2816,7 +3112,7 @@ function Controls.list(parent, ctx, options, get, set, opts)
         search.Parent = container
         themed(search, "BackgroundColor3", "control")
         corner(search, 8)
-        local sicon = makeIcon(search, "search", UDim2.new(0, 15, 0, 15), "subtext")
+        local sicon = makeIcon(search, "search", UDim2.new(0, 15, 0, 15), "iconDim")
         sicon.AnchorPoint = Vector2.new(0, 0.5)
         sicon.Position = UDim2.new(0, 10, 0.5, 0)
         searchBox = Instance.new("TextBox")
@@ -2839,7 +3135,7 @@ function Controls.list(parent, ctx, options, get, set, opts)
         for value, refs in pairs(rows) do
             local on = value == current
             refs.on = on
-            tween(refs.label, 0.14, { TextColor3 = on and PALETTE.accent or PALETTE.text }, EASE_SOFT)
+            tween(refs.label, 0.14, { TextColor3 = on and PALETTE.accentSoft or PALETTE.text }, EASE_SOFT)
             refs.row.BackgroundColor3 = PALETTE.controlHover
             tween(refs.row, 0.14, { BackgroundTransparency = on and 0 or 1 }, EASE_SOFT)
             if refs.tick then
@@ -2869,7 +3165,7 @@ function Controls.list(parent, ctx, options, get, set, opts)
         label.Parent = optRow
         faced(label, "medium")
         localized(label, "Text", tostring(option))
-        local tick = makeIcon(optRow, "check", UDim2.new(0, 16, 0, 16), "accent")
+        local tick = makeIcon(optRow, "check", UDim2.new(0, 16, 0, 16), "accentSoft")
         tick.AnchorPoint = Vector2.new(1, 0.5)
         tick.Position = UDim2.new(1, -12, 0.5, 0)
         tick.ImageTransparency = 1
@@ -2974,21 +3270,42 @@ end
 -- with the same parent frame and owning window as context.
 Card = {}
 Card.__index = Card
-function Card.new(frame, ctx)
-    return setmetatable({ _frame = frame, _ctx = ctx }, Card)
+function Card.new(frame, ctx, place)
+    return setmetatable({ _frame = frame, _ctx = ctx, _place = place }, Card)
 end
+
+-- Every named control is added to the search index as it is built.
+--
+-- It is done here rather than inside each control builder for two reasons: the
+-- builders do not know which card, sub-page and tab they ended up on, and a card
+-- standing in for a gear popover is created without a place, which is exactly the
+-- case that should not be indexed. A control inside a popover cannot be jumped to
+-- without opening the popover first.
+function Card:_index(label, row)
+    local ctx = self._ctx
+    if not (ctx and ctx._search and self._place and row and label and label ~= "") then return row end
+    ctx._search[#ctx._search + 1] = {
+        label = label,
+        card = self._place.card,
+        tab = self._place.tab,
+        sub = self._place.sub,
+        row = row,
+    }
+    return row
+end
+
 function Card:label(text) return Controls.label(self._frame, text) end
 function Card:section(text) return Controls.section(self._frame, text) end
-function Card:button(text, fn) return Controls.button(self._frame, self._ctx, text, fn) end
-function Card:input(text, placeholder, get, set) return Controls.input(self._frame, self._ctx, text, placeholder, get, set) end
-function Card:toggle(text, get, set, settings) return Controls.toggle(self._frame, self._ctx, text, get, set, settings) end
-function Card:slider(text, min, max, get, set, decimals, format) return Controls.slider(self._frame, self._ctx, text, min, max, get, set, decimals, format) end
-function Card:keybind(text, getKey, setKey, opts) return Controls.keybind(self._frame, self._ctx, text, getKey, setKey, opts) end
-function Card:dropdown(text, options, get, set, opts) return Controls.dropdown(self._frame, self._ctx, text, options, get, set, opts) end
-function Card:colorpicker(text, getRgb, setRgb, opts) return Controls.colorpicker(self._frame, self._ctx, text, getRgb, setRgb, opts) end
-function Card:segmented(text, options, get, set) return Controls.segmented(self._frame, self._ctx, text, options, get, set) end
+function Card:button(text, fn) return self:_index(text, Controls.button(self._frame, self._ctx, text, fn)) end
+function Card:input(text, placeholder, get, set) return self:_index(text, Controls.input(self._frame, self._ctx, text, placeholder, get, set)) end
+function Card:toggle(text, get, set, settings) return self:_index(text, Controls.toggle(self._frame, self._ctx, text, get, set, settings)) end
+function Card:slider(text, min, max, get, set, decimals, format) return self:_index(text, Controls.slider(self._frame, self._ctx, text, min, max, get, set, decimals, format)) end
+function Card:keybind(text, getKey, setKey, opts) return self:_index(text, Controls.keybind(self._frame, self._ctx, text, getKey, setKey, opts)) end
+function Card:dropdown(text, options, get, set, opts) return self:_index(text, Controls.dropdown(self._frame, self._ctx, text, options, get, set, opts)) end
+function Card:colorpicker(text, getRgb, setRgb, opts) return self:_index(text, Controls.colorpicker(self._frame, self._ctx, text, getRgb, setRgb, opts)) end
+function Card:segmented(text, options, get, set) return self:_index(text, Controls.segmented(self._frame, self._ctx, text, options, get, set)) end
 function Card:list(options, get, set, opts) return Controls.list(self._frame, self._ctx, options, get, set, opts) end
-function Card:stepper(text, min, max, step, get, set) return Controls.stepper(self._frame, self._ctx, text, min, max, step, get, set) end
+function Card:stepper(text, min, max, step, get, set) return self:_index(text, Controls.stepper(self._frame, self._ctx, text, min, max, step, get, set)) end
 -- A thin divider line inside a card body.
 function Card:divider()
     local line = Instance.new("Frame")
@@ -3045,7 +3362,7 @@ function Sub:card(title, column)
 
         local textX = 0
         if cfg.icon then
-            local hicon = makeIcon(header, cfg.icon, UDim2.new(0, 24, 0, 24), "text")
+            local hicon = makeIcon(header, cfg.icon, UDim2.new(0, 24, 0, 24), "icon")
             hicon.AnchorPoint = Vector2.new(0, 0.5)
             hicon.Position = UDim2.new(0, 0, 0.5, 0)
             textX = 34
@@ -3093,7 +3410,12 @@ function Sub:card(title, column)
         line.Parent = body
         themed(line, "BackgroundColor3", "stroke")
     end
-    return Card.new(body, self._ctx)
+    -- Where this card sits, carried into the search index by every control it builds.
+    return Card.new(body, self._ctx, {
+        card = cfg.title,
+        tab = self.tab,
+        sub = self.entry,
+    })
 end
 
 -- Tab: a sidebar entry that owns a top sub-tab bar and sub-pages.
@@ -3149,7 +3471,7 @@ function Tab:sub(name)
     local leftCol = makeColumn("Left", 0)
     local rightCol = makeColumn("Right", 0.5)
 
-    local sub = { name = name, btn = btn, page = page, columns = columns }
+    local sub = { name = name, btn = btn, page = page, columns = columns, tab = self }
     table.insert(self._subs, sub)
 
     local function activate()
@@ -3175,6 +3497,8 @@ function Tab:sub(name)
     btn.MouseLeave:Connect(function()
         if not page.Visible then tween(btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT) end
     end)
+    -- Exposed so the interface search can bring a sub-page forward.
+    sub.activate = activate
     btn.MouseButton1Click:Connect(activate)
     -- The buttons are auto sized, so translating one changes its width and the
     -- underline under it is suddenly the wrong length in the wrong place. Following
@@ -3195,7 +3519,10 @@ function Tab:sub(name)
     if #self._subs == 1 then
         activate()
     end
-    return Sub.new(page, self._ctx, leftCol, rightCol)
+    local subObj = Sub.new(page, self._ctx, leftCol, rightCol)
+    subObj.entry = sub
+    subObj.tab = self
+    return subObj
 end
 
 local Window = {}
@@ -3254,7 +3581,7 @@ function Window:tab(opts)
     })
     fillGrad.Parent = fill
 
-    local icon = makeIcon(btn, opts.icon, UDim2.new(0, 24, 0, 24), "subtext")
+    local icon = makeIcon(btn, opts.icon, UDim2.new(0, 24, 0, 24), "iconDim")
     icon.AnchorPoint = Vector2.new(0, 0.5)
     icon.Position = UDim2.new(0, 14, 0.5, 0)
     icon.ZIndex = 2
@@ -3323,7 +3650,7 @@ function Window:tab(opts)
                 other.page.Visible = false
                 if other.fill then tween(other.fill, 0.18, { BackgroundTransparency = 1 }, EASE_SOFT) end
                 tween(other.label, 0.18, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
-                tintIcon(other.icon, PALETTE.subtext)
+                tintIcon(other.icon, PALETTE.iconDim)
             end
         end
         if self.closeOverlays then self.closeOverlays() end
@@ -3339,7 +3666,7 @@ function Window:tab(opts)
         tween(fill, 0.2, { BackgroundTransparency = 0 }, EASE_SOFT)
         tween(fillGrad, 0.4, { Offset = Vector2.new(0, 0) }, EASE)
         tween(label, 0.18, { TextColor3 = PALETTE.text }, EASE_SOFT)
-        tintIcon(icon, PALETTE.text)
+        tintIcon(icon, PALETTE.icon)
         self.title.Text = translate(opts.name)
         self._titlePhrase = opts.name
         if self.subtitle then
@@ -3351,19 +3678,21 @@ function Window:tab(opts)
         task.defer(function() placeUnderline(nil, false) end)
     end
     tabObj.fill = fill
+    -- Exposed so the interface search can bring a tab forward.
+    tabObj.activate = activate
     btn.MouseButton1Click:Connect(activate)
     btn.MouseEnter:Connect(function()
         if not tabPage.Visible then
             tween(fill, 0.14, { BackgroundTransparency = 0.55 }, EASE_SOFT)
             tween(label, 0.14, { TextColor3 = PALETTE.text }, EASE_SOFT)
-            tintIcon(icon, PALETTE.text)
+            tintIcon(icon, PALETTE.icon)
         end
     end)
     btn.MouseLeave:Connect(function()
         if not tabPage.Visible then
             tween(fill, 0.18, { BackgroundTransparency = 1 }, EASE_SOFT)
             tween(label, 0.18, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
-            tintIcon(icon, PALETTE.subtext)
+            tintIcon(icon, PALETTE.iconDim)
         end
     end)
     -- Same as the sub-tabs: the registry repaints every tab to the resting
@@ -3371,13 +3700,230 @@ function Window:tab(opts)
     table.insert(self._refresh, function()
         local open = tabPage.Visible
         label.TextColor3 = open and PALETTE.text or PALETTE.subtext
-        icon.ImageColor3 = open and PALETTE.text or PALETTE.subtext
+        icon.ImageColor3 = open and PALETTE.icon or PALETTE.iconDim
         fill.BackgroundTransparency = open and 0 or 1
     end)
     if #self.tabs == 1 then
         activate()
     end
     return tabObj
+end
+
+-- Interface search ------------------------------------------------------------
+-- Every named control registers its label, its card and the page it lives on while
+-- the interface is built. Typing in the sidebar filters that index, and picking a
+-- result opens the tab, opens the sub-page, scrolls the column until the control is
+-- in view and flashes it.
+--
+-- Labels are matched in both the language they were written in and the language they
+-- are drawn in, so a translated build is searchable either way.
+local SEARCH_RESULTS = 7
+
+-- Pull a row into view inside whichever column it belongs to.
+local function scrollTo(row)
+    local column = scrollerOf(row)
+    if not column then return end
+    local offset = row.AbsolutePosition.Y - column.AbsolutePosition.Y + column.CanvasPosition.Y
+    local target = math.max(0, offset - 48)
+    tween(column, 0.32, { CanvasPosition = Vector2.new(0, target) }, EASE)
+end
+
+-- Mark the control that was found. The flash sits behind the row and fades out, so
+-- it never covers the thing it is pointing at.
+local function flashRow(row)
+    local glow = newInstance("Frame")
+    glow.Name = randomName()
+    glow.AnchorPoint = Vector2.new(0, 0.5)
+    glow.Position = UDim2.new(0, -8, 0.5, 0)
+    glow.Size = UDim2.new(1, 16, 1, 8)
+    glow.BackgroundTransparency = 0.72
+    glow.BorderSizePixel = 0
+    glow.ZIndex = 0
+    glow.Parent = row
+    themed(glow, "BackgroundColor3", "accentSoft", { fade = false })
+    corner(glow, 8)
+    local out = tween(glow, 0.9, { BackgroundTransparency = 1 }, EASE_SOFT)
+    out.Completed:Once(function() glow:Destroy() end)
+end
+
+function Window:_buildSearch(parent)
+    local box = newInstance("Frame")
+    box.Name = randomName()
+    box.Size = UDim2.new(1, -20, 0, 30)
+    box.Position = UDim2.new(0, 10, 0, 70)
+    box.BorderSizePixel = 0
+    box.Parent = parent
+    themed(box, "BackgroundColor3", "control")
+    corner(box, 8)
+
+    local icon = makeIcon(box, "search", UDim2.new(0, 15, 0, 15), "iconDim")
+    icon.AnchorPoint = Vector2.new(0, 0.5)
+    icon.Position = UDim2.new(0, 9, 0.5, 0)
+
+    local field = newInstance("TextBox")
+    field.BackgroundTransparency = 1
+    field.Position = UDim2.new(0, 30, 0, 0)
+    field.Size = UDim2.new(1, -40, 1, 0)
+    field.TextSize = 14
+    field.Text = ""
+    field.ClearTextOnFocus = false
+    field.TextXAlignment = Enum.TextXAlignment.Left
+    field.TextTruncate = Enum.TextTruncate.AtEnd
+    field.Parent = box
+    faced(field, "regular")
+    themed(field, "TextColor3", "text")
+    themed(field, "PlaceholderColor3", "subtext")
+    localized(field, "PlaceholderText", "Search the interface..")
+    self._searchField = field
+
+    -- The result list floats in the overlay layer, like every other panel, so it is
+    -- not clipped by the sidebar and draws over the content.
+    local list = newInstance("CanvasGroup")
+    list.Name = randomName()
+    list.Size = UDim2.new(0, 260, 0, 0)
+    list.AutomaticSize = Enum.AutomaticSize.Y
+    list.BorderSizePixel = 0
+    list.GroupTransparency = 1
+    list.Visible = false
+    list.ZIndex = 300
+    list.Parent = self.overlay
+    themed(list, "BackgroundColor3", "card")
+    corner(list, 10)
+    local listEdge = stateStroke(list, "stroke")
+    local body = newInstance("Frame")
+    body.BackgroundTransparency = 1
+    body.Size = UDim2.new(1, 0, 0, 0)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    body.Parent = list
+    listLayout(body, 2)
+    padding(body, 6)
+
+    local shown = false
+    local function setShown(want)
+        if want == shown then return end
+        shown = want
+        if want then
+            list.Visible = true
+            tween(list, 0.18, { GroupTransparency = 0 }, EASE_SOFT)
+            tween(listEdge, 0.18, { Transparency = 0.35 }, EASE_SOFT)
+        else
+            tween(listEdge, 0.14, { Transparency = 1 }, EASE_SOFT)
+            tween(list, 0.14, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
+                if not shown then list.Visible = false end
+            end)
+        end
+    end
+
+    local function place()
+        local origin = self.window.AbsolutePosition
+        local at = box.AbsolutePosition
+        list.Position = UDim2.new(0, math.floor(at.X - origin.X + 0.5), 0, math.floor(at.Y - origin.Y + 36))
+    end
+
+    local function jump(entry)
+        setShown(false)
+        field.Text = ""
+        if entry.tab and entry.tab.activate then pcall(entry.tab.activate) end
+        if entry.sub and entry.sub.activate then pcall(entry.sub.activate) end
+        -- The columns have just been made visible, so their geometry lands a frame
+        -- later and the scroll has to wait for it.
+        task.defer(function()
+            if not entry.row.Parent then return end
+            scrollTo(entry.row)
+            flashRow(entry.row)
+        end)
+    end
+
+    local function render()
+        for _, child in ipairs(body:GetChildren()) do
+            if child:IsA("GuiObject") then child:Destroy() end
+        end
+        local query = string.lower(field.Text)
+        if query == "" then
+            setShown(false)
+            return
+        end
+        local hits = 0
+        for _, entry in ipairs(self._search) do
+            if entry.row.Parent then
+                local written = string.lower(entry.label)
+                local drawn = string.lower(translate(entry.label))
+                if written:find(query, 1, true) or drawn:find(query, 1, true) then
+                    hits += 1
+                    local hit = newInstance("TextButton")
+                    hit.Size = UDim2.new(1, 0, 0, 34)
+                    hit.BackgroundTransparency = 1
+                    hit.BorderSizePixel = 0
+                    hit.AutoButtonColor = false
+                    hit.Text = ""
+                    hit.LayoutOrder = hits
+                    hit.Parent = body
+                    themed(hit, "BackgroundColor3", "controlHover", { fade = false })
+                    corner(hit, 7)
+
+                    local name = newInstance("TextLabel")
+                    name.BackgroundTransparency = 1
+                    name.Position = UDim2.new(0, 10, 0, 3)
+                    name.Size = UDim2.new(1, -20, 0, 17)
+                    name.TextSize = 14
+                    name.TextXAlignment = Enum.TextXAlignment.Left
+                    name.TextTruncate = Enum.TextTruncate.AtEnd
+                    name.Text = translate(entry.label)
+                    name.ZIndex = 2
+                    name.Parent = hit
+                    faced(name, "medium")
+                    themed(name, "TextColor3", "text")
+
+                    local where = newInstance("TextLabel")
+                    where.BackgroundTransparency = 1
+                    where.Position = UDim2.new(0, 10, 0, 18)
+                    where.Size = UDim2.new(1, -20, 0, 13)
+                    where.TextSize = 12
+                    where.TextXAlignment = Enum.TextXAlignment.Left
+                    where.TextTruncate = Enum.TextTruncate.AtEnd
+                    where.ZIndex = 2
+                    where.Parent = hit
+                    faced(where, "regular")
+                    themed(where, "TextColor3", "subtext")
+                    local trail = translate(entry.tab and entry.tab.name or "")
+                    if entry.card then trail = trail .. "  /  " .. translate(entry.card) end
+                    where.Text = trail
+
+                    hit.MouseEnter:Connect(function() tween(hit, 0.12, { BackgroundTransparency = 0.45 }, EASE_SOFT) end)
+                    hit.MouseLeave:Connect(function() tween(hit, 0.16, { BackgroundTransparency = 1 }, EASE_SOFT) end)
+                    hit.MouseButton1Click:Connect(function() jump(entry) end)
+                    if hits >= SEARCH_RESULTS then break end
+                end
+            end
+        end
+        if hits == 0 then
+            local empty = newInstance("TextLabel")
+            empty.BackgroundTransparency = 1
+            empty.Size = UDim2.new(1, 0, 0, 28)
+            empty.TextSize = 14
+            empty.Parent = body
+            faced(empty, "regular")
+            themed(empty, "TextColor3", "subtext")
+            localized(empty, "Text", "Nothing found")
+        end
+        place()
+        setShown(true)
+    end
+
+    field:GetPropertyChangedSignal("Text"):Connect(render)
+    field.FocusLost:Connect(function()
+        -- Left open for a moment so a click on a result is not thrown away by the
+        -- field losing focus first.
+        task.delay(0.15, function()
+            if field.Text == "" then setShown(false) end
+        end)
+    end)
+    box:GetPropertyChangedSignal("AbsolutePosition"):Connect(place)
+    self._closeSearch = function()
+        field.Text = ""
+        setShown(false)
+    end
+    return box
 end
 
 -- Show or hide the window.
@@ -3487,12 +4033,9 @@ local function driveThemeFade(dt)
     end
 end
 
-function Window:setColor(key, rgb)
+local function applyKey(key, new, alpha)
     local reg = THEME_REG[key]
     if not reg then return end
-    local new = (typeof(rgb) == "Color3") and rgb or colorOf(rgb)
-    local alpha = (type(rgb) == "table" and rgb[4]) or PALETTE_A[key] or 1
-
     local running = themeFade[key]
     local from = (running and running.shown) or PALETTE[key]
     local alphaFrom = (running and running.shownAlpha) or PALETTE_A[key] or 1
@@ -3503,16 +4046,29 @@ function Window:setColor(key, rgb)
     if from == new and alphaFrom == alpha then
         themeFade[key] = nil
         paintKey(key, new, alpha)
-    else
-        themeFade[key] = {
-            from = from, to = new,
-            alphaFrom = alphaFrom, alphaTo = alpha,
-            shown = from, shownAlpha = alphaFrom,
-            t = 0,
-        }
-        if not themeFadeStop then
-            themeFadeStop = addTicker(0, driveThemeFade)
-        end
+        return
+    end
+    themeFade[key] = {
+        from = from, to = new,
+        alphaFrom = alphaFrom, alphaTo = alpha,
+        shown = from, shownAlpha = alphaFrom,
+        t = 0,
+    }
+    if not themeFadeStop then
+        themeFadeStop = addTicker(0, driveThemeFade)
+    end
+end
+
+function Window:setColor(key, rgb)
+    if not THEME_REG[key] or key == "accentSoft" then return end
+    local new = (typeof(rgb) == "Color3") and rgb or colorOf(rgb)
+    local alpha = (type(rgb) == "table" and rgb[4]) or PALETTE_A[key] or 1
+    applyKey(key, new, alpha)
+
+    -- The corrected accent depends on both the accent and the surface behind it, so
+    -- either one moving recomputes it.
+    if key == "accent" or key == "background" then
+        applyKey("accentSoft", legibleOn(PALETTE.accent, PALETTE.background), PALETTE_A.accent)
     end
 
     if self._refresh then
@@ -3531,6 +4087,26 @@ function Window:resetTheme()
     for key, def in pairs(DEFAULTS) do
         self:setColor(key, { math.floor(def.R * 255 + 0.5), math.floor(def.G * 255 + 0.5), math.floor(def.B * 255 + 0.5), 1 })
     end
+end
+
+-- Apply a named preset. A preset only names the keys it changes, so one that sets
+-- the accent alone leaves the rest of the palette where the user put it. The change
+-- runs through setColor, so it eases in like any other.
+function Window:applyTheme(name)
+    local preset = THEMES[name]
+    if not preset then return false end
+    for key, rgb in pairs(preset) do
+        if DEFAULTS[key] and type(rgb) == "table" then
+            self:setColor(key, { rgb[1], rgb[2], rgb[3], rgb[4] or PALETTE_A[key] or 1 })
+        end
+    end
+    self.theme = name
+    self._dirty = true
+    return true
+end
+
+function Window:getTheme()
+    return self.theme
 end
 
 -- Re-apply every control's visual from its current value (used after loading a
@@ -3569,6 +4145,47 @@ end
 -- with their own setter (colour pickers) call this so their changes are saved too.
 function Window:markDirty() self._dirty = true end
 
+-- Re-fit the interface to the screen it is on: the window's size, the sidebar's
+-- share of it, and every detached panel pulled back inside the viewport. Runs on a
+-- timer and can be called by hand after a change nothing else notices.
+--
+-- A window the user has dragged is left where they put it. Re-centring something
+-- somebody deliberately moved is worse than a window slightly off centre.
+function Window:refit(force)
+    local view = viewport()
+    local known = self._view
+    if not force and known and known.X == view.X and known.Y == view.Y then return end
+    self._view = view
+
+    local winW, winH = windowFit(view)
+    local sideW = sidebarFit(winW)
+    self.window.Size = UDim2.new(0, winW, 0, winH)
+    if self._sidebar then self._sidebar.Size = UDim2.new(0, sideW, 1, 0) end
+    if self._content then
+        self._content.Position = UDim2.new(0, sideW, 0, 0)
+        self._content.Size = UDim2.new(1, -sideW, 1, 0)
+    end
+
+    if not self._moved then
+        local centred = UDim2.new(0, math.floor(view.X / 2), 0, math.floor(view.Y / 2))
+        self._resting = centred
+        if self._open then self.window.Position = centred end
+    end
+
+    for name, frame in pairs(self._overlays) do
+        if frame and frame.Parent then
+            local rest = self._overlayRest[name] or frame.Position
+            local kept = clampToView(rest, frame.AbsoluteSize, view)
+            if kept ~= rest then
+                self._overlayRest[name] = kept
+                if frame.Visible then frame.Position = kept end
+                self._dirty = true
+            end
+        end
+    end
+    if self.closeOverlays then self.closeOverlays() end
+end
+
 local CONFIG_ROOT = "NewReality/configs"
 -- Configs are stored per game so one game's configs never appear in another.
 local function placeFolder()
@@ -3589,12 +4206,15 @@ local function ensureConfigDir()
     end)
 end
 
--- What a config holds: the flags, the palette with its opacity, the show/hide
--- key, the language and the position and visibility of every detached panel.
--- The window's own position is left out on purpose so it always opens centred.
-function Window:saveConfig(name, silent)
-    if type(name) ~= "string" or name == "" then return false end
-    if type(writefile) ~= "function" then warn("[NewReality] executor has no writefile") return false end
+-- What a config holds: the flags, the palette with its opacity, the show/hide key,
+-- the language, the theme preset, the recent colours and the position and visibility
+-- of every detached panel. The window's own position is left out on purpose so it
+-- always opens centred.
+--
+-- Built here rather than inside saveConfig, because the clipboard export and the
+-- file write have to be the same thing. A config copied out of one session and
+-- pasted into another that restores less than a file would is a trap.
+function Window:snapshot()
     -- Snapshot the current theme so colours are restored on load too. The fourth
     -- number is the key's opacity, which the old format dropped and which is the
     -- difference between a translucent window and an opaque one.
@@ -3608,25 +4228,34 @@ function Window:saveConfig(name, silent)
             PALETTE_A[key] or 1,
         }
     end
-    local payload = {
-        flags = self.flags,
-        theme = theme,
-        toggleKey = (typeof(self.toggleKey) == "EnumItem") and self.toggleKey.Name or nil,
-        locale = Interface.getLocale(),
-    }
-    -- Persist the dragged position and the visibility of every detached part
-    -- (watermark, keybind list, each HUD by its id).
+    -- The resting place of each detached panel, not wherever the show/hide animation
+    -- has the frame at this instant. Writing the live position could persist a panel
+    -- halfway through leaving.
     local overlays = {}
     for key, frame in pairs(self._overlays) do
         if frame and frame.Parent then
-            -- The resting place, not wherever the show/hide animation has the frame
-            -- at this instant. Writing the live position could persist a panel
-            -- halfway through leaving.
             local p = self._overlayRest[key] or frame.Position
             overlays[key] = { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset, frame.Visible and 1 or 0 }
         end
     end
-    payload.overlays = overlays
+    local recent = {}
+    for i, hex in ipairs(recentColors) do recent[i] = hex end
+    return {
+        build = Interface.version,
+        flags = self.flags,
+        theme = theme,
+        themeName = self.theme,
+        toggleKey = (typeof(self.toggleKey) == "EnumItem") and self.toggleKey.Name or nil,
+        locale = Interface.getLocale(),
+        recent = recent,
+        overlays = overlays,
+    }
+end
+
+function Window:saveConfig(name, silent)
+    if type(name) ~= "string" or name == "" then return false end
+    if type(writefile) ~= "function" then log("warn", "executor has no writefile") return false end
+    local payload = self:snapshot()
     local ok, err = pcall(function()
         ensureConfigDir()
         writefile(configPath(name), HttpService:JSONEncode(payload))
@@ -3638,31 +4267,16 @@ function Window:saveConfig(name, silent)
         err = "file missing after write (executor blocked writefile?)"
     end
     if ok then
-        if not silent then print("[NewReality] saved config: " .. configPath(name)) end
+        if not silent then log("info", "saved config: " .. configPath(name)) end
     else
-        warn("[NewReality] saveConfig failed: " .. tostring(err))
+        log("warn", "saveConfig failed: " .. tostring(err))
     end
     return ok
 end
 
-function Window:loadConfig(name)
-    if type(name) ~= "string" or name == "" then return false end
-    if type(readfile) ~= "function" or type(isfile) ~= "function" then
-        warn("[NewReality] executor has no readfile/isfile")
-        return false
-    end
-    local path = configPath(name)
-    if not isfile(path) then
-        warn("[NewReality] config '" .. name .. "' does not exist (" .. path .. ")")
-        return false
-    end
-    local ok, data = pcall(function()
-        return HttpService:JSONDecode(readfile(path))
-    end)
-    if not ok then
-        warn("[NewReality] loadConfig failed: " .. tostring(data))
-        return false
-    end
+-- Apply a decoded snapshot. Shared by loadConfig and by the clipboard import, so
+-- the two cannot drift apart.
+function Window:restore(data)
     if type(data) ~= "table" then return false end
     -- New format is { flags = , theme = , ... }; old format was just the flags table.
     local flags = (type(data.flags) == "table") and data.flags or data
@@ -3682,9 +4296,18 @@ function Window:loadConfig(name)
             end
         end
     end
+    if type(data.themeName) == "string" then self.theme = data.themeName end
     if type(data.toggleKey) == "string" then
         local okKey, key = pcall(function() return Enum.KeyCode[data.toggleKey] end)
         if okKey and key then self.toggleKey = key end
+    end
+    if type(data.recent) == "table" then
+        table.clear(recentColors)
+        for _, hex in ipairs(data.recent) do
+            if type(hex) == "string" and #hex == 6 then
+                recentColors[#recentColors + 1] = hex
+            end
+        end
     end
     -- Restore the saved positions of detached parts. Kept for later too, so an
     -- overlay created after this load still picks its spot up.
@@ -3694,7 +4317,10 @@ function Window:loadConfig(name)
             local frame = self._overlays[key]
             if frame and frame.Parent and type(t) == "table" and #t >= 4 then
                 pcall(function()
-                    local at = UDim2.new(t[1], t[2], t[3], t[4])
+                    -- Clamped on the way in: a config written on a bigger monitor
+                    -- puts panels where this screen has no pixels, and a panel that
+                    -- cannot be reached cannot be dragged back.
+                    local at = clampToView(UDim2.new(t[1], t[2], t[3], t[4]), frame.AbsoluteSize, viewport())
                     self._overlayRest[key] = at
                     frame.Position = at
                     if t[5] ~= nil then self:showOverlay(frame, t[5] == 1, true) end
@@ -3704,6 +4330,68 @@ function Window:loadConfig(name)
     end
     self:refreshAll()
     return true
+end
+
+function Window:loadConfig(name)
+    if type(name) ~= "string" or name == "" then return false end
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then
+        log("warn", "executor has no readfile/isfile")
+        return false
+    end
+    local path = configPath(name)
+    if not isfile(path) then
+        log("warn", "config '" .. name .. "' does not exist (" .. path .. ")")
+        return false
+    end
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(readfile(path))
+    end)
+    if not ok then
+        log("warn", "loadConfig failed: " .. tostring(data))
+        return false
+    end
+    return self:restore(data)
+end
+
+-- Clipboard --------------------------------------------------------------------
+-- The same snapshot a file holds, as text. Sharing a setup with somebody is the
+-- thing people actually want to do with a config, and passing a file around is not
+-- how anyone does it.
+--
+-- Export returns the text as well as putting it on the clipboard, so a script can
+-- show it in a box when the executor has no setclipboard.
+function Window:exportConfig()
+    local ok, text = pcall(function()
+        return HttpService:JSONEncode(self:snapshot())
+    end)
+    if not ok then
+        log("warn", "exportConfig failed: " .. tostring(text))
+        return nil
+    end
+    if type(setclipboard) == "function" then
+        pcall(setclipboard, text)
+    end
+    return text
+end
+
+-- Import from text, or from the clipboard when no text is given and the executor
+-- can read it back.
+function Window:importConfig(text)
+    if (text == nil or text == "") and type(getclipboard) == "function" then
+        local ok, fromClipboard = pcall(getclipboard)
+        if ok then text = fromClipboard end
+    end
+    if type(text) ~= "string" or text == "" then return false end
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(text)
+    end)
+    if not ok or type(data) ~= "table" then
+        log("warn", "importConfig: not a config")
+        return false
+    end
+    local applied = self:restore(data)
+    if applied then self._dirty = true end
+    return applied
 end
 
 function Window:listConfigs()
@@ -3728,9 +4416,9 @@ end
 
 function Window:deleteConfig(name)
     if type(name) ~= "string" or name == "" then return false end
-    if type(delfile) ~= "function" then warn("[NewReality] executor has no delfile") return false end
+    if type(delfile) ~= "function" then log("warn", "executor has no delfile") return false end
     local ok, err = pcall(function() delfile(configPath(name)) end)
-    if not ok then warn("[NewReality] deleteConfig failed: " .. tostring(err)) end
+    if not ok then log("warn", "deleteConfig failed: " .. tostring(err)) end
     return ok
 end
 
@@ -3838,7 +4526,7 @@ function Window:notify(opts)
     -- notification exists to deliver.
     local textX = 16
     if opts.icon then
-        local ic = makeIcon(toast, opts.icon, UDim2.new(0, 20, 0, 20), "text")
+        local ic = makeIcon(toast, opts.icon, UDim2.new(0, 20, 0, 20), "icon")
         ic.AnchorPoint = Vector2.new(0, 0.5)
         ic.Position = UDim2.new(0, 16, 0.5, 0)
         if ic.Image == "" then
@@ -4091,7 +4779,7 @@ local function overlayHeader(body, cfg)
             textX = 24
         end
     elseif cfg.icon then
-        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 16, 0, 16), "text")
+        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 16, 0, 16), "icon")
         ic.AnchorPoint = Vector2.new(0, 0.5)
         ic.Position = UDim2.new(0, 0, 0.5, 0)
         ic.ZIndex = OVERLAY_Z
@@ -4311,7 +4999,7 @@ function Window:keybindList(opts)
             local active = (r.bind.active and r.bind.active()) or false
             if active ~= r.lastActive then
                 r.lastActive = active
-                tween(r.dot, 0.18, { BackgroundColor3 = active and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
+                tween(r.dot, 0.18, { BackgroundColor3 = active and PALETTE.accentSoft or PALETTE.subtext }, EASE_SOFT)
                 tween(r.lbl, 0.18, { TextColor3 = active and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
                 r.row.Visible = showInactive or active
             end
@@ -4402,7 +5090,7 @@ function Hud:row(label, value, opts)
         corner(dot, 4)
         textX = 16
     elseif cfg.icon then
-        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 15, 0, 15), "subtext")
+        local ic = makeIcon(row, cfg.icon, UDim2.new(0, 15, 0, 15), "iconDim")
         ic.AnchorPoint = Vector2.new(0, 0.5)
         ic.Position = UDim2.new(0, 0, 0.5, 0)
         ic.ZIndex = OVERLAY_Z
@@ -4481,7 +5169,7 @@ function Hud:row(label, value, opts)
                     local on = hudRead(cfg.dot) and true or false
                     if on ~= handle._lastDot then
                         handle._lastDot = on
-                        tween(dot, 0.18, { BackgroundColor3 = on and PALETTE.accent or PALETTE.subtext }, EASE_SOFT)
+                        tween(dot, 0.18, { BackgroundColor3 = on and PALETTE.accentSoft or PALETTE.subtext }, EASE_SOFT)
                         tween(labelText, 0.18, { TextColor3 = on and PALETTE.text or PALETTE.subtext }, EASE_SOFT)
                     end
                 end
@@ -4742,6 +5430,9 @@ function Interface.new(opts)
         -- listeners this window owns, the detached overlays by config name, the
         -- fade helper of each of them and the HUDs built through win:hud.
         _panels = {}, _conns = {}, _overlays = {}, _overlayFade = {}, _overlayRest = {}, _huds = {},
+        -- Index of every named control, filled while the interface is built and read
+        -- by the search field in the sidebar.
+        _search = {},
         _open = true,
         locale = Interface.getLocale(),
     }, Window)
@@ -4783,10 +5474,13 @@ function Interface.new(opts)
     -- offset is worked out once and the drag controller only ever adds whole pixel
     -- deltas to it.
     local view = viewport()
+    local winW, winH = windowFit(view)
+    local sideW = sidebarFit(winW)
+    self._view = view
     local window = newInstance("Frame")
     window.Name = randomName()
     window.AnchorPoint = Vector2.new(0.5, 0.5)
-    window.Size = UDim2.new(0, 900, 0, 580)
+    window.Size = UDim2.new(0, winW, 0, winH)
     window.Position = UDim2.new(0, math.floor(view.X / 2), 0, math.floor(view.Y / 2))
     window.BackgroundTransparency = 1
     window.BorderSizePixel = 0
@@ -4807,11 +5501,12 @@ function Interface.new(opts)
 
     -- Sidebar
     local sidebar = Instance.new("Frame")
-    sidebar.Size = UDim2.new(0, 230, 1, 0)
+    sidebar.Size = UDim2.new(0, sideW, 1, 0)
     sidebar.BorderSizePixel = 0
     sidebar.Parent = body
     themed(sidebar, "BackgroundColor3", "sidebar")
     corner(sidebar, 14)
+    self._sidebar = sidebar
     local sidebarMask = Instance.new("Frame")
     sidebarMask.Size = UDim2.new(0, 12, 1, 0)
     sidebarMask.Position = UDim2.new(1, -12, 0, 0)
@@ -4833,7 +5528,7 @@ function Interface.new(opts)
         mark:Destroy()
         mark = nil
         if iconAsset(opts.icon or "logo") then
-            mark = makeIcon(brandRow, opts.icon or "logo", UDim2.new(0, 40, 0, 40), "text")
+            mark = makeIcon(brandRow, opts.icon or "logo", UDim2.new(0, 40, 0, 40), "icon")
             mark.AnchorPoint = Vector2.new(0, 0.5)
             mark.Position = UDim2.new(0, 0, 0.5, 0)
         end
@@ -4853,8 +5548,9 @@ function Interface.new(opts)
     table.insert(self._refresh, rebuildBrand)
 
     local sidebarList = Instance.new("ScrollingFrame")
-    sidebarList.Position = UDim2.new(0, 10, 0, 70)
-    sidebarList.Size = UDim2.new(1, -22, 1, -80)
+    -- Below the search field, which the window builds after the overlay layer exists.
+    sidebarList.Position = UDim2.new(0, 10, 0, 110)
+    sidebarList.Size = UDim2.new(1, -22, 1, -120)
     sidebarList.BackgroundTransparency = 1
     sidebarList.BorderSizePixel = 0
     sidebarList.ScrollBarThickness = 0
@@ -4866,10 +5562,11 @@ function Interface.new(opts)
 
     -- Content
     local content = Instance.new("Frame")
-    content.Position = UDim2.new(0, 230, 0, 0)
-    content.Size = UDim2.new(1, -230, 1, 0)
+    content.Position = UDim2.new(0, sideW, 0, 0)
+    content.Size = UDim2.new(1, -sideW, 1, 0)
     content.BackgroundTransparency = 1
     content.Parent = body
+    self._content = content
 
     -- Drag handle sits behind the header so the title bar is draggable, but the
     -- labels (created after it) stay on top.
@@ -4934,7 +5631,12 @@ function Interface.new(opts)
                 panel.close()
             end
         end
+        if self._closeSearch and not keepPopovers then self._closeSearch() end
     end
+
+    -- The search field goes in after the overlay layer, because its result list
+    -- floats in that layer.
+    self:_buildSearch(sidebar)
 
     -- Where a floating panel goes, given the offset of its control and its size.
     --
@@ -4971,8 +5673,21 @@ function Interface.new(opts)
         return UDim2.new(0, math.floor(sx - winPos.X + 0.5), 0, math.floor(sy - winPos.Y + 0.5))
     end
 
-    -- Dropping the window updates where the open animation returns it to.
-    makeDraggable(window, topDrag, function(frame) self._resting = frame.Position end)
+    -- Dropping the window updates where the open animation returns it to, and marks
+    -- it as placed by hand so a viewport change stops re-centring it.
+    makeDraggable(window, topDrag, function(frame)
+        self._resting = frame.Position
+        self._moved = true
+    end)
+
+    -- Follow the screen. A player can change resolution, go full screen or rotate a
+    -- device mid session, and a window sized for the old viewport is either off the
+    -- edge or a stamp in the middle. Checked twice a second on the shared driver
+    -- rather than on a per frame signal, because nothing here needs to be immediate.
+    table.insert(self._conns, addTicker(0.5, function()
+        if self._dead then return end
+        self:refit()
+    end))
 
     -- Hotkey to show/hide the window (RightShift by default).
     self.toggleKey = opts.toggleKey or Enum.KeyCode.RightShift
