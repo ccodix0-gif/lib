@@ -96,7 +96,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.30.2"
+Interface.version = "2026.07.30.3"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -136,17 +136,23 @@ local TRANS_OF = {
 }
 
 -- Type ------------------------------------------------------------------------
--- One face for the whole interface: Arial at Heavy weight, which is Arial Black.
--- Size and colour carry the hierarchy instead of weight, so a card title and a
--- control label differ by scale rather than by two faces sitting next to each
--- other.
+-- One face for the whole interface: Arial Bold. Size and colour carry the
+-- hierarchy instead of weight, so a card title and a control label differ by
+-- scale rather than by two faces sitting next to each other.
+--
+-- The weight is Bold and not Heavy on purpose. What Roblox serves for the Arial
+-- family is Arimo, and it ships two real faces: Regular and Bold. Ask it for a
+-- weight it does not have and the client makes one by thickening the Regular
+-- glyphs, which grows the letterforms without growing the space between them, so
+-- pairs of letters run into each other at small sizes. Bold is a drawn face with
+-- its own metrics, so the spacing is the spacing the typeface was designed with.
 --
 -- Roles are still named at the call sites and still resolve through the registry,
--- so a build that wants a second weight only has to fill WEIGHTS in again, and
--- UI.setFont(family) re-faces a live interface for a language whose glyphs the
--- family does not carry.
+-- so a build that wants a second weight only has to hand them different faces,
+-- and UI.setFont(family) re-faces a live interface for a language whose glyphs
+-- the family does not carry.
 local FONT_FAMILY = "rbxasset://fonts/families/Arial.json"
-local FONT_WEIGHT = Enum.FontWeight.Heavy
+local FONT_WEIGHT = Enum.FontWeight.Bold
 local ROLES = { "regular", "medium", "semibold", "bold" }
 local FACES = {}
 local function rebuildFaces()
@@ -166,6 +172,19 @@ local function colorOf(rgb)
     return Color3.fromRGB(rgb[1] or 255, rgb[2] or 255, rgb[3] or 255)
 end
 Interface.colorOf = colorOf
+
+-- Black or white, whichever can be read on top of the given colour. Anything the
+-- kit prints on an accent filled shape goes through this: the accent is the one
+-- palette key a user is certain to change, and a label that assumes a bright
+-- accent disappears the moment someone picks a dark one.
+local function contrastOn(color)
+    local luma = 0.2126 * color.R + 0.7152 * color.G + 0.0722 * color.B
+    if luma > 0.55 then
+        return Color3.fromRGB(16, 16, 20)
+    end
+    return Color3.fromRGB(255, 255, 255)
+end
+Interface.contrastOn = contrastOn
 
 -- Tag registries --------------------------------------------------------------
 -- Theme tagging: any element passed to themed(inst, prop, key) follows the
@@ -1269,13 +1288,27 @@ local function openPanel(ctx, cfg)
     backdrop.ZIndex = zBase
     backdrop.Parent = ctx.overlay
 
+    -- The panel is a CanvasGroup, which is not a button, so a click that lands on
+    -- its padding rather than on one of its controls went straight through to the
+    -- catcher underneath and closed the thing that was being clicked. The shield
+    -- swallows those. It is inflated a little past the panel as well, so nearly
+    -- missing the edge of an open panel does nothing instead of dismissing it.
+    local SHIELD_MARGIN = 10
+    local shield = newInstance("TextButton")
+    shield.Name = randomName()
+    shield.BackgroundTransparency = 1
+    shield.AutoButtonColor = false
+    shield.Text = ""
+    shield.ZIndex = zBase + 1
+    shield.Parent = ctx.overlay
+
     local panel = newInstance("CanvasGroup")
     panel.Name = randomName()
     panel.Size = UDim2.new(0, width, 0, cfg.height or 0)
     panel.AutomaticSize = Enum.AutomaticSize.Y
     panel.BorderSizePixel = 0
     panel.GroupTransparency = 1
-    panel.ZIndex = zBase + 1
+    panel.ZIndex = zBase + 2
     panel.Parent = ctx.overlay
     themed(panel, "BackgroundColor3", "card")
     corner(panel, cfg.radius or 10)
@@ -1290,6 +1323,16 @@ local function openPanel(ctx, cfg)
     local entering = true
     local resting = panel.Position
 
+    local function syncShield()
+        local size = panel.AbsoluteSize
+        local h = (size.Y > 4) and size.Y or (cfg.height or 0)
+        shield.Position = UDim2.new(
+            resting.X.Scale, resting.X.Offset - SHIELD_MARGIN,
+            resting.Y.Scale, resting.Y.Offset - SHIELD_MARGIN
+        )
+        shield.Size = UDim2.new(0, width + SHIELD_MARGIN * 2, 0, h + SHIELD_MARGIN * 2)
+    end
+
     local function place()
         if closed or not anchor.Parent then return end
         local origin = ctx.window.AbsolutePosition
@@ -1301,23 +1344,39 @@ local function openPanel(ctx, cfg)
         local below = at.Y - origin.Y + size.Y + gap
         local above = at.Y - origin.Y - gap
         resting = ctx.fitPanel(x, below, width, height, above)
+        syncShield()
         if entering then return end
         panel.Position = resting
     end
 
-    -- Hide while the control is scrolled past the top or bottom of its column,
-    -- the panel would otherwise float over the header or the next card.
+    -- Fade out while the control is scrolled past the top or bottom of its column,
+    -- the panel would otherwise float over the header or the next card, and fade
+    -- back in when the control comes back. Scrolling a picker off the list and back
+    -- used to snap it on and off.
+    local shown = true
     local function clip()
         if closed then return end
-        local show = true
+        local want = true
         if scroller then
             local top = scroller.AbsolutePosition.Y
             local bottom = top + scroller.AbsoluteSize.Y
             local at = anchor.AbsolutePosition.Y
-            show = (at + anchor.AbsoluteSize.Y > top + 2) and (at < bottom - 2)
+            want = (at + anchor.AbsoluteSize.Y > top + 2) and (at < bottom - 2)
         end
-        panel.Visible = show
-        backdrop.Visible = show
+        if want == shown then return end
+        shown = want
+        backdrop.Visible = want
+        shield.Visible = want
+        if want then
+            panel.Visible = true
+            tween(panel, 0.18, { GroupTransparency = 0 }, EASE_SOFT)
+            tween(edge, 0.18, { Transparency = 0.35 }, EASE_SOFT)
+        else
+            tween(edge, 0.14, { Transparency = 1 }, EASE_SOFT)
+            tween(panel, 0.14, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
+                if not shown and not closed then panel.Visible = false end
+            end)
+        end
     end
 
     local conns = {
@@ -1329,6 +1388,7 @@ local function openPanel(ctx, cfg)
         -- filter changes it again, so follow the size instead of guessing once.
         panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(place),
     }
+    syncShield()
 
     local function close()
         if closed then return end
@@ -1338,6 +1398,7 @@ local function openPanel(ctx, cfg)
             if stack[i] == controller then table.remove(stack, i) end
         end
         backdrop:Destroy()
+        shield:Destroy()
         if cfg.onClose then cfg.onClose() end
         -- The outline is not composited by GroupTransparency, so it is faded on
         -- the same clock as the fill. Any difference between the two and the
@@ -1423,6 +1484,10 @@ local function makePill(row, ctx, get, set)
 
     local function render(value)
         tween(pill, 0.2, { BackgroundColor3 = value and PALETTE.accent or PALETTE.track }, EASE_SOFT)
+        -- The knob sits on the accent once the pill is on, so its colour is picked
+        -- against the accent. A white knob on a pale accent has nothing to stand
+        -- against.
+        tween(knob, 0.2, { BackgroundColor3 = value and contrastOn(PALETTE.accent) or PALETTE.text }, EASE_SOFT)
         -- Back easing gives the knob a small settle at the end of the travel.
         tween(knob, 0.28, { Position = value and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8) }, EASE_POP)
     end
@@ -1631,15 +1696,13 @@ function Controls.input(parent, ctx, text, placeholder, get, set)
     localized(box, "PlaceholderText", placeholder or "")
     corner(box, 6)
     padding(box, nil, { left = 10, right = 10 })
-    -- The outline lights up in the accent while the box has focus, so it is clear
-    -- which field the keyboard is going to.
-    local edge = stateStroke(box, "accent")
+    -- Focus is shown by lifting the fill, not by drawing a ring. A ring around a
+    -- field that already has an edge is one border too many, and it draws attention
+    -- to the box at the moment the attention should be on what is being typed.
     box.Focused:Connect(function()
-        tween(edge, 0.16, { Transparency = 0.25 }, EASE_SOFT)
         tween(box, 0.16, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT)
     end)
     box.FocusLost:Connect(function()
-        tween(edge, 0.2, { Transparency = 1 }, EASE_SOFT)
         tween(box, 0.2, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
         if set then set(box.Text) end
     end)
@@ -1675,8 +1738,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     themed(valueBox, "BackgroundColor3", "control")
     themed(valueBox, "TextColor3", "text")
     corner(valueBox, 5)
-    local valueEdge = stateStroke(valueBox, "accent")
-    valueBox.Focused:Connect(function() tween(valueEdge, 0.16, { Transparency = 0.3 }, EASE_SOFT) end)
+    valueBox.Focused:Connect(function() tween(valueBox, 0.16, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT) end)
 
     local track = Instance.new("TextButton")
     track.AnchorPoint = Vector2.new(0, 1)
@@ -1738,7 +1800,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
 
     -- The value box accepts a typed number (clamped to range).
     valueBox.FocusLost:Connect(function()
-        tween(valueEdge, 0.2, { Transparency = 1 }, EASE_SOFT)
+        tween(valueBox, 0.2, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
         local typed = set and tonumber(string.match(valueBox.Text, "[%-%d%.]+"))
         if typed then
             local value = math.clamp(clampValue(typed), min, max)
@@ -2481,10 +2543,9 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         themed(hexBox, "TextColor3", "text")
         themed(hexBox, "PlaceholderColor3", "subtext")
         corner(hexBox, 6)
-        local hexEdge = stateStroke(hexBox, "accent")
-        hexBox.Focused:Connect(function() tween(hexEdge, 0.16, { Transparency = 0.3 }, EASE_SOFT) end)
+        hexBox.Focused:Connect(function() tween(hexBox, 0.16, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT) end)
         hexBox.FocusLost:Connect(function()
-            tween(hexEdge, 0.2, { Transparency = 1 }, EASE_SOFT)
+            tween(hexBox, 0.2, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
             local hx = string.gsub(hexBox.Text, "#", "")
             if #hx == 6 then
                 local r = tonumber(string.sub(hx, 1, 2), 16)
@@ -2606,9 +2667,14 @@ function Controls.segmented(parent, ctx, text, options, get, set)
     end
     local function render(animate)
         local current = get()
+        -- The selected label sits on the accent block, so its colour is picked
+        -- against the accent rather than fixed. It used to be the background
+        -- colour, which is dark, and a dark accent left the selected option
+        -- reading as blank.
+        local onAccent = contrastOn(PALETTE.accent)
         for value, btn in pairs(buttons) do
             local on = value == current
-            tween(btn, 0.16, { TextColor3 = on and PALETTE.background or PALETTE.subtext }, EASE_SOFT)
+            tween(btn, 0.16, { TextColor3 = on and onAccent or PALETTE.subtext }, EASE_SOFT)
         end
         place(buttons[current], animate)
     end
@@ -3050,11 +3116,20 @@ function Tab:sub(name)
         if not page.Visible then tween(btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT) end
     end)
     btn.MouseButton1Click:Connect(activate)
+    -- The buttons are auto sized, so translating one changes its width and the
+    -- underline under it is suddenly the wrong length in the wrong place. Following
+    -- the button's own size covers a language change, a font change and the first
+    -- layout pass with one connection.
+    local sizeConn = btn:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        if page.Visible then self._placeUnderline(btn, false) end
+    end)
+    btn.Destroying:Connect(function() sizeConn:Disconnect() end)
     -- A palette change repaints from the registry, which does not know which
     -- sub-tab is open, so the open one claims its colour back afterwards.
     if self._ctx._refresh then
         table.insert(self._ctx._refresh, function()
             btn.TextColor3 = page.Visible and PALETTE.text or PALETTE.subtext
+            if page.Visible then self._placeUnderline(btn, false) end
         end)
     end
     if #self._subs == 1 then
@@ -3247,12 +3322,19 @@ end
 
 -- Show or hide the window.
 --
--- The whole window is one CanvasGroup, so opening and closing fades every part
--- of it by the same amount. The old build faded the root frame only, which left
--- the sidebar solid while the content area went see-through, and the scale grew
--- from the top left corner so the window appeared to unroll to the right. The
--- group is centred on its anchor now, so it settles out of and back into its own
--- middle.
+-- The whole window is one CanvasGroup, so this fades every part of it by the same
+-- amount, outlines included, and the group rises into place as it does.
+--
+-- It used to scale, and scaling a CanvasGroup costs twice. The rounded corner is a
+-- mask over the group's raster, and resampling that mask at a size it was not
+-- drawn at leaves thin bright seams along the curve, which is the striping that
+-- showed up at the corners while the window arrived. Every glyph in the window is
+-- also re-rendered at a fractional size on each frame of the tween, which is the
+-- shimmer that came with it. Travel does neither: the raster is finished once and
+-- only its blit position changes.
+--
+-- The resting position is remembered rather than assumed, because the window is
+-- draggable and its resting place is wherever it was last left.
 function Window:toggle(show)
     local window = self.window
     if show == nil then show = not window.Visible end
@@ -3261,28 +3343,34 @@ function Window:toggle(show)
     self._open = show
     if self.closeOverlays then self.closeOverlays() end
 
-    local scale = self._scale
     local body = self._body
     local shade = self._shadow
+    if show and not self._resting then self._resting = window.Position end
+    local resting = self._resting or window.Position
+    local lifted = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + 26)
+
     if show then
         window.Visible = true
-        if scale then
-            scale.Scale = 0.9
-            tween(scale, 0.34, { Scale = 1 }, EASE_POP)
-        end
-        if body then tween(body, 0.16, { GroupTransparency = 0 }, EASE_SOFT) end
-        if shade then tween(shade, 0.24, { ImageTransparency = 0.55 }, EASE_SOFT) end
+        window.Position = lifted
+        tween(window, 0.36, { Position = resting }, EASE)
+        if body then tween(body, 0.2, { GroupTransparency = 0 }, EASE_SOFT) end
+        if shade then tween(shade, 0.28, { ImageTransparency = 0.55 }, EASE_SOFT) end
     else
-        if body then tween(body, 0.16, { GroupTransparency = 1 }, EASE_SOFT) end
-        if shade then tween(shade, 0.14, { ImageTransparency = 1 }, EASE_SOFT) end
-        local out = scale and tween(scale, 0.2, { Scale = 0.9 }, EASE)
-        if out then
-            out.Completed:Once(function()
-                if not self._open then window.Visible = false end
-            end)
-        else
-            window.Visible = false
-        end
+        -- Where it sits now is where it should come back to.
+        self._resting = window.Position
+        resting = self._resting
+        lifted = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + 26)
+        if body then tween(body, 0.18, { GroupTransparency = 1 }, EASE_SOFT) end
+        if shade then tween(shade, 0.16, { ImageTransparency = 1 }, EASE_SOFT) end
+        local out = tween(window, 0.24, { Position = lifted }, EASE)
+        out.Completed:Once(function()
+            if not self._open then
+                window.Visible = false
+                -- Put it back, so the next open starts from the resting place and
+                -- a drag never inherits the lifted offset.
+                window.Position = resting
+            end
+        end)
     end
 end
 
@@ -3624,7 +3712,7 @@ function Window:notify(opts)
     -- notification exists to deliver.
     local textX = 16
     if opts.icon then
-        local ic = makeIcon(toast, opts.icon, UDim2.new(0, 20, 0, 20), "accent")
+        local ic = makeIcon(toast, opts.icon, UDim2.new(0, 20, 0, 20), "text")
         ic.AnchorPoint = Vector2.new(0, 0.5)
         ic.Position = UDim2.new(0, 16, 0.5, 0)
         if ic.Image == "" then
@@ -3773,13 +3861,26 @@ local function overlayShell(self, name, opts)
     -- The first call is the panel appearing, which is not a change the user made,
     -- so it does not mark the config dirty and trigger a write on startup.
     local settled = false
+    -- The panel drops a little as it goes and lifts back into place as it returns,
+    -- so hiding one reads as the panel leaving rather than as the panel being
+    -- switched off. Only the group's own position moves, and the resting place is
+    -- restored the moment the tween is done, because that position is what the
+    -- config stores and what a drag starts from.
+    local LIFT = 14
+    local function restingOf()
+        local p = frame.Position
+        return UDim2.new(p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset)
+    end
     self._overlayFade[frame] = function(visible, instant)
         if visible then
+            local resting = restingOf()
             frame.Visible = true
             if instant then
                 frame.GroupTransparency = 0
                 edge.Transparency = 0.3
             else
+                frame.Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + LIFT)
+                tween(frame, 0.32, { Position = resting }, EASE)
                 tween(frame, 0.24, { GroupTransparency = 0 }, EASE_SOFT)
                 tween(edge, 0.24, { Transparency = 0.3 }, EASE_SOFT)
             end
@@ -3788,9 +3889,15 @@ local function overlayShell(self, name, opts)
             edge.Transparency = 1
             frame.Visible = false
         else
-            tween(edge, 0.18, { Transparency = 1 }, EASE_SOFT)
-            tween(frame, 0.18, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
+            local resting = restingOf()
+            tween(edge, 0.2, { Transparency = 1 }, EASE_SOFT)
+            tween(frame, 0.2, { GroupTransparency = 1 }, EASE_SOFT)
+            local out = tween(frame, 0.26, {
+                Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + LIFT),
+            }, EASE)
+            out.Completed:Once(function()
                 if frame.GroupTransparency > 0.9 then frame.Visible = false end
+                frame.Position = resting
             end)
         end
         if settled then self._dirty = true end
@@ -4036,6 +4143,16 @@ function Window:keybindList(opts)
         rows[#rows + 1] = { row = row, dot = dot, lbl = lbl, key = keyLbl, bind = bind }
     end
 
+    -- The ticker below only repaints a row when its active state changes, which
+    -- means a row that was already lit kept the accent it was lit with. Dropping
+    -- the cached state on a palette change makes the next tick repaint it.
+    table.insert(self._refresh, function()
+        for _, r in ipairs(rows) do
+            r.lastActive = nil
+            r.lastKey = nil
+        end
+    end)
+
     -- Ten refreshes a second is enough for a bind list, and each row is only
     -- written when its key or its state actually changed.
     local stop
@@ -4200,6 +4317,15 @@ function Hud:row(label, value, opts)
             row:Destroy()
         end,
     }
+
+    -- A lit dot keeps the accent it was lit with, because the poll below only
+    -- repaints on a change of state. Clearing the cache on a palette change lets
+    -- the next tick pick the new accent up.
+    if dot and self._ctx and self._ctx._refresh then
+        table.insert(self._ctx._refresh, function()
+            handle._lastDot = nil
+        end)
+    end
 
     -- Only poll the rows that were given a function, a pushed value costs nothing.
     if type(cfg.value) == "function" or type(cfg.dot) == "function" then
@@ -4687,7 +4813,8 @@ function Interface.new(opts)
         return UDim2.new(0, math.floor(sx - winPos.X + 0.5), 0, math.floor(sy - winPos.Y + 0.5))
     end
 
-    makeDraggable(window, topDrag)
+    -- Dropping the window updates where the open animation returns it to.
+    makeDraggable(window, topDrag, function(frame) self._resting = frame.Position end)
 
     -- Hotkey to show/hide the window (RightShift by default).
     self.toggleKey = opts.toggleKey or Enum.KeyCode.RightShift
@@ -4706,16 +4833,18 @@ function Interface.new(opts)
         end))
     end
 
-    -- Opening: the group fades up while the window settles out of its own centre.
-    -- The scale is kept because the show/hide toggle reuses it.
-    local scale = newInstance("UIScale")
-    scale.Scale = 0.9
-    scale.Parent = window
-    self._scale = scale
+    -- Opening: the group fades up while it rises the last few pixels into place.
+    -- Same motion the show/hide toggle uses, and for the same reason it is a
+    -- travel and not a scale.
+    self._resting = window.Position
+    window.Position = UDim2.new(
+        self._resting.X.Scale, self._resting.X.Offset,
+        self._resting.Y.Scale, self._resting.Y.Offset + 26
+    )
     self._shadow.ImageTransparency = 1
-    tween(body, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
-    tween(self._shadow, 0.3, { ImageTransparency = 0.55 }, EASE_SOFT)
-    tween(scale, 0.36, { Scale = 1 }, EASE_POP)
+    tween(window, 0.4, { Position = self._resting }, EASE)
+    tween(body, 0.24, { GroupTransparency = 0 }, EASE_SOFT)
+    tween(self._shadow, 0.32, { ImageTransparency = 0.55 }, EASE_SOFT)
 
     return self
 end
@@ -4817,7 +4946,7 @@ function Interface.showcase()
     local settings = win:tab({ name = "Settings", icon = "settings", group = "Other", subtitle = "Interface options" })
     do
         local s = settings:sub("Settings")
-        local ui = s:card({ title = "Interface", icon = "settings", subtitle = "Window behaviour", column = "left" })
+        local ui = s:card({ title = "Window", icon = "settings", subtitle = "Show and hide", column = "left" })
         ui:keybind("Toggle UI", function() return win.toggleKey.Name end, function(k)
             local ok, key = pcall(function() return Enum.KeyCode[k] end)
             if ok and key then
@@ -4829,10 +4958,12 @@ function Interface.showcase()
 
         -- Detached overlays: the watermark strip, the keybind list and a HUD
         -- built from the same rows, all draggable and saved with the config.
-        local overlays = s:card({ title = "Overlays", icon = "layout-dashboard", subtitle = "Detached panels", column = "left" })
+        local overlays = s:card({ title = "Panels", icon = "layout-dashboard", subtitle = "Detached panels", column = "left" })
         local wm = win:watermark()
         local binds = win:keybindList({ position = UDim2.new(0, 16, 0, 70) })
-        local demoHud = win:hud({ title = "Session", logo = true, position = UDim2.new(0, 16, 0, 190) })
+        -- No logo on the HUD by default: a panel the script builds gets whatever
+        -- header the script asks for, so the choice is left to the caller.
+        local demoHud = win:hud({ title = "Session", position = UDim2.new(0, 16, 0, 190) })
         local startedAt = os.clock()
         demoHud:row("Uptime", function()
             local secs = math.floor(os.clock() - startedAt)
