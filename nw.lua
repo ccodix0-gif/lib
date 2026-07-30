@@ -96,7 +96,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.30.4"
+Interface.version = "2026.07.30.6"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -1338,11 +1338,19 @@ local function openPanel(ctx, cfg)
 
     local scroller = scrollerOf(anchor)
     local controller, closed = nil, false
-    -- While the panel is coming in, its Position belongs to the entry tween. The
-    -- resting position is still recalculated on the way past, so the moment the
-    -- entry is over the panel is put exactly where it belongs.
-    local entering = true
     local resting = panel.Position
+
+    -- The entry movement is an offset that decays to zero, not a tween on Position.
+    --
+    -- place() has to stay the only thing that writes Position. When a tween owned it
+    -- instead, two things went wrong: the tween's target was the resting place as it
+    -- was known at the moment the panel opened, before an auto sized panel had
+    -- reported its real height, and place() had to be muted for the length of the
+    -- animation, so scrolling the column in that quarter second left the panel
+    -- behind, floating over rows it did not belong to. Now a scroll and the entry
+    -- can both be in flight and the panel is drawn from the sum of them.
+    local slideOffset = 0
+    local slideStop = nil
 
     local function syncShield()
         local size = panel.AbsoluteSize
@@ -1366,8 +1374,35 @@ local function openPanel(ctx, cfg)
         local above = at.Y - origin.Y - gap
         resting = ctx.fitPanel(x, below, width, height, above)
         syncShield()
-        if entering then return end
-        panel.Position = resting
+        panel.Position = UDim2.new(
+            resting.X.Scale, resting.X.Offset,
+            resting.Y.Scale, resting.Y.Offset + slideOffset
+        )
+    end
+
+    -- Run the offset down to zero on the shared frame driver.
+    local function slideFrom(distance, duration)
+        if slideStop then
+            slideStop()
+            slideStop = nil
+        end
+        slideOffset = distance
+        local elapsed = 0
+        slideStop = addTicker(0, function(dt)
+            if closed then
+                if slideStop then slideStop() slideStop = nil end
+                return
+            end
+            elapsed += dt
+            local t = math.min(elapsed / duration, 1)
+            -- Quint out, the same curve the tweened parts of the kit travel on.
+            slideOffset = distance * (1 - t) ^ 5
+            if t >= 1 then
+                slideOffset = 0
+                if slideStop then slideStop() slideStop = nil end
+            end
+            place()
+        end)
     end
 
     -- Fade out while the control is scrolled past the top or bottom of its column,
@@ -1392,10 +1427,9 @@ local function openPanel(ctx, cfg)
             -- Comes back the way it opened, so returning to a panel and opening one
             -- are the same movement.
             panel.Visible = true
-            panel.Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset - 10)
-            tween(panel, 0.26, { Position = resting }, EASE)
-            tween(panel, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
-            tween(edge, 0.2, { Transparency = 0.35 }, EASE_SOFT)
+            slideFrom(-10, 0.3)
+            tween(panel, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
+            tween(edge, 0.22, { Transparency = 0.35 }, EASE_SOFT)
         else
             tween(edge, 0.16, { Transparency = 1 }, EASE_SOFT)
             tween(panel, 0.16, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
@@ -1422,6 +1456,10 @@ local function openPanel(ctx, cfg)
         for i = #stack, 1, -1 do
             if stack[i] == controller then table.remove(stack, i) end
         end
+        if slideStop then
+            slideStop()
+            slideStop = nil
+        end
         backdrop:Destroy()
         shield:Destroy()
         if cfg.onClose then cfg.onClose() end
@@ -1442,20 +1480,14 @@ local function openPanel(ctx, cfg)
     -- Open: the panel drops the last few pixels into place while it fades up, so
     -- it reads as coming out from under the control it belongs to.
     --
-    -- It is the group's own Position that moves, and nothing inside it. A UIScale
-    -- on the group, which is what this used to be, grows it from whichever corner
-    -- its anchor point sits on (the top left, so every panel unrolled to the
-    -- right) and re-renders the text at a fractional size on every frame, which
-    -- is what made the labels crawl while a menu opened.
-    panel.Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset - 12)
-    local enter = tween(panel, 0.26, { Position = resting }, EASE)
-    tween(panel, 0.18, { GroupTransparency = 0 }, EASE_SOFT)
-    tween(edge, 0.18, { Transparency = 0.35 }, EASE_SOFT)
-    enter.Completed:Once(function()
-        entering = false
-        place()
-        clip()
-    end)
+    -- It is the group's own position that moves, and nothing inside it. A UIScale on
+    -- the group, which is what this used to be, grows it from whichever corner its
+    -- anchor point sits on (the top left, so every panel unrolled to the right) and
+    -- re-renders the text at a fractional size on every frame, which is what made
+    -- the labels crawl while a menu opened.
+    slideFrom(-14, 0.34)
+    tween(panel, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
+    tween(edge, 0.2, { Transparency = 0.35 }, EASE_SOFT)
 
     return panel, controller
 end
@@ -1597,6 +1629,11 @@ function Controls.label(parent, text)
     -- adjacent letters start closing up, so the running text in the kit sits a
     -- point above where it would with a regular weight.
     label.TextSize = 14
+    -- And it needs the lines pushed apart. Roblox leaves wrapped lines at the
+    -- font's own em height, which on a bold face is close enough that the
+    -- descenders of one line sit on the ascenders of the next and a paragraph
+    -- reads as a single grey block.
+    label.LineHeight = 1.22
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Top
     label.Parent = row
@@ -1711,7 +1748,7 @@ function Controls.input(parent, ctx, text, placeholder, get, set)
     box.Position = UDim2.new(1, 0, 0.5, 0)
     box.Size = UDim2.new(0, 140, 0, 26)
     box.BorderSizePixel = 0
-    box.TextSize = 13
+    box.TextSize = 14
     box.Text = (get and get()) or ""
     box.ClearTextOnFocus = false
     box.TextXAlignment = Enum.TextXAlignment.Left
@@ -1757,7 +1794,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     valueBox.Position = UDim2.new(1, 0, 0, 0)
     valueBox.Size = UDim2.new(0, 54, 0, 21)
     valueBox.BorderSizePixel = 0
-    valueBox.TextSize = 13
+    valueBox.TextSize = 14
     valueBox.Text = "0"
     valueBox.ClearTextOnFocus = false
     valueBox.TextXAlignment = Enum.TextXAlignment.Center
@@ -1870,17 +1907,20 @@ function Controls.keybind(parent, ctx, text, getKey, setKey, opts)
     opts = opts or {}
     local multi = opts.multi
     local row = controlRow(parent, 30)
-    rowLabel(row, text, 150)
+    -- The field is wide enough for the longest name it can hold. "MouseButton2" at
+    -- the control text size fills 116 pixels once the clear button has taken its
+    -- corner, and a bind that shows as "MouseButt.." is worse than a wider field.
+    rowLabel(row, text, 158)
     local kbIcon = makeIcon(row, "keyboard", UDim2.new(0, 22, 0, 22), "subtext")
     kbIcon.AnchorPoint = Vector2.new(1, 0.5)
-    kbIcon.Position = UDim2.new(1, -126, 0.5, 0)
+    kbIcon.Position = UDim2.new(1, -134, 0.5, 0)
     local button = Instance.new("TextButton")
     button.AnchorPoint = Vector2.new(1, 0.5)
     button.Position = UDim2.new(1, 0, 0.5, 0)
-    button.Size = UDim2.new(0, 116, 0, 24)
+    button.Size = UDim2.new(0, 124, 0, 24)
     button.BorderSizePixel = 0
     button.AutoButtonColor = false
-    button.TextSize = 13
+    button.TextSize = 14
     button.TextTruncate = Enum.TextTruncate.AtEnd
     button.Parent = row
     faced(button, "medium")
@@ -2062,7 +2102,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
     button.Size = UDim2.new(0, 140, 0, 26)
     button.BorderSizePixel = 0
     button.AutoButtonColor = false
-    button.TextSize = 13
+    button.TextSize = 14
     button.TextXAlignment = Enum.TextXAlignment.Left
     button.TextTruncate = Enum.TextTruncate.AtEnd
     button.Parent = row
@@ -2157,7 +2197,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             searchBox.BackgroundTransparency = 1
             searchBox.Position = UDim2.new(0, 36, 0, 0)
             searchBox.Size = UDim2.new(1, -46, 1, 0)
-            searchBox.TextSize = 13
+            searchBox.TextSize = 14
             searchBox.Text = ""
             searchBox.ClearTextOnFocus = false
             searchBox.TextXAlignment = Enum.TextXAlignment.Left
@@ -2225,7 +2265,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             optLabel.BackgroundTransparency = 1
             optLabel.Position = UDim2.new(0, 14, 0, 0)
             optLabel.Size = UDim2.new(1, -46, 1, 0)
-            optLabel.TextSize = 13
+            optLabel.TextSize = 14
             optLabel.TextXAlignment = Enum.TextXAlignment.Left
             optLabel.TextTruncate = Enum.TextTruncate.AtEnd
             optLabel.ZIndex = 2
@@ -2705,7 +2745,7 @@ function Controls.segmented(parent, ctx, text, options, get, set)
         btn.BackgroundTransparency = 1
         btn.BorderSizePixel = 0
         btn.AutoButtonColor = false
-        btn.TextSize = 13
+        btn.TextSize = 14
         btn.Parent = strip
         faced(btn, "medium")
         localized(btn, "Text", tostring(option))
@@ -2783,7 +2823,7 @@ function Controls.list(parent, ctx, options, get, set, opts)
         searchBox.BackgroundTransparency = 1
         searchBox.Position = UDim2.new(0, 32, 0, 0)
         searchBox.Size = UDim2.new(1, -42, 1, 0)
-        searchBox.TextSize = 13
+        searchBox.TextSize = 14
         searchBox.Text = ""
         searchBox.ClearTextOnFocus = false
         searchBox.TextXAlignment = Enum.TextXAlignment.Left
@@ -4561,6 +4601,7 @@ function Hud:text(value)
     label.AutomaticSize = Enum.AutomaticSize.Y
     label.TextWrapped = true
     label.TextSize = 13
+    label.LineHeight = 1.22
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.Text = hudText(hudRead(value))
     label.ZIndex = OVERLAY_Z
@@ -4895,22 +4936,36 @@ function Interface.new(opts)
         end
     end
 
-    -- Keep a floating panel inside the window bounds given its offset and size.
+    -- Where a floating panel goes, given the offset of its control and its size.
+    --
+    -- Below the control if it fits, above it if it does not, and if neither side has
+    -- the room then whichever side has more of it, pinned against the edge of the
+    -- screen. That last case used to clamp the below position into the viewport,
+    -- which for a tall panel next to a control in the middle of the screen parked it
+    -- straight over the row that opened it.
     self.fitPanel = function(xOff, yBelow, w, h, yAbove)
         local winPos = self.window.AbsolutePosition
         local cam = workspace.CurrentCamera
         local vp = (cam and cam.ViewportSize) or self.window.AbsoluteSize
-        -- Work in screen space and clamp to the viewport, so a panel can sit outside
-        -- the window (e.g. above it when the window is low) but never off the screen.
-        local sx = winPos.X + xOff
-        local syBelow = winPos.Y + yBelow
-        local syAbove = winPos.Y + (yAbove or yBelow)
-        sx = math.clamp(sx, 8, math.max(8, vp.X - w - 8))
-        local sy = syBelow
-        if syBelow + h > vp.Y - 8 then
-            local up = syAbove - h - 6
-            sy = (up >= 8) and up or math.clamp(syBelow, 8, math.max(8, vp.Y - h - 8))
+        -- Worked out in screen space, so a panel may sit outside the window (above it
+        -- when the window is low) but never off the screen.
+        local sx = math.clamp(winPos.X + xOff, 8, math.max(8, vp.X - w - 8))
+        local below = winPos.Y + yBelow
+        local above = winPos.Y + (yAbove or yBelow)
+
+        local roomBelow = (vp.Y - 8) - below
+        local roomAbove = above - 8
+        local sy
+        if h <= roomBelow then
+            sy = below
+        elseif h <= roomAbove then
+            sy = above - h
+        elseif roomAbove > roomBelow then
+            sy = 8
+        else
+            sy = math.max(8, vp.Y - 8 - h)
         end
+
         -- Whole pixels: a panel is a CanvasGroup, and half a pixel of offset is
         -- half a pixel of blur across everything written on it.
         return UDim2.new(0, math.floor(sx - winPos.X + 0.5), 0, math.floor(sy - winPos.Y + 0.5))
