@@ -49,11 +49,13 @@
 --   keys: accent, background, sidebar, card, cardTop, control, controlHover,
 --   track, text, subtext, stroke
 --
--- TRANSLATIONS: every string the kit draws goes through the phrase table, so a
---   script can ship more than one language without touching its layout code.
+-- TRANSLATIONS (optional, nothing to do if a script only ships one language):
+--   every string the kit draws goes through the phrase table, so more than one
+--   language costs no changes to the layout code.
 --   UI.addLocale("ru", { ["Auto Farm"] = "Автофарм", None = "Нет" })
 --   UI.setLocale("ru")            -- re-labels a live interface, no rebuild
 --   win:setLocale("ru")           -- same, and the choice is saved with the config
+--   UI.hasLocales()               -- false until a language is added
 --
 -- CONFIGS: win:saveConfig(name) / loadConfig(name) / listConfigs() / deleteConfig(name)
 --   win:setAutoLoad(name|nil) / getAutoLoad()       -- which config loads on launch
@@ -94,7 +96,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.30.1"
+Interface.version = "2026.07.30.2"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -134,25 +136,23 @@ local TRANS_OF = {
 }
 
 -- Type ------------------------------------------------------------------------
--- Weights instead of one heavy face. The old build drew everything in Arial
--- Heavy, which the renderer has to thicken itself, and small labels came out
--- smeared. Gotham Screen Smart is hinted for interface sizes, and a role picks a
--- weight rather than every label being as loud as the page title.
+-- One face for the whole interface: Arial at Heavy weight, which is Arial Black.
+-- Size and colour carry the hierarchy instead of weight, so a card title and a
+-- control label differ by scale rather than by two faces sitting next to each
+-- other.
 --
--- The family is swappable because a translated build may need glyphs the default
--- does not carry: UI.setFont("rbxasset://fonts/families/Arial.json") re-faces a
--- live interface.
-local FONT_FAMILY = "rbxasset://fonts/families/GothamSSm.json"
-local WEIGHTS = {
-    regular = Enum.FontWeight.Regular,
-    medium = Enum.FontWeight.Medium,
-    semibold = Enum.FontWeight.SemiBold,
-    bold = Enum.FontWeight.Bold,
-}
+-- Roles are still named at the call sites and still resolve through the registry,
+-- so a build that wants a second weight only has to fill WEIGHTS in again, and
+-- UI.setFont(family) re-faces a live interface for a language whose glyphs the
+-- family does not carry.
+local FONT_FAMILY = "rbxasset://fonts/families/Arial.json"
+local FONT_WEIGHT = Enum.FontWeight.Heavy
+local ROLES = { "regular", "medium", "semibold", "bold" }
 local FACES = {}
 local function rebuildFaces()
-    for role, weight in pairs(WEIGHTS) do
-        FACES[role] = Font.new(FONT_FAMILY, weight, Enum.FontStyle.Normal)
+    local face = Font.new(FONT_FAMILY, FONT_WEIGHT, Enum.FontStyle.Normal)
+    for _, role in ipairs(ROLES) do
+        FACES[role] = face
     end
 end
 rebuildFaces()
@@ -292,11 +292,19 @@ local TEXT_REG = {}
 local WINDOWS = {}
 Interface.locales = LOCALES
 
+-- Nothing here is required. A script that never calls addLocale gets its strings
+-- back exactly as it wrote them, and the lookup is skipped entirely, so opting out
+-- costs nothing at all.
+local localeCount = 0
+
 local function translate(phrase, ...)
     if type(phrase) ~= "string" then return phrase end
-    local table_ = LOCALES[localeCode]
-    local out = table_ and table_[phrase]
-    if out == nil then out = phrase end
+    local out = phrase
+    if localeCount > 0 then
+        local phrases = LOCALES[localeCode]
+        local hit = phrases and phrases[phrase]
+        if hit ~= nil then out = hit end
+    end
     if select("#", ...) > 0 then
         local ok, formatted = pcall(string.format, out, ...)
         if ok then return formatted end
@@ -305,17 +313,37 @@ local function translate(phrase, ...)
 end
 Interface.translate = translate
 
+-- Whether any language has been registered. A script can use this to decide
+-- whether to show a language control at all.
+function Interface.hasLocales()
+    return localeCount > 0
+end
+
+-- The registered language codes, in the order they were added.
+function Interface.localeCodes()
+    local out = {}
+    for code in pairs(LOCALES) do out[#out + 1] = code end
+    table.sort(out)
+    return out
+end
+
 -- Bind a label to a phrase: written now, rewritten on a language change.
+--
+-- The returned setter changes the phrase the label is bound to, not just the text
+-- on screen. It writes into the same entry the registry holds, so a label renamed
+-- at runtime (hud:setTitle, row:setLabel) is still the renamed one after the
+-- language changes rather than reverting to whatever it was built with.
 local function localized(instance, prop, phrase, transform)
+    local entry = { prop = prop, phrase = phrase, transform = transform }
     local function write()
-        local value = translate(phrase)
-        if transform then value = transform(value) end
+        local value = translate(entry.phrase)
+        if entry.transform then value = entry.transform(value) end
         instance[prop] = value
     end
     write()
-    tagAdd(TEXT_REG, instance, { prop = prop, phrase = phrase, transform = transform })
+    tagAdd(TEXT_REG, instance, entry)
     return function(nextPhrase)
-        phrase = nextPhrase
+        entry.phrase = nextPhrase
         write()
     end
 end
@@ -326,6 +354,7 @@ function Interface.addLocale(code, phrases)
     if not target then
         target = {}
         LOCALES[code] = target
+        localeCount += 1
     end
     for phrase, value in pairs(phrases) do
         target[phrase] = value
@@ -569,19 +598,24 @@ end
 -- 40% and not as a darker shade. Used by the picker's opacity bar and by the
 -- swatch on the control row.
 --
+-- The holder is a CanvasGroup because the grid has to be rounded off with the
+-- element it fills. ClipsDescendants clips to a rectangle, so on a rounded swatch
+-- the corner squares poked out past the curve and the swatch read as a square. A
+-- CanvasGroup rasterises its children first and the corner then masks the raster.
+--
 -- The grid is laid out from the real pixel size, which a scale sized element
 -- only reports once the layout has run, so it is built again whenever that size
 -- changes and skipped while the size is still zero.
-local function checkerboard(parent, cell, zIndex)
+local function checkerboard(parent, cell, zIndex, radius)
     cell = cell or 8
-    local holder = Instance.new("Frame")
+    local holder = Instance.new("CanvasGroup")
     holder.Name = "Checker"
     holder.Size = UDim2.new(1, 0, 1, 0)
     holder.BackgroundColor3 = Color3.fromRGB(208, 208, 214)
     holder.BorderSizePixel = 0
-    holder.ClipsDescendants = true
     holder.ZIndex = zIndex or 0
     holder.Parent = parent
+    if radius then corner(holder, radius) end
 
     local builtFor = -1
     local function build()
@@ -1043,19 +1077,15 @@ local function tintIcon(img, color)
     tween(img, 0.18, { ImageColor3 = color }, EASE_SOFT)
 end
 
--- Hover on a filled surface. The fill lifts to the hover colour and a faint
--- outline comes up with it, which is what a flat rectangle needs before it reads
--- as something you can press. Returns settle(), so a control can force the
--- resting look after a click without re-reading its own state.
+-- Hover on a filled surface: the fill lifts to the hover colour and nothing else
+-- happens. An outline that appeared on hover was tried and dropped, it drew a
+-- second border on top of a shape that already had one and read as a defect
+-- rather than as feedback. Returns settle(), so a control can force the resting
+-- look after a click without re-reading its own state.
 local function hoverSurface(part, opts)
     opts = opts or {}
     local base = opts.base or function() return PALETTE.control end
     local over = opts.hover or function() return PALETTE.controlHover end
-    local edge = nil
-    if opts.edge ~= false then
-        edge = stateStroke(part, opts.edgeKey or "accent", opts.thickness)
-    end
-    local edgeOn = opts.edgeTransparency or 0.6
     local hovering = false
     local function settle(instant)
         local color = hovering and over() or base()
@@ -1063,9 +1093,6 @@ local function hoverSurface(part, opts)
             part.BackgroundColor3 = color
         else
             tween(part, hovering and 0.14 or 0.2, { BackgroundColor3 = color }, EASE_SOFT)
-        end
-        if edge then
-            tween(edge, hovering and 0.14 or 0.22, { Transparency = hovering and edgeOn or 1 }, EASE_SOFT)
         end
     end
     part.MouseEnter:Connect(function()
@@ -1076,10 +1103,17 @@ local function hoverSurface(part, opts)
         hovering = false
         settle()
     end)
-    return settle, edge
+    return settle
 end
 
--- Press feedback: a short squash on mouse down, released on mouse up.
+-- Press feedback: a short squash on mouse down, released on mouse up. Kept for
+-- the toggle pill, which carries no text.
+--
+-- It is deliberately not used on anything with a label. A UIScale re-renders the
+-- glyphs at a fractional size on every frame of the tween, and the label crawls
+-- while it settles. The expanding ring that used to mark a click is gone for the
+-- same class of reason: it was clipped to the button's rectangle, so on a rounded
+-- button it squared off the corners as it passed them.
 local function pressScale(button, amount)
     local scale = newInstance("UIScale")
     scale.Parent = button
@@ -1087,38 +1121,6 @@ local function pressScale(button, amount)
     button.MouseButton1Up:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_POP) end)
     button.MouseLeave:Connect(function() tween(scale, 0.18, { Scale = 1 }, EASE_SOFT) end)
     return scale
-end
-
--- A ring that leaves the point of contact and fades as it crosses the surface.
--- It is what tells a wide flat button that the click landed, where a colour
--- change alone is too quiet to notice.
---
--- Only the horizontal position comes from the pointer: input coordinates and
--- absolute positions do not share an origin on every executor, and the vertical
--- centre reads the same anyway on a control sized row.
-local function pressRipple(button, key)
-    button.ClipsDescendants = true
-    button.InputBegan:Connect(function(input)
-        if not isPointer(input.UserInputType) then return end
-        local size = button.AbsoluteSize
-        local reach = math.max(size.X, size.Y) * 2.4
-        if reach < 8 then return end
-        local ring = newInstance("Frame")
-        ring.Name = randomName()
-        ring.AnchorPoint = Vector2.new(0.5, 0.5)
-        ring.Position = UDim2.new(0, input.Position.X - button.AbsolutePosition.X, 0.5, 0)
-        ring.Size = UDim2.new(0, 0, 0, 0)
-        ring.BackgroundTransparency = 0.82
-        ring.BorderSizePixel = 0
-        ring.ZIndex = button.ZIndex + 1
-        themed(ring, "BackgroundColor3", key or "text", { fade = false })
-        ring.Parent = button
-        corner(ring, 500)
-        tween(ring, 0.45, { Size = UDim2.new(0, reach, 0, reach), BackgroundTransparency = 1 }, EASE)
-        task.delay(0.5, function()
-            if ring.Parent then ring:Destroy() end
-        end)
-    end)
 end
 
 -- Drag a frame by a handle. The frame is kept on screen (a margin of it always
@@ -1139,9 +1141,12 @@ local function makeDraggable(frame, handle, onDrop)
                 local wantY = startAbs.Y + (y - origin.Y)
                 local keptX = math.clamp(wantX, 40 - size.X, view.X - 40)
                 local keptY = math.clamp(wantY, 0, view.Y - 28)
+                -- Whole pixels only. A frame parked on a fractional offset is
+                -- sampled between pixels, and on a CanvasGroup that means every
+                -- glyph inside it comes out soft.
                 frame.Position = UDim2.new(
-                    startPos.X.Scale, startPos.X.Offset + (keptX - startAbs.X),
-                    startPos.Y.Scale, startPos.Y.Offset + (keptY - startAbs.Y)
+                    startPos.X.Scale, math.floor(startPos.X.Offset + (keptX - startAbs.X) + 0.5),
+                    startPos.Y.Scale, math.floor(startPos.Y.Offset + (keptY - startAbs.Y) + 0.5)
                 )
             end,
             stop = function()
@@ -1193,12 +1198,17 @@ local function slidingUnderline(bar, thickness)
     corner(line, 1)
 
     local current = nil
-    local function place(target, animate)
+    -- Auto sized buttons have no width until the layout has run, and a tab that
+    -- was never opened has none at all, so the retry is capped rather than
+    -- deferring itself for the rest of the session.
+    local function place(target, animate, attempt)
+        attempt = attempt or 0
         current = target or current
         if not current or not current.Parent then return end
         local width = current.AbsoluteSize.X
         if width < 1 then
-            task.defer(function() place(nil, false) end)
+            if attempt >= 8 then return end
+            task.defer(function() place(nil, false, attempt + 1) end)
             return
         end
         local x = current.AbsolutePosition.X - bar.AbsolutePosition.X
@@ -1274,6 +1284,11 @@ local function openPanel(ctx, cfg)
 
     local scroller = scrollerOf(anchor)
     local controller, closed = nil, false
+    -- While the panel is coming in, its Position belongs to the entry tween. The
+    -- resting position is still recalculated on the way past, so the moment the
+    -- entry is over the panel is put exactly where it belongs.
+    local entering = true
+    local resting = panel.Position
 
     local function place()
         if closed or not anchor.Parent then return end
@@ -1285,7 +1300,9 @@ local function openPanel(ctx, cfg)
         local x = at.X - origin.X + (cfg.offsetX or 0)
         local below = at.Y - origin.Y + size.Y + gap
         local above = at.Y - origin.Y - gap
-        panel.Position = ctx.fitPanel(x, below, width, height, above)
+        resting = ctx.fitPanel(x, below, width, height, above)
+        if entering then return end
+        panel.Position = resting
     end
 
     -- Hide while the control is scrolled past the top or bottom of its column,
@@ -1322,8 +1339,11 @@ local function openPanel(ctx, cfg)
         end
         backdrop:Destroy()
         if cfg.onClose then cfg.onClose() end
-        tween(edge, 0.12, { Transparency = 1 }, EASE_SOFT)
-        local out = tween(panel, 0.14, { GroupTransparency = 1 }, EASE_SOFT)
+        -- The outline is not composited by GroupTransparency, so it is faded on
+        -- the same clock as the fill. Any difference between the two and the
+        -- border is the last thing left on screen.
+        tween(edge, 0.16, { Transparency = 1 }, EASE_SOFT)
+        local out = tween(panel, 0.16, { GroupTransparency = 1 }, EASE_SOFT)
         out.Completed:Once(function() panel:Destroy() end)
     end
 
@@ -1333,15 +1353,23 @@ local function openPanel(ctx, cfg)
 
     place()
     clip()
-    -- Open: the panel unfolds from the top edge it is anchored to and fades in
-    -- with it. Position belongs to place(), so it can still be moved by a scroll
-    -- while it is appearing.
-    local scale = newInstance("UIScale")
-    scale.Scale = 0.94
-    scale.Parent = panel
-    tween(panel, 0.16, { GroupTransparency = 0 }, EASE_SOFT)
-    tween(edge, 0.2, { Transparency = 0.35 }, EASE_SOFT)
-    tween(scale, 0.26, { Scale = 1 }, EASE_POP)
+    -- Open: the panel drops the last few pixels into place while it fades up, so
+    -- it reads as coming out from under the control it belongs to.
+    --
+    -- It is the group's own Position that moves, and nothing inside it. A UIScale
+    -- on the group, which is what this used to be, grows it from whichever corner
+    -- its anchor point sits on (the top left, so every panel unrolled to the
+    -- right) and re-renders the text at a fractional size on every frame, which
+    -- is what made the labels crawl while a menu opened.
+    panel.Position = UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset - 12)
+    local enter = tween(panel, 0.26, { Position = resting }, EASE)
+    tween(panel, 0.18, { GroupTransparency = 0 }, EASE_SOFT)
+    tween(edge, 0.18, { Transparency = 0.35 }, EASE_SOFT)
+    enter.Completed:Once(function()
+        entering = false
+        place()
+        clip()
+    end)
 
     return panel, controller
 end
@@ -1363,7 +1391,7 @@ local function rowLabel(row, text, rightInset)
     label.BackgroundTransparency = 1
     label.Position = UDim2.new(0, 0, 0, 0)
     label.Size = UDim2.new(1, -(rightInset or 54), 1, 0)
-    label.TextSize = 14
+    label.TextSize = 15
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextTruncate = Enum.TextTruncate.AtEnd
     label.Parent = row
@@ -1478,7 +1506,6 @@ function Controls.label(parent, text)
     label.TextSize = 13
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Top
-    label.LineHeight = 1.12
     label.Parent = row
     faced(label, "regular")
     themed(label, "TextColor3", "subtext")
@@ -1567,32 +1594,16 @@ function Controls.button(parent, ctx, text, onClick)
     button.BorderSizePixel = 0
     button.AutoButtonColor = false
     button.TextSize = 14
-    button.Text = ""
+    button.TextTruncate = Enum.TextTruncate.AtEnd
     button.Parent = row
+    faced(button, "medium")
     themed(button, "BackgroundColor3", "control")
+    themed(button, "TextColor3", "text")
+    localized(button, "Text", text)
     corner(button, 8)
+    padding(button, nil, { left = 10, right = 10 })
 
-    -- The caption is its own label so the ripple can be clipped by the button
-    -- without the text being clipped with it.
-    local caption = newInstance("TextLabel")
-    caption.BackgroundTransparency = 1
-    caption.Size = UDim2.new(1, -20, 1, 0)
-    caption.Position = UDim2.new(0, 10, 0, 0)
-    caption.TextSize = 14
-    caption.TextTruncate = Enum.TextTruncate.AtEnd
-    caption.ZIndex = 3
-    caption.Parent = button
-    faced(caption, "medium")
-    themed(caption, "TextColor3", "text")
-    localized(caption, "Text", text)
-
-    hoverSurface(button, {
-        base = function() return PALETTE.control end,
-        hover = function() return PALETTE.controlHover end,
-        edgeTransparency = 0.55,
-    })
-    pressRipple(button, "accent")
-    pressScale(button, 0.985)
+    hoverSurface(button)
     button.MouseButton1Click:Connect(function()
         if onClick then onClick() end
     end)
@@ -1982,7 +1993,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
     local arrow = makeIcon(row, "chevron-down", UDim2.new(0, 18, 0, 18), "subtext")
     arrow.AnchorPoint = Vector2.new(1, 0.5)
     arrow.Position = UDim2.new(1, -8, 0.5, 0)
-    hoverSurface(button, { edgeTransparency = 0.6 })
+    hoverSurface(button)
 
     local selected = {}
     if multi then
@@ -2152,7 +2163,6 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             local refs = { btn = optBtn, label = optLabel, tick = tick.Image ~= "" and tick or nil, on = false }
             optRows[opt] = refs
             paint(refs, opt)
-            pressRipple(optBtn, "accent")
             optBtn.MouseEnter:Connect(function()
                 if not refs.on then tween(optBtn, 0.12, { BackgroundTransparency = 0.5 }, EASE_SOFT) end
             end)
@@ -2242,11 +2252,13 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     swatch.AutoButtonColor = false
     swatch.Text = ""
     swatch.Active = false
-    swatch.ClipsDescendants = true
     swatch.Parent = row
     corner(swatch, 9)
     stroke(swatch, "stroke", 1, 0.2)
-    if useAlpha then checkerboard(swatch, 5, 0) end
+    -- Every layer carries the same rounding. A UICorner only rounds the element it
+    -- is on, so a square child inside a rounded parent shows its own corners
+    -- straight through the curve.
+    if useAlpha then checkerboard(swatch, 5, 0, 9) end
     local swatchFill = Instance.new("Frame")
     swatchFill.Size = UDim2.new(1, 0, 1, 0)
     swatchFill.BackgroundColor3 = colorOf(getRgb())
@@ -2254,6 +2266,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     swatchFill.BorderSizePixel = 0
     swatchFill.ZIndex = 2
     swatchFill.Parent = swatch
+    corner(swatchFill, 9)
 
     local opened = nil
     local h, s, v = colorOf(getRgb()):ToHSV()
@@ -2359,10 +2372,8 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             alphaHolder.Size = UDim2.new(1, 0, 0, 16)
             alphaHolder.BackgroundTransparency = 1
             alphaHolder.BorderSizePixel = 0
-            alphaHolder.ClipsDescendants = true
             alphaHolder.Parent = panel
-            corner(alphaHolder, 4)
-            checkerboard(alphaHolder, 8, 0)
+            checkerboard(alphaHolder, 8, 0, 4)
 
             alphaBar = Instance.new("ImageButton")
             alphaBar.Size = UDim2.new(1, 0, 1, 0)
@@ -2371,6 +2382,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             alphaBar.BorderSizePixel = 0
             alphaBar.ZIndex = 2
             alphaBar.Parent = alphaHolder
+            corner(alphaBar, 4)
             local aGrad = Instance.new("UIGradient")
             aGrad.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) })
             aGrad.Parent = alphaBar
@@ -2512,39 +2524,69 @@ end
 -- which is what makes the change read as one movement.
 function Controls.segmented(parent, ctx, text, options, get, set)
     local row = controlRow(parent, 30)
+    local label = nil
     if text and text ~= "" then
-        rowLabel(row, text, 200)
+        label = rowLabel(row, text, 200)
     end
-    local holder = Instance.new("Frame")
-    holder.AnchorPoint = Vector2.new(1, 0.5)
-    holder.Position = UDim2.new(1, 0, 0.5, 0)
-    holder.Size = UDim2.new(0, math.min(60 * #options, 220), 1, -4)
-    holder.BorderSizePixel = 0
-    holder.Parent = row
-    themed(holder, "BackgroundColor3", "control")
-    corner(holder, 7)
-    padding(holder, 3)
-    listLayout(holder, 4, Enum.FillDirection.Horizontal)
+    -- Three siblings of the row, in draw order: the recessed track, the accent
+    -- marker, then the strip of labels.
+    --
+    -- The labels have to be the last of the three. An earlier build put the
+    -- marker after the strip so it could be measured against the row, and
+    -- because siblings of equal depth draw in tree order the marker landed on top
+    -- of the label it was supposed to be highlighting: the selected option went
+    -- blank behind a block of accent.
+    --
+    -- The marker stays out of the strip because the strip is padded, and a padded
+    -- parent would offset it a second time on top of the rectangle it was already
+    -- measured from.
+    local track = Instance.new("Frame")
+    track.AnchorPoint = Vector2.new(1, 0.5)
+    track.Position = UDim2.new(1, 0, 0.5, 0)
+    track.Size = UDim2.new(0, 0, 1, -2)
+    track.BorderSizePixel = 0
+    track.ZIndex = 1
+    track.Parent = row
+    themed(track, "BackgroundColor3", "control")
+    corner(track, 7)
 
-    -- The marker is a sibling of the pill strip rather than a child of it: the
-    -- strip is padded, and a padded parent would offset the marker a second time
-    -- on top of the rectangle it was measured from.
     local marker = Instance.new("Frame")
     marker.Name = randomName()
     marker.Size = UDim2.new(0, 0, 0, 0)
     marker.Position = UDim2.new(0, 0, 0, 0)
     marker.BorderSizePixel = 0
-    marker.ZIndex = 1
+    marker.ZIndex = 2
     marker.Parent = row
     themed(marker, "BackgroundColor3", "accent")
     corner(marker, 5)
 
+    -- The strip is auto sized from its labels and the track is sized to match, so
+    -- a translated option twice as long as the English one still fits instead of
+    -- being cut off at a fixed pill width.
+    local strip = Instance.new("Frame")
+    strip.AnchorPoint = Vector2.new(1, 0.5)
+    strip.Position = UDim2.new(1, 0, 0.5, 0)
+    strip.Size = UDim2.new(0, 0, 1, -2)
+    strip.AutomaticSize = Enum.AutomaticSize.X
+    strip.BackgroundTransparency = 1
+    strip.ZIndex = 3
+    strip.Parent = row
+    padding(strip, nil, { left = 3, right = 3, top = 3, bottom = 3 })
+    listLayout(strip, 3, Enum.FillDirection.Horizontal)
+
     local buttons = {}
-    local function place(btn, animate)
-        if not btn or btn.AbsoluteSize.X < 1 then
+    -- Auto sized labels report a width a frame after they are built, and the row
+    -- reports a position only once its column has been laid out, so the first
+    -- placement retries. The retry is capped: a tab that has never been opened
+    -- has no geometry at all, and an uncapped retry would defer itself forever.
+    local function place(btn, animate, attempt)
+        attempt = attempt or 0
+        if not btn or not btn.Parent then return end
+        if btn.AbsoluteSize.X < 1 then
+            if attempt >= 8 then return end
             task.defer(function()
                 local current = buttons[get()]
-                if current then place(current, false) end
+                if current then place(current, false, attempt + 1) end
             end)
             return
         end
@@ -2572,17 +2614,20 @@ function Controls.segmented(parent, ctx, text, options, get, set)
     end
     for _, option in ipairs(options) do
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0, 52, 1, 0)
+        btn.Size = UDim2.new(0, 0, 1, 0)
+        btn.AutomaticSize = Enum.AutomaticSize.X
         btn.BackgroundTransparency = 1
         btn.BorderSizePixel = 0
         btn.AutoButtonColor = false
         btn.TextSize = 13
-        btn.ZIndex = 2
-        btn.Parent = holder
+        btn.Parent = strip
         faced(btn, "medium")
         localized(btn, "Text", tostring(option))
+        local bpad = Instance.new("UIPadding")
+        bpad.PaddingLeft = UDim.new(0, 12)
+        bpad.PaddingRight = UDim.new(0, 12)
+        bpad.Parent = btn
         buttons[option] = btn
-        pressScale(btn, 0.94)
         btn.MouseEnter:Connect(function()
             if get() ~= option then tween(btn, 0.14, { TextColor3 = PALETTE.text }, EASE_SOFT) end
         end)
@@ -2595,12 +2640,31 @@ function Controls.segmented(parent, ctx, text, options, get, set)
             render(true)
         end)
     end
+    -- The track follows the strip, so the recess is exactly as wide as the labels,
+    -- and the row's own label gives up whatever room the strip takes. A fixed
+    -- reservation was enough for the English options and not for a translation
+    -- twice their length, which then ran under the strip.
+    local function fitTrack()
+        local width = strip.AbsoluteSize.X
+        track.Size = UDim2.new(0, width, 1, -2)
+        if label then
+            label.Size = UDim2.new(1, -(width + 12), 1, 0)
+        end
+    end
+    fitTrack()
     render(false)
-    -- The row only knows its real width once the layout has run.
-    local conn = row:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
-        place(buttons[get()], false)
+    local conns = {
+        row:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+            place(buttons[get()], false)
+        end),
+        strip:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            fitTrack()
+            place(buttons[get()], false)
+        end),
+    }
+    row.Destroying:Connect(function()
+        for _, conn in ipairs(conns) do conn:Disconnect() end
     end)
-    row.Destroying:Connect(function() conn:Disconnect() end)
     if ctx and ctx._refresh then table.insert(ctx._refresh, function() render(true) end) end
     return row
 end
@@ -2686,7 +2750,6 @@ function Controls.list(parent, ctx, options, get, set, opts)
         tick.ZIndex = 2
         tick.Active = false
         rows[option] = { label = label, row = optRow, tick = tick.Image ~= "" and tick or nil, on = false }
-        pressRipple(optRow, "accent")
         optRow.MouseEnter:Connect(function()
             if get() ~= option then tween(optRow, 0.12, { BackgroundTransparency = 0.5 }, EASE_SOFT) end
         end)
@@ -2741,7 +2804,6 @@ function Controls.stepper(parent, ctx, text, min, max, step, get, set)
         b.Parent = holder
         faced(b, "semibold")
         themed(b, "TextColor3", "subtext", { fade = false })
-        pressScale(b, 0.86)
         b.MouseEnter:Connect(function() tween(b, 0.14, { TextColor3 = PALETTE.accent }, EASE_SOFT) end)
         b.MouseLeave:Connect(function() tween(b, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT) end)
         return b
@@ -2762,21 +2824,17 @@ function Controls.stepper(parent, ctx, text, min, max, step, get, set)
     faced(value, "medium")
     themed(value, "TextColor3", "text")
 
-    -- The number leaves in the direction it was pushed, so a step reads as a step
-    -- and a held button reads as a run.
-    local function bump(direction)
-        value.Position = UDim2.new(0.5, direction * 5, 0.5, 0)
-        tween(value, 0.22, { Position = UDim2.new(0.5, 0, 0.5, 0) }, EASE_POP)
-    end
-    local function apply(v, direction)
+    -- The number is written straight in. Sliding it in the direction of the step
+    -- was tried and dropped: moving a label a few pixels re-renders the glyphs at
+    -- fractional offsets and the digits crawl instead of stepping.
+    local function apply(v)
         if not set then return end
         v = math.clamp(v, min, max)
         set(v)
         value.Text = tostring(v)
-        if direction then bump(direction) end
     end
-    minus.MouseButton1Click:Connect(function() apply(get() - step, -1) end)
-    plus.MouseButton1Click:Connect(function() apply(get() + step, 1) end)
+    minus.MouseButton1Click:Connect(function() apply(get() - step) end)
+    plus.MouseButton1Click:Connect(function() apply(get() + step) end)
     value.FocusLost:Connect(function()
         local typed = tonumber(string.match(value.Text, "[%-%d%.]+"))
         if typed then apply(typed) else value.Text = tostring(get()) end
@@ -2871,7 +2929,7 @@ function Sub:card(title, column)
         titleLabel.BackgroundTransparency = 1
         titleLabel.Position = UDim2.new(0, textX, 0, 0)
         titleLabel.Size = UDim2.new(1, -textX - (cfg.toggle and 54 or 0), 0, cfg.subtitle and 20 or 22)
-        titleLabel.TextSize = 16
+        titleLabel.TextSize = 17
         titleLabel.TextXAlignment = Enum.TextXAlignment.Left
         titleLabel.TextYAlignment = cfg.subtitle and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center
         titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
@@ -2922,7 +2980,7 @@ function Tab:sub(name)
     btn.Size = UDim2.new(0, 0, 1, 0)
     btn.BackgroundTransparency = 1
     btn.AutoButtonColor = false
-    btn.TextSize = 14
+    btn.TextSize = 15
     btn.LayoutOrder = order
     btn.Parent = self._subBar
     faced(btn, "medium")
@@ -2974,11 +3032,14 @@ function Tab:sub(name)
             tween(other.btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
         end
         if self._ctx.closeOverlays then self._ctx.closeOverlays() end
+        -- Only the page group moves, never anything inside it. Sliding the column
+        -- holder within the group, which is what this used to do, forces the group
+        -- to re-rasterise every frame and the labels crawl the whole way in.
         page.Visible = true
         page.GroupTransparency = 1
-        columns.Position = UDim2.new(0, 0, 0, 10)
-        tween(page, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
-        tween(columns, 0.3, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        page.Position = UDim2.new(0, 0, 0, 12)
+        tween(page, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
+        tween(page, 0.34, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
         tween(btn, 0.16, { TextColor3 = PALETTE.text }, EASE_SOFT)
         self._placeUnderline(btn, true)
     end
@@ -3012,7 +3073,7 @@ function Window:tab(opts)
         local header = Instance.new("TextLabel")
         header.BackgroundTransparency = 1
         header.Size = UDim2.new(1, 0, 0, 24)
-        header.TextSize = 11
+        header.TextSize = 12
         header.TextXAlignment = Enum.TextXAlignment.Left
         header.LayoutOrder = nextOrder(self.sidebarList)
         header.Parent = self.sidebarList
@@ -3067,7 +3128,7 @@ function Window:tab(opts)
     label.BackgroundTransparency = 1
     label.Position = UDim2.new(0, 48, 0, 0)
     label.Size = UDim2.new(1, -56, 1, 0)
-    label.TextSize = 14
+    label.TextSize = 15
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextTruncate = Enum.TextTruncate.AtEnd
     label.ZIndex = 2
@@ -3131,11 +3192,13 @@ function Window:tab(opts)
             end
         end
         if self.closeOverlays then self.closeOverlays() end
+        -- Same rule as the sub-pages: the group itself travels, its contents do
+        -- not, so the text arrives in one piece.
         tabPage.Visible = true
         tabPage.GroupTransparency = 1
-        tabPage.Position = UDim2.new(0, 0, 0, 10)
-        tween(tabPage, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
-        tween(tabPage, 0.3, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        tabPage.Position = UDim2.new(0, 0, 0, 14)
+        tween(tabPage, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
+        tween(tabPage, 0.36, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
         -- The fill slides in from the left as the section opens.
         fillGrad.Offset = Vector2.new(-0.6, 0)
         tween(fill, 0.2, { BackgroundTransparency = 0 }, EASE_SOFT)
@@ -3556,24 +3619,18 @@ function Window:notify(opts)
     -- group by hand.
     local edge = stateStroke(toast, "stroke")
 
+    -- Just the icon. It used to sit on a tinted disc, which put a second shape
+    -- inside a card that already had one and drew the eye away from the text the
+    -- notification exists to deliver.
     local textX = 16
     if opts.icon then
-        local badge = newInstance("Frame")
-        badge.AnchorPoint = Vector2.new(0, 0.5)
-        badge.Position = UDim2.new(0, 14, 0.5, 0)
-        badge.Size = UDim2.new(0, 26, 0, 26)
-        badge.BackgroundTransparency = 0.86
-        badge.BorderSizePixel = 0
-        badge.Parent = toast
-        themed(badge, "BackgroundColor3", "accent", { fade = false })
-        corner(badge, 13)
-        local ic = makeIcon(badge, opts.icon, UDim2.new(0, 16, 0, 16), "text")
-        ic.AnchorPoint = Vector2.new(0.5, 0.5)
-        ic.Position = UDim2.new(0.5, 0, 0.5, 0)
+        local ic = makeIcon(toast, opts.icon, UDim2.new(0, 20, 0, 20), "accent")
+        ic.AnchorPoint = Vector2.new(0, 0.5)
+        ic.Position = UDim2.new(0, 16, 0.5, 0)
         if ic.Image == "" then
-            badge:Destroy()
+            ic:Destroy()
         else
-            textX = 50
+            textX = 46
         end
     end
 
@@ -3632,7 +3689,9 @@ function Window:notify(opts)
             if stack[i] == entry then table.remove(stack, i) end
         end
         entry.offX = offscreen
-        tween(edge, 0.2, { Transparency = 1 }, EASE_SOFT)
+        -- The outline sits outside the raster GroupTransparency composites, so it
+        -- fades on exactly the same clock as the fill.
+        tween(edge, 0.28, { Transparency = 1 }, EASE_SOFT)
         tween(toast, 0.28, { GroupTransparency = 1 }, EASE_SOFT)
         local out = tween(toast, 0.34, { Position = UDim2.new(1, offscreen, 1, entry.y) }, EASE)
         out.Completed:Once(function() toast:Destroy() end)
@@ -3689,7 +3748,11 @@ local function overlayShell(self, name, opts)
     frame.Parent = self.screen
     themed(frame, "BackgroundColor3", "card")
     corner(frame, opts.radius or 8)
-    stroke(frame, "stroke", 1, 0.3)
+    -- A UIStroke on a CanvasGroup is drawn on the group's own border, outside the
+    -- raster GroupTransparency composites, so it has to be faded by hand and on
+    -- the same clock. Left alone it was the one thing still on screen after a
+    -- panel had gone.
+    local edge = stroke(frame, "stroke", 1, 0.3)
 
     -- A position saved in the config wins over the default one.
     local saved = self._overlayPos and self._overlayPos[name]
@@ -3700,12 +3763,12 @@ local function overlayShell(self, name, opts)
     -- Dropping it marks the config dirty, so auto save keeps the new spot.
     makeDraggable(frame, frame, function() self._dirty = true end)
 
-    local scale = newInstance("UIScale")
-    scale.Scale = 0.94
-    scale.Parent = frame
-
     -- Show and hide with the same fade the panel came in with. Registered on the
     -- window so win:showOverlay works on a watermark as well as on a HUD.
+    --
+    -- Fade only, no scale: these panels are almost entirely text, and scaling a
+    -- group of labels re-renders the glyphs at a fractional size for the length of
+    -- the tween.
     --
     -- The first call is the panel appearing, which is not a change the user made,
     -- so it does not mark the config dirty and trigger a write on startup.
@@ -3715,16 +3778,17 @@ local function overlayShell(self, name, opts)
             frame.Visible = true
             if instant then
                 frame.GroupTransparency = 0
-                scale.Scale = 1
+                edge.Transparency = 0.3
             else
-                tween(frame, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
-                tween(scale, 0.3, { Scale = 1 }, EASE_POP)
+                tween(frame, 0.24, { GroupTransparency = 0 }, EASE_SOFT)
+                tween(edge, 0.24, { Transparency = 0.3 }, EASE_SOFT)
             end
         elseif instant then
             frame.GroupTransparency = 1
+            edge.Transparency = 1
             frame.Visible = false
         else
-            tween(scale, 0.2, { Scale = 0.94 }, EASE)
+            tween(edge, 0.18, { Transparency = 1 }, EASE_SOFT)
             tween(frame, 0.18, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
                 if frame.GroupTransparency > 0.9 then frame.Visible = false end
             end)
@@ -4443,11 +4507,17 @@ function Interface.new(opts)
     -- scales around and the coordinate space the floating panels are placed in.
     -- Everything you can see is inside the body group, which is what lets a fade
     -- take the whole window down evenly, outlines included.
+    -- Centred on a whole pixel, not on a scale of 0.5. A viewport with an odd
+    -- width puts a scale centred frame on a half pixel, and the body group is then
+    -- blitted between two pixel rows, which softens every glyph in the window. The
+    -- offset is worked out once and the drag controller only ever adds whole pixel
+    -- deltas to it.
+    local view = viewport()
     local window = newInstance("Frame")
     window.Name = randomName()
     window.AnchorPoint = Vector2.new(0.5, 0.5)
     window.Size = UDim2.new(0, 900, 0, 580)
-    window.Position = UDim2.new(0.5, 0, 0.5, 0)
+    window.Position = UDim2.new(0, math.floor(view.X / 2), 0, math.floor(view.Y / 2))
     window.BackgroundTransparency = 1
     window.BorderSizePixel = 0
     window.Parent = screen
@@ -4503,7 +4573,7 @@ function Interface.new(opts)
     brand.BackgroundTransparency = 1
     brand.Position = UDim2.new(0, hasLogo and 50 or 0, 0, 0)
     brand.Size = UDim2.new(1, hasLogo and -50 or 0, 1, 0)
-    brand.TextSize = 22
+    brand.TextSize = 23
     brand.TextXAlignment = Enum.TextXAlignment.Left
     brand.Text = opts.brand or "NewReality"
     brand.Parent = brandRow
@@ -4542,7 +4612,7 @@ function Interface.new(opts)
     title.BackgroundTransparency = 1
     title.Position = UDim2.new(0, 24, 0, 13)
     title.Size = UDim2.new(1, -48, 0, 24)
-    title.TextSize = 21
+    title.TextSize = 22
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextTruncate = Enum.TextTruncate.AtEnd
     title.Text = ""
@@ -4612,7 +4682,9 @@ function Interface.new(opts)
             local up = syAbove - h - 6
             sy = (up >= 8) and up or math.clamp(syBelow, 8, math.max(8, vp.Y - h - 8))
         end
-        return UDim2.new(0, sx - winPos.X, 0, sy - winPos.Y)
+        -- Whole pixels: a panel is a CanvasGroup, and half a pixel of offset is
+        -- half a pixel of blur across everything written on it.
+        return UDim2.new(0, math.floor(sx - winPos.X + 0.5), 0, math.floor(sy - winPos.Y + 0.5))
     end
 
     makeDraggable(window, topDrag)
