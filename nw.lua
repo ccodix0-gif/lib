@@ -104,7 +104,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.31.3"
+Interface.version = "2026.07.31.4"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -339,40 +339,9 @@ function Interface.pushRecentColor(value)
     pushRecent(value)
 end
 
--- Fixed swatches every picker offers, above the recent row. A build with a house
--- palette sets these once; a single picker can override them with opts.swatches.
--- Empty by default, and an empty list means the row is not drawn at all rather than
--- drawn empty.
-local swatches = {}
-Interface.swatches = swatches
 
--- Accepts hex strings, { r, g, b } triples or Color3 values, in any mix, and hands
--- back hex strings with the duplicates and the malformed entries dropped.
-local function swatchHexList(list)
-    local out, seen = {}, {}
-    if type(list) ~= "table" then return out end
-    for _, entry in ipairs(list) do
-        local hex = normaliseHex(entry)
-        if hex and not seen[hex] then
-            seen[hex] = true
-            out[#out + 1] = hex
-        end
-    end
-    return out
-end
 
--- Replace the house palette. Filled in place, because the module table is frozen
--- and because Interface.swatches is the same table a script may be holding. Rubbish
--- is dropped here rather than at draw time, so a build finds out its palette was
--- wrong by reading it back, not by opening a picker.
-function Interface.setSwatches(list)
-    local kept = swatchHexList(list)
-    table.clear(swatches)
-    for index, hex in ipairs(kept) do
-        swatches[index] = hex
-    end
-    return swatches
-end
+
 
 -- The accent, lifted or dropped until it can be seen against the surface it is
 -- drawn on. Used only by the thin marks: a two pixel underline, a sixteen pixel
@@ -1444,83 +1413,34 @@ local function tween(instance, time, props, style, dir)
     return t
 end
 
--- Fade a whole panel without wrapping it in a CanvasGroup.
+-- Nothing that carries text fades. Ever.
 --
--- A CanvasGroup is the obvious way to fade a group of things by one number, and it
--- was how this kit did it. The cost is that the group rasterises everything inside
--- it into a texture and blits that, and text drawn through a render target comes out
--- softer than text drawn straight to the screen. With the whole window inside one
--- group, that was every label in the interface.
+-- Fading a panel as a whole means writing a transparency on every part of it, and
+-- that only works if nothing else writes the same property. In a kit this size
+-- something always does: the palette opacity has its own opinion about text
+-- transparency, a dropdown row paints its own background by state, a hover lifts a
+-- fill. Three rounds of bugs came out of that one idea, all of them the same shape
+-- and all of them looking like something unrelated. A notification that arrived
+-- blank. A HUD that never came back. A dropdown drawn with no words in it.
 --
--- So the transparency properties are driven directly instead. The list is cached and
--- rebuilt whenever the panel gains or loses children, which covers a HUD whose rows
--- are added by the caller after the panel was made. Each part keeps its own resting
--- transparency as the floor, so an outline at 0.3 fades from 0.3 rather than
--- snapping to opaque on the way in.
-local FADE_PROPS = {
-    BackgroundTransparency = true,
-    TextTransparency = true,
-    TextStrokeTransparency = true,
-    ImageTransparency = true,
-    Transparency = true,
-    ScrollBarImageTransparency = true,
-}
-
--- A part's resting transparency is read once, the first time that part is seen,
--- and never read again. Reading it a second time is the trap: the list is rebuilt
--- when the panel gains or loses a child, that can happen while the panel is faded
--- out, and the second read then takes the faded value for the resting one. The
--- panel has nothing left to come back to and stays invisible for good.
---
--- Two things hit exactly that. A toast gains its click target immediately after
--- the first setAlpha(0), so every notification went out invisible. And a HUD given
--- a row while it was hidden lost its whole panel the same way.
-local function fadeGroup(root)
-    local bases = {}
-    local parts, count = {}, -1
-
-    local function rebuild(kids)
-        count = #kids
-        table.clear(parts)
-        -- Rebuilt rather than added to, so parts that have been destroyed drop out
-        -- instead of collecting in a panel whose rows churn.
-        local kept = {}
-
-        local function collect(node)
-            local slots = bases[node]
-            if slots == nil then
-                slots = {}
-                for prop in pairs(FADE_PROPS) do
-                    -- Numbers only. UIGradient carries a Transparency as well and
-                    -- it is a NumberSequence, not something to interpolate here.
-                    local ok, base = pcall(function() return node[prop] end)
-                    if ok and type(base) == "number" then
-                        slots[prop] = base
-                    end
-                end
-            end
-            kept[node] = slots
-            for prop, base in pairs(slots) do
-                parts[#parts + 1] = { node = node, prop = prop, base = base }
-            end
-        end
-
-        -- The root itself as well as its children: the panel's own surface and its
-        -- outline have to go with the rows on it.
-        collect(root)
-        for _, node in ipairs(kids) do
-            collect(node)
-        end
-        bases = kept
+-- So a panel fades its own surface and its own outline, and nothing else. Two
+-- properties on two instances, written by one thing. The content is opaque from the
+-- first frame it exists and is hidden by Visible when the panel is gone. What makes
+-- the panel read as arriving is the travel, which is what the window does too.
+local function surfaceFade(root)
+    local edge = nil
+    for _, child in ipairs(root:GetChildren()) do
+        if child:IsA("UIStroke") then edge = child end
     end
+    -- Resting values, read once here, before anything has had a chance to move them.
+    local fill = root.BackgroundTransparency
+    local line = edge and edge.Transparency or 0
 
-    -- alpha 1 is fully visible, 0 is gone.
+    -- alpha 1 is the panel at rest, 0 is the surface gone.
     return function(alpha)
-        local kids = root:GetDescendants()
-        if #kids ~= count then rebuild(kids) end
-        for _, part in ipairs(parts) do
-            local hidden = part.base + (1 - part.base) * (1 - alpha)
-            pcall(function() part.node[part.prop] = hidden end)
+        root.BackgroundTransparency = fill + (1 - fill) * (1 - alpha)
+        if edge then
+            edge.Transparency = line + (1 - line) * (1 - alpha)
         end
     end
 end
@@ -1532,58 +1452,31 @@ local function WINDOW_LIFT(resting)
     return UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + WINDOW_RISE)
 end
 
--- Swap one page for another.
+-- A section change: the page that was open is hidden at once, and the content of the
+-- one that opens settles into place.
 --
--- The arriving page travels in from the side the selection moved towards and the
--- leaving page goes out the other way, so a section change says which direction it
--- went. Both of those were the complaint: every page used to arrive from the same
--- place whichever one you came from, and the page you left vanished in a single frame
--- while the new one was still sliding, which read as unfinished rather than as a
--- change of section.
---
--- Only the two page frames move. Nothing inside them is touched, and nothing fades:
--- fading a page means fading every card on it, and doing that in one write is what a
--- CanvasGroup was for, which is what was costing the text its edges. The container
--- clips instead, so a page is masked at the edge of the content area.
---
--- Leaving is quicker than arriving, and accelerates away while the new page eases in.
--- Matching the two made the pair look like one rigid strip being dragged past.
-local PAGE_IN = 0.3
-local PAGE_OUT = 0.17
+-- The two columns rise, the right one a beat behind the left. That stagger is the whole
+-- animation, and it is deliberately the only thing that moves: two frames, each written
+-- to its resting place by its own tween, so an interrupted change cannot leave anything
+-- parked off screen. There is no fade, because fading a page means fading every card on
+-- it, and no exit animation, because an exit that has to hide the page when it finishes
+-- needs a completion callback, and a position tween reports completion the moment
+-- something else takes the property over. That is what left two pages drawn on top of
+-- each other: the sub-tab bar of the section you had left, over the one you had opened.
+local COLUMN_RISE = 14
+local COLUMN_LEAD = 0.26
+local COLUMN_TRAIL = 0.34
 
--- Which page each frame is meant to end up as, so a quick change and change back
--- cannot let an exit that is still running hide the page now being looked at. Weak
--- keys: a page that has been destroyed should not be kept alive by this.
-local pageIntent = setmetatable({}, { __mode = "k" })
-
-local function pageAt(horizontal, amount)
-    if horizontal then return UDim2.new(0, amount, 0, 0) end
-    return UDim2.new(0, 0, 0, amount)
-end
-
--- direction is 1 when the selection moved forward (down the sidebar, right along the
--- sub-tab bar) and -1 when it moved back.
-local function swapPages(leaving, arriving, horizontal, distance, direction)
-    local home = UDim2.new(0, 0, 0, 0)
-    local enter = distance * (direction < 0 and -1 or 1)
-
-    if leaving and leaving ~= arriving and leaving.Visible then
-        pageIntent[leaving] = false
-        local going = leaving
-        local out = tween(going, PAGE_OUT, { Position = pageAt(horizontal, -enter) }, EASE, Enum.EasingDirection.In)
-        out.Completed:Once(function()
-            -- Only if leaving is still what it is meant to do.
-            if pageIntent[going] == false then
-                going.Visible = false
-                going.Position = home
-            end
-        end)
+local function enterColumns(columns)
+    for index, column in ipairs(columns) do
+        local home = column.home
+        local frame = column.frame
+        frame.Position = UDim2.new(
+            home.X.Scale, home.X.Offset,
+            home.Y.Scale, home.Y.Offset + COLUMN_RISE
+        )
+        tween(frame, index == 1 and COLUMN_LEAD or COLUMN_TRAIL, { Position = home }, EASE)
     end
-
-    pageIntent[arriving] = true
-    arriving.Visible = true
-    arriving.Position = pageAt(horizontal, enter)
-    tween(arriving, PAGE_IN, { Position = home }, EASE)
 end
 
 -- Gentle icon colour transition.
@@ -1606,26 +1499,42 @@ end
 -- is rewritten from the ratio, and the bar always shows the ramp from its start up to
 -- its own share of it. The slope is then the same at every value, which is what makes
 -- it read as one piece of shading across the track rather than per bar decoration.
-local BAR_RAMP_FLOOR = 0.48
+-- Every bar's gradient, so a palette change can rebuild them. Weak keys: a ramp goes
+-- when the bar it shades does.
+local BAR_RAMPS = setmetatable({}, { __mode = "k" })
+
+local function rampColours()
+    -- The ramp adapts to the colour it is shading, which is the one thing a hardcoded
+    -- grey to white sequence could not do. It is a multiply, so these are brightness
+    -- factors: the same depth that reads well over cyan takes a dark blue fill most of
+    -- the way to black, and over a pale accent on a light theme it reads as dirt. So the
+    -- depth comes from how bright the accent is. A bright accent gets the full ramp, a
+    -- dark one gets a shallow one.
+    local lit = luminance(PALETTE.accent)
+    local floor = math.clamp(0.72 - 0.32 * lit, 0.42, 0.86)
+    return ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.new(floor, floor, floor)),
+        ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)),
+    })
+end
+
+local function refreshBarRamps()
+    local colours = rampColours()
+    for ramp in pairs(BAR_RAMPS) do
+        if ramp.Parent then
+            ramp.Color = colours
+        else
+            BAR_RAMPS[ramp] = nil
+        end
+    end
+end
+
 local function barRamp(fill)
     local ramp = newInstance("UIGradient")
-    local applied = nil
-    local function setSpan(ratio)
-        ratio = math.clamp(tonumber(ratio) or 1, 0, 1)
-        -- Rounded to a fiftieth: a slider drag would otherwise rebuild the sequence
-        -- on every frame for a change nobody can see.
-        ratio = math.floor(ratio * 50 + 0.5) / 50
-        if applied == ratio then return end
-        applied = ratio
-        local far = BAR_RAMP_FLOOR + (1 - BAR_RAMP_FLOOR) * ratio
-        ramp.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.new(BAR_RAMP_FLOOR, BAR_RAMP_FLOOR, BAR_RAMP_FLOOR)),
-            ColorSequenceKeypoint.new(1, Color3.new(far, far, far)),
-        })
-    end
-    setSpan(1)
+    ramp.Color = rampColours()
     ramp.Parent = fill
-    return setSpan
+    BAR_RAMPS[ramp] = true
+    return ramp
 end
 
 -- Hover on a filled surface: the fill lifts to the hover colour and nothing else
@@ -1911,6 +1820,9 @@ local function openPanel(ctx, cfg)
     local scroller = scrollerOf(anchor)
     local controller, closed = nil, false
     local resting = panel.Position
+    -- Declared ahead of place(), which dismisses the panel when the row it belongs to
+    -- has left the tree.
+    local closePanel
 
     -- The entry movement is an offset that decays to zero, not a tween on Position.
     --
@@ -1926,26 +1838,82 @@ local function openPanel(ctx, cfg)
     -- Which way the panel went when its row was scrolled out, so it can come back
     -- the same way.
     local lastExit = nil
-    -- Without a group there is no one number to fade, so the parts are written
-    -- directly. The list is built on first use and rebuilt when the panel gains
-    -- children, which is what happens the frame after it opens: the caller fills it
-    -- in after openPanel returns.
-    local setAlpha = fadeGroup(panel)
+    -- The surface and the outline fade. The rows on the panel do not: they are opaque
+    -- from the frame the caller creates them, which is after this function returns.
+    local setAlpha = surfaceFade(panel)
     local alphaNow = 0
     setAlpha(0)
 
+    -- Where the panel is drawn on the vertical axis, as opposed to where it belongs.
+    -- place() explains why those are two different things.
+    local drawnY = nil
+    local lastTarget = 0
+    local lastAnchorY = nil
+    local catchUpStop = nil
+
+    local function drawY()
+        return (drawnY or resting.Y.Offset) + slideOffset
+    end
+
+    local function write()
+        panel.Position = UDim2.new(
+            resting.X.Scale, resting.X.Offset,
+            resting.Y.Scale, drawY()
+        )
+    end
+
+    -- Ease the drawn position onto wherever the panel now belongs.
+    --
+    -- Exponential rather than a tween over a fixed distance, because the target can keep
+    -- moving while this runs: a panel pushed off the bottom of the screen while the
+    -- column is still being scrolled is being moved by two things at once, and a tween
+    -- to a captured target would be heading somewhere that stopped being true.
+    local function startCatchUp()
+        if catchUpStop then return end
+        catchUpStop = addTicker(0, function(dt)
+            if closed then
+                if catchUpStop then catchUpStop() catchUpStop = nil end
+                return
+            end
+            local gap = lastTarget - (drawnY or lastTarget)
+            if math.abs(gap) < 0.5 then
+                drawnY = lastTarget
+                write()
+                if catchUpStop then catchUpStop() catchUpStop = nil end
+                return
+            end
+            -- A share of the remaining distance per second, not per frame, so the slide
+            -- takes the same time whatever the frame rate.
+            drawnY += gap * (1 - 0.0005 ^ dt)
+            write()
+        end)
+    end
+
+    -- The shield sits over where the panel is drawn, not over where it belongs: while
+    -- the panel is sliding onto a new place, a press has to land on the panel the user
+    -- can see.
     local function syncShield()
         local size = panel.AbsoluteSize
         local h = (size.Y > 4) and size.Y or (cfg.height or 0)
         shield.Position = UDim2.new(
             resting.X.Scale, resting.X.Offset - SHIELD_MARGIN,
-            resting.Y.Scale, resting.Y.Offset - SHIELD_MARGIN
+            resting.Y.Scale, drawY() - SHIELD_MARGIN
         )
         shield.Size = UDim2.new(0, width + SHIELD_MARGIN * 2, 0, h + SHIELD_MARGIN * 2)
     end
 
     local function place()
-        if closed or not anchor.Parent then return end
+        if closed then return end
+        -- The row this panel belongs to has left the tree, so there is nothing left to
+        -- place against. That happens when a panel is opened from inside another one, a
+        -- dropdown inside a gear popover being the case that matters, and the host is
+        -- closed first: the child used to be left frozen on screen with no way to reach
+        -- it, because everything that could have moved or dismissed it was placed
+        -- relative to a control that no longer existed.
+        if not anchor.Parent then
+            closePanel()
+            return
+        end
         local origin = ctx.window.AbsolutePosition
         local at = anchor.AbsolutePosition
         local size = anchor.AbsoluteSize
@@ -1955,11 +1923,40 @@ local function openPanel(ctx, cfg)
         local below = at.Y - origin.Y + size.Y + gap
         local above = at.Y - origin.Y - gap
         resting = ctx.fitPanel(x, below, width, height, above)
+
+        -- Two different things can move a panel, and they want opposite treatment.
+        --
+        -- Following the row it is glued to has to be exact. A panel that lags behind a
+        -- scroll by even a few pixels reads as coming loose from the control it belongs
+        -- to, so that movement is written straight through.
+        --
+        -- Running out of room is not following anything. The panel has been put
+        -- somewhere else because where it wanted to be is off the screen, or because it
+        -- has grown and no longer fits below its row and has to go above it instead.
+        -- That is a decision, not a drag, and taking it in one frame is what read as the
+        -- panel jumping.
+        --
+        -- They are told apart by how far the row moved. If the target moved by the same
+        -- amount, this is a scroll and it is written through. If it moved by more, the
+        -- placement changed its mind and the difference is eased away.
+        local anchorY = at.Y
+        local target = resting.Y.Offset
+        if drawnY == nil then
+            drawnY = target
+        else
+            local rowMoved = lastAnchorY and (anchorY - lastAnchorY) or 0
+            local targetMoved = target - lastTarget
+            if math.abs(targetMoved - rowMoved) < 1.5 then
+                drawnY += targetMoved
+            else
+                startCatchUp()
+            end
+        end
+        lastTarget = target
+        lastAnchorY = anchorY
+
+        write()
         syncShield()
-        panel.Position = UDim2.new(
-            resting.X.Scale, resting.X.Offset,
-            resting.Y.Scale, resting.Y.Offset + slideOffset
-        )
     end
 
     -- Move the offset and the opacity together on the shared frame driver.
@@ -2057,10 +2054,33 @@ local function openPanel(ctx, cfg)
     }
     syncShield()
 
-    local function close()
+    closePanel = function()
         if closed then return end
         closed = true
         for _, conn in ipairs(conns) do conn:Disconnect() end
+
+        -- Anything opened out of this panel goes with it. A dropdown inside a gear
+        -- popover is anchored to a control on the popover, so once the popover is gone
+        -- that dropdown can never be placed or dismissed again: it has to be taken down
+        -- here, while there is still a way to identify it.
+        for i = #stack, 1, -1 do
+            local other = stack[i]
+            if other ~= controller and not other.closed and other.anchor then
+                local node = other.anchor
+                while node do
+                    if node == panel then
+                        other.close()
+                        break
+                    end
+                    node = node.Parent
+                end
+            end
+        end
+        -- Marked as well as removed. The controller is created after this function is,
+        -- so a close that happens before it exists cannot take itself off the stack,
+        -- and a dead controller sitting in the stack is a panel that nothing can place
+        -- and nothing can close again.
+        if controller then controller.closed = true end
         for i = #stack, 1, -1 do
             if stack[i] == controller then table.remove(stack, i) end
         end
@@ -2076,6 +2096,10 @@ local function openPanel(ctx, cfg)
         if slideStop then
             slideStop()
             slideStop = nil
+        end
+        if catchUpStop then
+            catchUpStop()
+            catchUpStop = nil
         end
         local base = resting
         local fromOffset = slideOffset
@@ -2099,8 +2123,21 @@ local function openPanel(ctx, cfg)
         end)
     end
 
-    controller = { frame = panel, close = close, popover = cfg.popover == true }
-    stack[#stack + 1] = controller
+    controller = {
+        frame = panel,
+        -- The control the panel came out of. Kept because the panel is placed from it
+        -- on every scroll, so anything reasoning about an open panel needs to know
+        -- which row it belongs to.
+        anchor = anchor,
+        close = closePanel,
+        popover = cfg.popover == true,
+        closed = closed,
+    }
+    -- Only if it is still open. Closing during the build is unlikely but a closed
+    -- controller on the stack would be a panel nothing can reach.
+    if not closed then
+        stack[#stack + 1] = controller
+    end
 
     -- A press anywhere outside the panel dismisses it, except on the window's title
     -- strip: that starts a window drag and leaves the panel open, so the window can
@@ -2112,7 +2149,7 @@ local function openPanel(ctx, cfg)
     backdrop.InputBegan:Connect(function(input)
         if not isPointer(input.UserInputType) then return end
         if ctx.dragWindowFrom and ctx.dragWindowFrom(input) then return end
-        close()
+        closePanel()
     end)
 
     place()
@@ -2463,7 +2500,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     fill.Parent = track
     themed(fill, "BackgroundColor3", "accent")
     corner(fill, 3)
-    local setRampSpan = barRamp(fill)
+    barRamp(fill)
 
     local knob = Instance.new("Frame")
     knob.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -2493,8 +2530,6 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
             tween(fill, 0.22, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
             tween(knob, 0.22, { Position = UDim2.new(ratio, 0, 0.5, 0) }, EASE_SOFT)
         end
-        -- The shading covers the same slice of the track whatever the value is.
-        setRampSpan(ratio)
         valueBox.Text = format and format(value) or tostring(value)
     end
     render(get(), true)
@@ -3057,21 +3092,13 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
         end
         if ctx.closeOverlays then ctx.closeOverlays(true) end
 
-        -- The picker's own swatches, if this picker or the build supplied any. Read
-        -- when the panel opens rather than when the control was built, so a script
-        -- can change the house palette at runtime.
-        local presets = swatchHexList((opts and opts.swatches) or Interface.swatches)
-
-        -- The layout is fixed, so the height is worked out rather than measured.
-        -- Top: the saturation square and the hue bar, then the opacity bar under
-        -- them. Bottom, stacked upward from the hex field: recent colours, and the
-        -- preset swatches above those if there are any.
+        -- The layout is fixed, so the height is worked out rather than measured. Top:
+        -- the saturation square and the hue bar, then the opacity bar under them.
+        -- Bottom, stacked upward from the hex field: the recent colours.
         local ROW_H, ROW_GAP, HEX_H = 22, 8, 28
         local top = 138 + (useAlpha and 28 or 0)
         local recentY = HEX_H + ROW_GAP
-        local presetY = recentY + ROW_H + ROW_GAP
-        local bottom = (#presets > 0 and presetY or recentY) + ROW_H
-        local panelH = 24 + top + 14 + bottom
+        local panelH = 24 + top + 14 + recentY + ROW_H
 
         local panel, controller = openPanel(ctx, {
             anchor = swatch,
@@ -3321,22 +3348,6 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             return chip
         end
 
-        -- The build's own swatches, if it has any. Fixed, so they are drawn once.
-        if #presets > 0 then
-            local presetRow = Instance.new("Frame")
-            presetRow.AnchorPoint = Vector2.new(0, 1)
-            presetRow.Position = UDim2.new(0, 0, 1, -presetY)
-            presetRow.Size = UDim2.new(1, 0, 0, ROW_H)
-            presetRow.BackgroundTransparency = 1
-            presetRow.Parent = panel
-            listLayout(presetRow, 4, Enum.FillDirection.Horizontal)
-            -- Eight fit across the panel; a longer list is the script's problem and
-            -- the row simply stops rather than wrapping into the hex field.
-            for index = 1, math.min(#presets, 8) do
-                chipFor(presets[index], presetRow, index)
-            end
-        end
-
         -- Recent colours, above the hex field. Rebuilt rather than reordered: seven
         -- swatches are cheaper to make again than to keep in sync.
         local recentRow = Instance.new("Frame")
@@ -3358,18 +3369,17 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             -- something to empty, so an untouched picker shows colours and nothing
             -- else.
             if #recentColors == 0 then return end
+            -- The icon on its own, with no surface under it. A filled chip here read as
+            -- a ninth colour in a row of colours, which is the one thing it is not.
             local clear = Instance.new("TextButton")
             clear.Size = UDim2.new(0, 22, 0, 22)
-            clear.BackgroundTransparency = 0
+            clear.BackgroundTransparency = 1
             clear.BorderSizePixel = 0
             clear.AutoButtonColor = false
             clear.Text = ""
             clear.LayoutOrder = 99
             clear.Parent = recentRow
-            themed(clear, "BackgroundColor3", "control")
-            corner(clear, 5)
-            stroke(clear, "stroke", 1, 0.35)
-            local mark = makeIcon(clear, "trash", UDim2.new(0, 13, 0, 13), "iconDim")
+            local mark = makeIcon(clear, "trash", UDim2.new(0, 14, 0, 14), "iconDim")
             mark.AnchorPoint = Vector2.new(0.5, 0.5)
             mark.Position = UDim2.new(0.5, 0, 0.5, 0)
             mark.Active = false
@@ -3381,11 +3391,9 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
                 themed(clear, "TextColor3", "subtext")
             end
             clear.MouseEnter:Connect(function()
-                tween(clear, 0.12, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT)
                 if mark.Parent then tintIcon(mark, PALETTE.icon) end
             end)
             clear.MouseLeave:Connect(function()
-                tween(clear, 0.16, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
                 if mark.Parent then tintIcon(mark, PALETTE.iconDim) end
             end)
             clear.MouseButton1Click:Connect(function()
@@ -3992,27 +4000,28 @@ function Tab:sub(name)
     local leftCol = makeColumn("Left", 0)
     local rightCol = makeColumn("Right", 0.5)
 
-    local sub = { name = name, btn = btn, page = page, columns = columns, tab = self, order = order }
+    -- Captured now, so the entry animation always has a resting place to return the
+    -- columns to and never reads one back off a frame that is mid-tween.
+    local risers = {
+        { frame = leftCol, home = leftCol.Position },
+        { frame = rightCol, home = rightCol.Position },
+    }
+    local sub = {
+        name = name, btn = btn, page = page, columns = columns, tab = self, order = order,
+        enter = function() enterColumns(risers) end,
+    }
     table.insert(self._subs, sub)
 
-    -- The sub-tabs sit in a row, so their pages travel sideways, along the bar.
-    local SUB_SLIDE = 26
-
     local function activate()
-        local leaving, from = nil, order
         for _, other in ipairs(self._subs) do
             if other ~= sub then
-                if other.page.Visible then
-                    leaving = other.page
-                    from = other.order
-                else
-                    other.page.Visible = false
-                end
+                other.page.Visible = false
                 tween(other.btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
             end
         end
         if self._ctx.closeOverlays then self._ctx.closeOverlays() end
-        swapPages(leaving, page, true, SUB_SLIDE, order >= from and 1 or -1)
+        page.Visible = true
+        sub.enter()
         tween(btn, 0.16, { TextColor3 = PALETTE.text }, EASE_SOFT)
         self._placeUnderline(btn, true)
     end
@@ -4168,30 +4177,24 @@ function Window:tab(opts)
         name = opts.name, btn = btn, icon = icon, label = label, page = tabPage,
     }, Tab)
     table.insert(self.tabs, tabObj)
-    -- Where this tab sits in the sidebar, which is the direction its page travels in.
-    local myIndex = #self.tabs
-
-    -- The tabs are a vertical list, so their pages travel vertically, with the
-    -- sidebar: pick a tab further down and the page comes up from below.
-    local TAB_SLIDE = 18
 
     local function activate()
-        local leaving, from = nil, myIndex
-        for index, other in ipairs(self.tabs) do
+        for _, other in ipairs(self.tabs) do
             if other ~= tabObj then
-                if other.page.Visible then
-                    leaving = other.page
-                    from = index
-                else
-                    other.page.Visible = false
-                end
+                other.page.Visible = false
                 if other.fill then tween(other.fill, 0.18, { BackgroundTransparency = 1 }, EASE_SOFT) end
                 tween(other.label, 0.18, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
                 tintIcon(other.icon, PALETTE.iconDim)
             end
         end
         if self.closeOverlays then self.closeOverlays() end
-        swapPages(leaving, tabPage, false, TAB_SLIDE, myIndex >= from and 1 or -1)
+        tabPage.Visible = true
+        -- The page frame itself does not move. What settles in is the content of
+        -- whichever sub-page is open on it, the same movement a sub-tab change makes, so
+        -- changing tab and changing sub-tab read as the same thing happening.
+        for _, entry in ipairs(tabObj._subs) do
+            if entry.page.Visible and entry.enter then entry.enter() end
+        end
         -- The fill slides in from the left as the section opens.
         fillGrad.Offset = Vector2.new(-0.6, 0)
         tween(fill, 0.2, { BackgroundTransparency = 0 }, EASE_SOFT)
@@ -4328,7 +4331,7 @@ function Window:_buildSearch(parent)
     listLayout(body, 2)
     padding(body, 6)
 
-    local setAlpha = fadeGroup(list)
+    local setAlpha = surfaceFade(list)
     setAlpha(0)
 
     -- Where the list sits when it is fully open, and how far below that it starts.
@@ -4603,6 +4606,10 @@ local function applyKey(key, new, alpha)
 
     PALETTE[key] = new
     PALETTE_A[key] = alpha
+    -- The shading over every filled bar is derived from the accent, so it is rebuilt
+    -- with it. Set at once rather than eased: it is a brightness ramp over a colour that
+    -- is already easing, and easing both reads as the bar changing twice.
+    if key == "accent" then refreshBarRamps() end
 
     if from == new and alphaFrom == alpha then
         themeFade[key] = nil
@@ -5121,8 +5128,7 @@ function Window:notify(opts)
         localized(msg, "Text", opts.text)
     end
 
-    -- Anywhere on the toast dismisses it early. Built before the fade so the fade
-    -- sees the finished toast and never has to rebuild its list.
+    -- Anywhere on the toast dismisses it early.
     local hit = newInstance("TextButton")
     hit.Size = UDim2.new(1, 0, 1, 0)
     hit.BackgroundTransparency = 1
@@ -5131,23 +5137,33 @@ function Window:notify(opts)
     hit.ZIndex = 10
     hit.Parent = toast
 
-    -- The toast is a frame, so its parts are faded one by one. There are five of
-    -- them, and the alternative was putting the text through a render target.
-    local setAlpha = fadeGroup(toast)
+    -- The card fades, the words on it do not. A toast already travels the width of
+    -- itself to get on screen, so its content needs no fade of its own, and every
+    -- attempt to give it one ended with notifications that arrived blank.
+    local setAlpha = surfaceFade(toast)
     setAlpha(0)
-    local function runFade(target, duration)
-        local from = target > 0 and 0 or 1
+    local fadeStop = nil
+    local alphaNow = 0
+    local function runFade(target, duration, onDone)
+        if fadeStop then
+            fadeStop()
+            fadeStop = nil
+        end
+        local from = alphaNow
         local elapsed = 0
-        local stop
-        stop = addTicker(0, function(dt)
+        fadeStop = addTicker(0, function(dt)
             if not toast.Parent then
-                if stop then stop() end
+                if fadeStop then fadeStop() fadeStop = nil end
                 return
             end
             elapsed += dt
             local t = math.min(elapsed / duration, 1)
-            setAlpha(from + (target - from) * t)
-            if t >= 1 and stop then stop() end
+            alphaNow = from + (target - from) * t
+            setAlpha(alphaNow)
+            if t >= 1 then
+                if fadeStop then fadeStop() fadeStop = nil end
+                if onDone then onDone() end
+            end
         end)
     end
 
@@ -5179,9 +5195,11 @@ function Window:notify(opts)
             if stack[i] == entry then table.remove(stack, i) end
         end
         entry.offX = offscreen
-        runFade(0, 0.28)
-        local out = tween(toast, 0.34, { Position = UDim2.new(1, offscreen, 1, entry.y) }, EASE)
-        out.Completed:Once(function() toast:Destroy() end)
+        -- Out the way it came in, and taken down when the surface has gone rather than
+        -- when a tween says so. A position tween on a toast is replaced every time the
+        -- stack relays out, and a replaced tween reports completion straight away.
+        runFade(0, 0.3, function() toast:Destroy() end)
+        tween(toast, 0.3, { Position = UDim2.new(1, offscreen, 1, entry.y) }, EASE)
         relayout(true)
     end
 
@@ -5226,8 +5244,10 @@ local function overlayShell(self, name, opts)
     themed(frame, "BackgroundColor3", "card")
     corner(frame, opts.radius or 8)
     stroke(frame, "stroke", 1, 0.3)
-    -- Everything on the panel fades together, the surface, the outline and the rows.
-    local setAlpha = fadeGroup(frame)
+    -- The card fades and the panel travels. The rows on it are left alone, so a HUD
+    -- that gains a row while it is hidden cannot lose the panel, and a value written
+    -- into a row is never fighting an animation for the same property.
+    local setAlpha = surfaceFade(frame)
 
     -- A position saved in the config wins over the default one.
     local saved = self._overlayPos and self._overlayPos[name]
@@ -5838,7 +5858,7 @@ function Hud:bar(label, getRatio, opts)
     -- The same brightness ramp a slider fill carries, so the two kinds of bar in
     -- the kit read as the same object. One with a ramp next to one without looks
     -- like one of them is shaded by mistake.
-    local setRampSpan = barRamp(fill)
+    barRamp(fill)
 
     local last = nil
     local function apply(ratio)
@@ -5846,7 +5866,6 @@ function Hud:bar(label, getRatio, opts)
         if last and math.abs(ratio - last) < 0.005 then return end
         last = ratio
         tween(fill, 0.2, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
-        setRampSpan(ratio)
         valueText.Text = opts.text and tostring(opts.text(ratio)) or (math.floor(ratio * 100 + 0.5) .. "%")
     end
     apply(hudRead(getRatio) or 0)
