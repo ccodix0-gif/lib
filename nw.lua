@@ -104,7 +104,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.31.1"
+Interface.version = "2026.07.31.2"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -698,19 +698,23 @@ end
 -- A fixed 900 by 580 covered almost all of a 1366 by 768 laptop and looked like a
 -- postage stamp on a 4K monitor. This takes a share of the viewport and clamps it,
 -- so the window is the same shape everywhere and always leaves the game visible
--- around it. Whole pixels, because the window is a CanvasGroup.
+-- around it. Whole pixels, so a border never lands on a half pixel and turns grey.
+-- The share is set so a 1920 by 1080 screen lands on 902 by 583, near enough the
+-- size this kit was designed at. A smaller screen gets a smaller window and a
+-- larger one stops growing, rather than the window taking the same share of a 4K
+-- monitor and turning into a wall.
 local function windowFit(view)
-    local w = math.clamp(math.floor(view.X * 0.66), 620, 1000)
-    local h = math.clamp(math.floor(view.Y * 0.76), 400, 660)
+    local w = math.clamp(math.floor(view.X * 0.47), 600, 920)
+    local h = math.clamp(math.floor(view.Y * 0.54), 380, 600)
     w = math.min(w, math.max(320, view.X - 32))
     h = math.min(h, math.max(260, view.Y - 32))
     return w, h
 end
 
--- The sidebar takes a quarter of the window, within reason: below about 180 the tab
+-- The sidebar takes a quarter of the window, within reason: below about 176 the tab
 -- names start truncating, above 240 it is just empty space.
 local function sidebarFit(windowWidth)
-    return math.clamp(math.floor(windowWidth * 0.25), 180, 240)
+    return math.clamp(math.floor(windowWidth * 0.255), 176, 240)
 end
 
 -- Keep a detached panel on screen. A config written on a large monitor puts panels
@@ -1168,6 +1172,22 @@ function Interface.setIconFolder(folder)
     iconLogged = false
 end
 
+-- Every name the pack answers to, sorted, so a script can browse what it has
+-- instead of guessing at a name and getting an empty square.
+function Interface.iconNames()
+    local names = {}
+    for name in pairs(ICON_DATA) do
+        table.insert(names, name)
+    end
+    for name in pairs(Interface.icons) do
+        if not ICON_DATA[name] then
+            table.insert(names, name)
+        end
+    end
+    table.sort(names)
+    return names
+end
+
 -- makeIcon(parent, name, size [, key]) where key is a palette key the tint
 -- follows. Passing a Color3 pins the tint instead.
 local function makeIcon(parent, name, size, key)
@@ -1281,6 +1301,63 @@ local function tween(instance, time, props, style, dir)
     local t = TweenService:Create(instance, info, props)
     t:Play()
     return t
+end
+
+-- Fade a whole panel without wrapping it in a CanvasGroup.
+--
+-- A CanvasGroup is the obvious way to fade a group of things by one number, and it
+-- was how this kit did it. The cost is that the group rasterises everything inside
+-- it into a texture and blits that, and text drawn through a render target comes out
+-- softer than text drawn straight to the screen. With the whole window inside one
+-- group, that was every label in the interface.
+--
+-- So the transparency properties are driven directly instead. The list is cached and
+-- rebuilt whenever the panel gains or loses children, which covers a HUD whose rows
+-- are added by the caller after the panel was made. Each part keeps its own resting
+-- transparency as the floor, so an outline at 0.3 fades from 0.3 rather than
+-- snapping to opaque on the way in.
+local FADE_PROPS = {
+    BackgroundTransparency = true,
+    TextTransparency = true,
+    TextStrokeTransparency = true,
+    ImageTransparency = true,
+    Transparency = true,
+    ScrollBarImageTransparency = true,
+}
+
+local function fadeGroup(root)
+    local parts, count = {}, -1
+    local function rebuild(kids)
+        count = #kids
+        table.clear(parts)
+        -- The root itself as well as its children: the panel's own surface and its
+        -- outline have to go with the rows on it.
+        for prop in pairs(FADE_PROPS) do
+            local ok, base = pcall(function() return root[prop] end)
+            if ok and type(base) == "number" then
+                parts[#parts + 1] = { node = root, prop = prop, base = base }
+            end
+        end
+        for _, node in ipairs(kids) do
+            for prop in pairs(FADE_PROPS) do
+                -- A number only. UIGradient also has a Transparency, and it is a
+                -- NumberSequence, which is not something to interpolate here.
+                local ok, base = pcall(function() return node[prop] end)
+                if ok and type(base) == "number" then
+                    parts[#parts + 1] = { node = node, prop = prop, base = base }
+                end
+            end
+        end
+    end
+    -- alpha 1 is fully visible, 0 is gone.
+    return function(alpha)
+        local kids = root:GetDescendants()
+        if #kids ~= count then rebuild(kids) end
+        for _, part in ipairs(parts) do
+            local hidden = part.base + (1 - part.base) * (1 - alpha)
+            pcall(function() part.node[part.prop] = hidden end)
+        end
+    end
 end
 
 -- How far below its resting place the window starts and ends. Kept in one place so
@@ -1610,13 +1687,13 @@ local function openPanel(ctx, cfg)
         )
     end
 
-    -- Run the offset down to zero on the shared frame driver.
-    local function slideFrom(distance, duration)
+    -- Move the offset between two values on the shared frame driver.
+    local function slide(from, to, duration)
         if slideStop then
             slideStop()
             slideStop = nil
         end
-        slideOffset = distance
+        slideOffset = from
         local elapsed = 0
         slideStop = addTicker(0, function(dt)
             if closed then
@@ -1626,9 +1703,10 @@ local function openPanel(ctx, cfg)
             elapsed += dt
             local t = math.min(elapsed / duration, 1)
             -- Quint out, the same curve the tweened parts of the kit travel on.
-            slideOffset = distance * (1 - t) ^ 5
+            local eased = 1 - (1 - t) ^ 5
+            slideOffset = from + (to - from) * eased
             if t >= 1 then
-                slideOffset = 0
+                slideOffset = to
                 if slideStop then slideStop() slideStop = nil end
             end
             place()
@@ -1657,12 +1735,15 @@ local function openPanel(ctx, cfg)
             -- Comes back the way it opened, so returning to a panel and opening one
             -- are the same movement.
             panel.Visible = true
-            slideFrom(-10, 0.3)
+            slide(-12, 0, 0.3)
             tween(panel, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
             tween(edge, 0.22, { Transparency = 0.35 }, EASE_SOFT)
         else
-            tween(edge, 0.16, { Transparency = 1 }, EASE_SOFT)
-            tween(panel, 0.16, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
+            -- And it leaves by moving too. Fading on the spot read as the panel being
+            -- switched off rather than as the panel going with the row it belongs to.
+            slide(slideOffset, 14, 0.2)
+            tween(edge, 0.18, { Transparency = 1 }, EASE_SOFT)
+            tween(panel, 0.18, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
                 if not shown and not closed then panel.Visible = false end
             end)
         end
@@ -1715,7 +1796,7 @@ local function openPanel(ctx, cfg)
     -- anchor point sits on (the top left, so every panel unrolled to the right) and
     -- re-renders the text at a fractional size on every frame, which is what made
     -- the labels crawl while a menu opened.
-    slideFrom(-14, 0.34)
+    slide(-14, 0, 0.34)
     tween(panel, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
     tween(edge, 0.2, { Transparency = 0.35 }, EASE_SOFT)
 
@@ -3439,7 +3520,9 @@ function Tab:sub(name)
     bpad.PaddingRight = UDim.new(0, 2)
     bpad.Parent = btn
 
-    local page = Instance.new("CanvasGroup")
+    -- Plain frames for the pages as well: a page holds every card on it, so a group
+    -- here is a render target around most of the text in the interface.
+    local page = Instance.new("Frame")
     page.Size = UDim2.new(1, 0, 1, 0)
     page.BackgroundTransparency = 1
     page.BorderSizePixel = 0
@@ -3480,14 +3563,12 @@ function Tab:sub(name)
             tween(other.btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
         end
         if self._ctx.closeOverlays then self._ctx.closeOverlays() end
-        -- Only the page group moves, never anything inside it. Sliding the column
-        -- holder within the group, which is what this used to do, forces the group
-        -- to re-rasterise every frame and the labels crawl the whole way in.
+        -- The page arrives by moving, over a short distance and in one beat. It used
+        -- to fade over 0.2 while travelling for 0.34, so the content went on sliding
+        -- after it was already fully visible, which is the part that read as wrong.
         page.Visible = true
-        page.GroupTransparency = 1
-        page.Position = UDim2.new(0, 0, 0, 12)
-        tween(page, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
-        tween(page, 0.34, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        page.Position = UDim2.new(0, 0, 0, 10)
+        tween(page, 0.24, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
         tween(btn, 0.16, { TextColor3 = PALETTE.text }, EASE_SOFT)
         self._placeUnderline(btn, true)
     end
@@ -3599,7 +3680,7 @@ function Window:tab(opts)
     themed(label, "TextColor3", "subtext", { fade = false })
     localized(label, "Text", opts.name)
 
-    local tabPage = Instance.new("CanvasGroup")
+    local tabPage = Instance.new("Frame")
     tabPage.Size = UDim2.new(1, 0, 1, 0)
     tabPage.BackgroundTransparency = 1
     tabPage.BorderSizePixel = 0
@@ -3654,13 +3735,11 @@ function Window:tab(opts)
             end
         end
         if self.closeOverlays then self.closeOverlays() end
-        -- Same rule as the sub-pages: the group itself travels, its contents do
-        -- not, so the text arrives in one piece.
+        -- Same rule as the sub-pages: the page frame itself travels, nothing inside
+        -- it moves, and the travel is one short beat.
         tabPage.Visible = true
-        tabPage.GroupTransparency = 1
-        tabPage.Position = UDim2.new(0, 0, 0, 14)
-        tween(tabPage, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
-        tween(tabPage, 0.36, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        tabPage.Position = UDim2.new(0, 0, 0, 12)
+        tween(tabPage, 0.26, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
         -- The fill slides in from the left as the section opens.
         fillGrad.Offset = Vector2.new(-0.6, 0)
         tween(fill, 0.2, { BackgroundTransparency = 0 }, EASE_SOFT)
@@ -3928,16 +4007,16 @@ end
 
 -- Show or hide the window.
 --
--- The whole window is one CanvasGroup, so this fades every part of it by the same
--- amount, outlines included, and the group rises into place as it does.
+-- The window travels and its shadow fades, and that is the whole animation. It
+-- fades nothing else on purpose: fading a few thousand instances one property at a
+-- time is a hitch, and fading them together needs a CanvasGroup around the window,
+-- which is what was rasterising every label in the interface and costing the text
+-- its edges.
 --
--- It used to scale, and scaling a CanvasGroup costs twice. The rounded corner is a
--- mask over the group's raster, and resampling that mask at a size it was not
--- drawn at leaves thin bright seams along the curve, which is the striping that
--- showed up at the corners while the window arrived. Every glyph in the window is
--- also re-rendered at a fractional size on each frame of the tween, which is the
--- shimmer that came with it. Travel does neither: the raster is finished once and
--- only its blit position changes.
+-- It used to scale as well. A scale re-renders every glyph under it at a fractional
+-- size on each frame of the tween, which is the shimmer that came with it, and it
+-- resamples the rounded corner at sizes it was not drawn at, which is the striping
+-- that showed up along the curve while the window arrived. Travel does neither.
 --
 -- The resting position is remembered rather than assumed, because the window is
 -- draggable and its resting place is wherever it was last left.
@@ -3949,7 +4028,6 @@ function Window:toggle(show)
     self._open = show
     if self.closeOverlays then self.closeOverlays() end
 
-    local body = self._body
     local shade = self._shadow
     if show and not self._resting then self._resting = window.Position end
     local resting = self._resting or window.Position
@@ -3960,13 +4038,11 @@ function Window:toggle(show)
         -- Back out, so it arrives with a little weight and settles rather than
         -- gliding to a stop.
         tween(window, 0.44, { Position = resting }, EASE_POP)
-        if body then tween(body, 0.28, { GroupTransparency = 0 }, EASE_SOFT) end
         if shade then tween(shade, 0.34, { ImageTransparency = 0.55 }, EASE_SOFT) end
     else
         -- Where it sits now is where it should come back to.
         self._resting = window.Position
         resting = self._resting
-        if body then tween(body, 0.18, { GroupTransparency = 1 }, EASE_SOFT) end
         if shade then tween(shade, 0.16, { ImageTransparency = 1 }, EASE_SOFT) end
         -- Leaving accelerates away instead of easing out, which is what stops a
         -- close from feeling like it is being dragged shut.
@@ -4506,20 +4582,17 @@ function Window:notify(opts)
     local height = hasText and 58 or 42
     local offscreen = TOAST_WIDTH + 48
 
-    local toast = newInstance("CanvasGroup")
+    local toast = newInstance("Frame")
     toast.Name = randomName()
     toast.AnchorPoint = Vector2.new(1, 1)
     toast.Size = UDim2.new(0, TOAST_WIDTH, 0, height)
     toast.Position = UDim2.new(1, offscreen, 1, 0)
     toast.BorderSizePixel = 0
-    toast.GroupTransparency = 1
     toast.ZIndex = 200
     toast.Parent = self._toasts
     themed(toast, "BackgroundColor3", "card")
     corner(toast, 10)
-    -- The outline is not composited by GroupTransparency, so it is faded with the
-    -- group by hand.
-    local edge = stateStroke(toast, "stroke")
+    stroke(toast, "stroke", 1, 0.35)
 
     -- Just the icon. It used to sit on a tinted disc, which put a second shape
     -- inside a card that already had one and drew the eye away from the text the
@@ -4563,7 +4636,27 @@ function Window:notify(opts)
         localized(msg, "Text", opts.text)
     end
 
-    local entry = { frame = toast, height = height, y = 0, offX = 0, edge = edge }
+    -- The toast is a frame, so its parts are faded one by one. There are five of
+    -- them, and the alternative was putting the text through a render target.
+    local setAlpha = fadeGroup(toast)
+    setAlpha(0)
+    local function runFade(target, duration)
+        local from = target > 0 and 0 or 1
+        local elapsed = 0
+        local stop
+        stop = addTicker(0, function(dt)
+            if not toast.Parent then
+                if stop then stop() end
+                return
+            end
+            elapsed += dt
+            local t = math.min(elapsed / duration, 1)
+            setAlpha(from + (target - from) * t)
+            if t >= 1 and stop then stop() end
+        end)
+    end
+
+    local entry = { frame = toast, height = height, y = 0, offX = 0 }
 
     -- Lay the stack out from the bottom up. The newest toast is at index one, so
     -- adding one pushes the rest along with a small settle at the end of the
@@ -4591,10 +4684,7 @@ function Window:notify(opts)
             if stack[i] == entry then table.remove(stack, i) end
         end
         entry.offX = offscreen
-        -- The outline sits outside the raster GroupTransparency composites, so it
-        -- fades on exactly the same clock as the fill.
-        tween(edge, 0.28, { Transparency = 1 }, EASE_SOFT)
-        tween(toast, 0.28, { GroupTransparency = 1 }, EASE_SOFT)
+        runFade(0, 0.28)
         local out = tween(toast, 0.34, { Position = UDim2.new(1, offscreen, 1, entry.y) }, EASE)
         out.Completed:Once(function() toast:Destroy() end)
         relayout(true)
@@ -4604,8 +4694,7 @@ function Window:notify(opts)
     -- Older toasts move first, then the new one comes in over the gap it made.
     relayout(true)
     tween(toast, 0.42, { Position = UDim2.new(1, 0, 1, entry.y) }, EASE)
-    tween(toast, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
-    tween(edge, 0.26, { Transparency = 0.35 }, EASE_SOFT)
+    runFade(1, 0.24)
 
     -- Anywhere on the toast dismisses it early.
     local hit = newInstance("TextButton")
@@ -4632,29 +4721,26 @@ end
 -- The watermark, the keybind panel and custom HUDs are the same shell: a small
 -- themed card that lives on the screen instead of inside the window, can be
 -- dragged anywhere and has its position and visibility saved with the config.
---
--- The shell is a CanvasGroup so showing and hiding it fades the whole panel at
--- once, the way the window does, instead of the surface fading while the rows on
--- it stay solid.
 local OVERLAY_Z = 150
 
 local function overlayShell(self, name, opts)
-    local frame = newInstance("CanvasGroup")
+    -- A frame, not a group. These panels are almost nothing but text, and a group
+    -- would put all of it through a render target for the sake of one fade number.
+    -- The fade is done by walking the parts instead, which is affordable here: a
+    -- panel like this is a few dozen instances, not a few thousand.
+    local frame = newInstance("Frame")
     frame.Name = randomName()
     frame.Size = opts.size or UDim2.new(0, 0, 0, 34)
     frame.AutomaticSize = opts.autoSize or Enum.AutomaticSize.X
     frame.Position = opts.position or UDim2.new(0, 16, 0, 16)
     frame.BorderSizePixel = 0
-    frame.GroupTransparency = 1
     frame.ZIndex = OVERLAY_Z
     frame.Parent = self.screen
     themed(frame, "BackgroundColor3", "card")
     corner(frame, opts.radius or 8)
-    -- A UIStroke on a CanvasGroup is drawn on the group's own border, outside the
-    -- raster GroupTransparency composites, so it has to be faded by hand and on
-    -- the same clock. Left alone it was the one thing still on screen after a
-    -- panel had gone.
-    local edge = stroke(frame, "stroke", 1, 0.3)
+    stroke(frame, "stroke", 1, 0.3)
+    -- Everything on the panel fades together, the surface, the outline and the rows.
+    local setAlpha = fadeGroup(frame)
 
     -- A position saved in the config wins over the default one.
     local saved = self._overlayPos and self._overlayPos[name]
@@ -4678,50 +4764,80 @@ local function overlayShell(self, name, opts)
         self._dirty = true
     end)
 
-    -- Show and hide with the same fade the panel came in with. Registered on the
-    -- window so win:showOverlay works on a watermark as well as on a HUD.
+    -- Show and hide. Registered on the window so win:showOverlay works on a
+    -- watermark as well as on a HUD.
     --
-    -- Fade only, no scale: these panels are almost entirely text, and scaling a
-    -- group of labels re-renders the glyphs at a fractional size for the length of
-    -- the tween.
+    -- The panel drops a little as it goes and lifts back into place as it returns, so
+    -- hiding one reads as the panel leaving rather than as the panel being switched
+    -- off. Only the frame's own position moves, and the resting place is restored the
+    -- moment the animation is done, because that position is what the config stores
+    -- and what a drag starts from.
     --
-    -- The first call is the panel appearing, which is not a change the user made,
-    -- so it does not mark the config dirty and trigger a write on startup.
+    -- The first call is the panel appearing, which is not a change the user made, so
+    -- it does not mark the config dirty and trigger a write on startup.
     local settled = false
-    -- The panel drops a little as it goes and lifts back into place as it returns,
-    -- so hiding one reads as the panel leaving rather than as the panel being
-    -- switched off. Only the group's own position moves, and the resting place is
-    -- restored the moment the tween is done, because that position is what the
-    -- config stores and what a drag starts from.
     local LIFT = 12
+    local wantVisible = true
+    local fadeStop = nil
+
     local function liftedFrom(resting)
         return UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + LIFT)
     end
+
+    -- Run the fade on the shared driver, from wherever it currently is, so a toggle
+    -- that interrupts another picks up mid way instead of restarting.
+    local alphaNow = 1
+    local function runFade(target, duration)
+        if fadeStop then
+            fadeStop()
+            fadeStop = nil
+        end
+        local from = alphaNow
+        local elapsed = 0
+        if math.abs(target - from) < 0.01 then
+            alphaNow = target
+            setAlpha(target)
+            return
+        end
+        fadeStop = addTicker(0, function(dt)
+            elapsed += dt
+            local t = math.min(elapsed / duration, 1)
+            alphaNow = from + (target - from) * t
+            setAlpha(alphaNow)
+            if t >= 1 then
+                if fadeStop then fadeStop() fadeStop = nil end
+                -- Hidden only if hiding is still what was asked for. Reading the
+                -- transparency instead let a fast off-then-on land here while the
+                -- panel was on its way back in, and it was switched off behind the
+                -- toggle that said it was on.
+                if not wantVisible then frame.Visible = false end
+            end
+        end)
+    end
+
     self._overlayFade[frame] = function(visible, instant)
         local resting = self._overlayRest[name] or frame.Position
+        wantVisible = visible
         if visible then
             frame.Visible = true
             if instant then
                 frame.Position = resting
-                frame.GroupTransparency = 0
-                edge.Transparency = 0.3
+                alphaNow = 1
+                setAlpha(1)
             else
                 frame.Position = liftedFrom(resting)
                 tween(frame, 0.34, { Position = resting }, EASE)
-                tween(frame, 0.26, { GroupTransparency = 0 }, EASE_SOFT)
-                tween(edge, 0.26, { Transparency = 0.3 }, EASE_SOFT)
+                runFade(1, 0.24)
             end
         elseif instant then
             frame.Position = resting
-            frame.GroupTransparency = 1
-            edge.Transparency = 1
+            alphaNow = 0
+            setAlpha(0)
             frame.Visible = false
         else
-            tween(edge, 0.2, { Transparency = 1 }, EASE_SOFT)
-            tween(frame, 0.2, { GroupTransparency = 1 }, EASE_SOFT)
+            runFade(0, 0.2)
             local out = tween(frame, 0.24, { Position = liftedFrom(resting) }, EASE, Enum.EasingDirection.In)
             out.Completed:Once(function()
-                if frame.GroupTransparency > 0.9 then frame.Visible = false end
                 -- Back to the resting place either way, so an interrupted hide
                 -- cannot leave the panel parked on the lifted offset.
                 frame.Position = self._overlayRest[name] or resting
@@ -4738,8 +4854,9 @@ local function overlayShell(self, name, opts)
     if startVisible then
         self._overlayFade[frame](true)
     else
+        wantVisible = false
+        alphaNow = 0
         frame.Visible = false
-        frame.GroupTransparency = 1
         settled = true
     end
     return frame
@@ -5488,11 +5605,12 @@ function Interface.new(opts)
     self.window = window
     self._shadow = shadow(window)
 
-    local body = newInstance("CanvasGroup")
+    -- A plain frame, not a CanvasGroup. Everything the window draws lives in here,
+    -- and a group would put every label in the interface through a render target.
+    local body = Instance.new("Frame")
     body.Name = randomName()
     body.Size = UDim2.new(1, 0, 1, 0)
     body.BorderSizePixel = 0
-    body.GroupTransparency = 1
     body.ZIndex = 1
     body.Parent = window
     themed(body, "BackgroundColor3", "background")
@@ -5706,14 +5824,13 @@ function Interface.new(opts)
         end))
     end
 
-    -- Opening: the group fades up while it rises the last few pixels into place.
-    -- Same motion the show/hide toggle uses, and for the same reason it is a
-    -- travel and not a scale.
+    -- Opening: the window rises the last few pixels into place with its shadow
+    -- coming up under it. Same motion the show/hide toggle uses, and for the same
+    -- reason it is a travel and not a scale.
     self._resting = window.Position
     window.Position = WINDOW_LIFT(self._resting)
     self._shadow.ImageTransparency = 1
     tween(window, 0.46, { Position = self._resting }, EASE_POP)
-    tween(body, 0.3, { GroupTransparency = 0 }, EASE_SOFT)
     tween(self._shadow, 0.36, { ImageTransparency = 0.55 }, EASE_SOFT)
 
     return self
