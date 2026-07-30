@@ -104,7 +104,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.31.4"
+Interface.version = "2026.07.31.5"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -231,29 +231,36 @@ local TRANS_OF = {
 }
 
 -- Type ------------------------------------------------------------------------
--- One face for the whole interface: Arial Bold. Size and colour carry the
--- hierarchy instead of weight, so a card title and a control label differ by
--- scale rather than by two faces sitting next to each other.
+-- Two faces, and only two, because only two exist.
 --
--- The weight is Bold and not Heavy on purpose. What Roblox serves for the Arial
--- family is Arimo, and it ships two real faces: Regular and Bold. Ask it for a
--- weight it does not have and the client makes one by thickening the Regular
--- glyphs, which grows the letterforms without growing the space between them, so
--- pairs of letters run into each other at small sizes. Bold is a drawn face with
--- its own metrics, so the spacing is the spacing the typeface was designed with.
+-- What Roblox serves for the Arial family is Arimo, and Arimo ships Regular and
+-- Bold. Ask for anything else and the client fakes it by thickening Regular, which
+-- grows the letterforms without growing the space between them, so at fourteen
+-- pixels pairs of letters close up on each other. That is why Heavy was wrong.
 --
--- Roles are still named at the call sites and still resolve through the registry,
--- so a build that wants a second weight only has to hand them different faces,
--- and UI.setFont(family) re-faces a live interface for a language whose glyphs
--- the family does not carry.
+-- Setting every role to Bold to avoid the fake was also wrong, and it is what made
+-- the type look off everywhere while nothing about it was measurably broken. Bold at
+-- thirteen to fifteen pixels is a display weight being used for body copy: the stems
+-- are wide, the counters inside the letters close up, and a paragraph of it reads as
+-- a grey slab. Every other interface uses Regular for anything you actually read and
+-- saves the heavy face for the two or three things that need to stand out, and that
+-- is the difference the eye picks up as "theirs looks normal and ours does not".
+--
+-- So the roles map onto the two real faces by what they are for, not by name:
+--   regular, medium     Regular, everything that gets read
+--   semibold, bold      Bold, titles, brand, section captions
 local FONT_FAMILY = "rbxasset://fonts/families/Arial.json"
-local FONT_WEIGHT = Enum.FontWeight.Bold
+local ROLE_WEIGHT = {
+    regular = Enum.FontWeight.Regular,
+    medium = Enum.FontWeight.Regular,
+    semibold = Enum.FontWeight.Bold,
+    bold = Enum.FontWeight.Bold,
+}
 local ROLES = { "regular", "medium", "semibold", "bold" }
 local FACES = {}
 local function rebuildFaces()
-    local face = Font.new(FONT_FAMILY, FONT_WEIGHT, Enum.FontStyle.Normal)
     for _, role in ipairs(ROLES) do
-        FACES[role] = face
+        FACES[role] = Font.new(FONT_FAMILY, ROLE_WEIGHT[role], Enum.FontStyle.Normal)
     end
 end
 rebuildFaces()
@@ -1503,14 +1510,14 @@ end
 -- when the bar it shades does.
 local BAR_RAMPS = setmetatable({}, { __mode = "k" })
 
-local function rampColours()
+local function rampColours(accent)
     -- The ramp adapts to the colour it is shading, which is the one thing a hardcoded
     -- grey to white sequence could not do. It is a multiply, so these are brightness
     -- factors: the same depth that reads well over cyan takes a dark blue fill most of
     -- the way to black, and over a pale accent on a light theme it reads as dirt. So the
     -- depth comes from how bright the accent is. A bright accent gets the full ramp, a
     -- dark one gets a shallow one.
-    local lit = luminance(PALETTE.accent)
+    local lit = luminance(accent or PALETTE.accent)
     local floor = math.clamp(0.72 - 0.32 * lit, 0.42, 0.86)
     return ColorSequence.new({
         ColorSequenceKeypoint.new(0, Color3.new(floor, floor, floor)),
@@ -1518,8 +1525,8 @@ local function rampColours()
     })
 end
 
-local function refreshBarRamps()
-    local colours = rampColours()
+local function refreshBarRamps(accent)
+    local colours = rampColours(accent)
     for ramp in pairs(BAR_RAMPS) do
         if ramp.Parent then
             ramp.Color = colours
@@ -1844,6 +1851,22 @@ local function openPanel(ctx, cfg)
     local alphaNow = 0
     setAlpha(0)
 
+    -- Show or hide everything on the panel with one write per direct child.
+    --
+    -- Needed because the surface fades and the content does not: a panel on its way out
+    -- would otherwise leave its words hanging in the air over whatever is underneath,
+    -- and with a new panel opening in the same place you get two lists of text on top of
+    -- each other. So the content goes at the moment the panel stops being the panel, and
+    -- only the empty card animates away.
+    --
+    -- Visible on a container hides its whole subtree, so this is a handful of writes
+    -- rather than one per label, and nothing else in the kit writes Visible on these.
+    local function showContent(want)
+        for _, child in ipairs(panel:GetChildren()) do
+            if child:IsA("GuiObject") then child.Visible = want end
+        end
+    end
+
     -- Where the panel is drawn on the vertical axis, as opposed to where it belongs.
     -- place() explains why those are two different things.
     local drawnY = nil
@@ -1941,7 +1964,11 @@ local function openPanel(ctx, cfg)
         -- placement changed its mind and the difference is eased away.
         local anchorY = at.Y
         local target = resting.Y.Offset
-        if drawnY == nil then
+        if drawnY == nil or slideStop then
+            -- Straight through while the panel is arriving or leaving. An auto sized
+            -- panel reports a new height on each of its first few frames, so the place
+            -- it belongs moves several times before it settles: easing that as though it
+            -- were a decision reads as the panel shivering on its way in.
             drawnY = target
         else
             local rowMoved = lastAnchorY and (anchorY - lastAnchorY) or 0
@@ -2034,10 +2061,14 @@ local function openPanel(ctx, cfg)
             -- Comes back from the side it left by, so leaving and returning are one
             -- movement reversed rather than two unrelated ones.
             panel.Visible = true
+            showContent(true)
             slide(lastExit or -CLIP_TRAVEL, 0, 1, 0.3)
         else
+            -- Content off first, so nothing is left readable over the header the panel
+            -- is being moved out from behind.
+            showContent(false)
             lastExit = upward and -CLIP_TRAVEL or CLIP_TRAVEL
-            slide(nil, lastExit, 0, 0.22, function()
+            slide(nil, lastExit, 0, 0.18, function()
                 if not shown and not closed then panel.Visible = false end
             end)
         end
@@ -2088,11 +2119,11 @@ local function openPanel(ctx, cfg)
         shield:Destroy()
         if cfg.onClose then cfg.onClose() end
 
-        -- Leaving is the entry reversed: the panel sinks back under the control it
-        -- came out of while it goes transparent. Driven here rather than through
-        -- slide(), because the closed flag has already stopped that driver and it has
-        -- to stay stopped: it calls place(), and place() reads an anchor the caller
-        -- may be tearing down.
+        -- The content goes at once and the empty card sinks back under the control it
+        -- came out of. Driven here rather than through slide(), because the closed flag
+        -- has already stopped that driver and it has to stay stopped: it calls place(),
+        -- and place() reads an anchor the caller may be tearing down.
+        showContent(false)
         if slideStop then
             slideStop()
             slideStop = nil
@@ -2104,16 +2135,17 @@ local function openPanel(ctx, cfg)
         local base = resting
         local fromOffset = slideOffset
         local fromAlpha = alphaNow
+        local drawn = drawnY or base.Y.Offset
         local elapsed = 0
         local stop
         stop = addTicker(0, function(dt)
             elapsed += dt
-            local t = math.min(elapsed / 0.18, 1)
-            local eased = 1 - (1 - t) ^  3
-            local offset = fromOffset + (10 - fromOffset) * eased
+            local t = math.min(elapsed / 0.14, 1)
+            local eased = 1 - (1 - t) ^ 3
+            local offset = fromOffset + (8 - fromOffset) * eased
             panel.Position = UDim2.new(
                 base.X.Scale, base.X.Offset,
-                base.Y.Scale, base.Y.Offset + offset
+                base.Y.Scale, drawn + offset
             )
             setAlpha(fromAlpha * (1 - eased))
             if t >= 1 then
@@ -3094,11 +3126,16 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
 
         -- The layout is fixed, so the height is worked out rather than measured. Top:
         -- the saturation square and the hue bar, then the opacity bar under them.
-        -- Bottom, stacked upward from the hex field: the recent colours.
+        -- Bottom, stacked upward from the hex field: the recent colours, if there are
+        -- any. The panel is shorter until there are, and grows when the first one is
+        -- recorded, so an untouched picker has no empty strip in it waiting to be filled.
         local ROW_H, ROW_GAP, HEX_H = 22, 8, 28
         local top = 138 + (useAlpha and 28 or 0)
         local recentY = HEX_H + ROW_GAP
-        local panelH = 24 + top + 14 + recentY + ROW_H
+        local shortH = 24 + top + 14 + HEX_H
+        local tallH = shortH + ROW_GAP + ROW_H
+        local hadRecent = #recentColors > 0
+        local panelH = hadRecent and tallH or shortH
 
         local panel, controller = openPanel(ctx, {
             anchor = swatch,
@@ -3365,10 +3402,23 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             for index, hex in ipairs(recentColors) do
                 chipFor(hex, recentRow, index)
             end
-            -- The eighth slot empties the row. It is only drawn when there is
-            -- something to empty, so an untouched picker shows colours and nothing
-            -- else.
-            if #recentColors == 0 then return end
+
+            -- The row takes no height until it has something in it, and the panel grows
+            -- into it when the first colour is recorded. Eased, because the panel is on
+            -- screen while this happens: snapping thirty pixels taller under the pointer
+            -- is the kind of jump that reads as a glitch.
+            local wantRecent = #recentColors > 0
+            recentRow.Visible = wantRecent
+            if wantRecent ~= hadRecent then
+                hadRecent = wantRecent
+                tween(panel, 0.22, {
+                    Size = UDim2.new(0, 232, 0, wantRecent and tallH or shortH),
+                }, EASE)
+            end
+
+            -- The last slot empties the row, and is only drawn when there is something to
+            -- empty.
+            if not wantRecent then return end
             -- The icon on its own, with no surface under it. A filled chip here read as
             -- a ninth colour in a row of colours, which is the one thing it is not.
             local clear = Instance.new("TextButton")
@@ -4493,13 +4543,14 @@ function Window:_buildSearch(parent)
     return box
 end
 
--- Show or hide the window.
+-- Show or hide the window: it travels, and it dissolves through the veil.
 --
--- The window travels and its shadow fades, and that is the whole animation. It
--- fades nothing else on purpose: fading a few thousand instances one property at a
--- time is a hitch, and fading them together needs a CanvasGroup around the window,
--- which is what was rasterising every label in the interface and costing the text
--- its edges.
+-- The veil is a sheet of the background colour over the whole window, and it is the
+-- only reason the window has a fade at all. Fading the window itself means writing a
+-- transparency onto a few thousand instances, and doing that in one write needs a
+-- CanvasGroup around all of them, which is what put every label in the interface
+-- through a render target. Fading a sheet over the top is one property on one frame
+-- and no glyph is touched.
 --
 -- It used to scale as well. A scale re-renders every glyph under it at a fractional
 -- size on each frame of the tween, which is the shimmer that came with it, and it
@@ -4508,6 +4559,9 @@ end
 --
 -- The resting position is remembered rather than assumed, because the window is
 -- draggable and its resting place is wherever it was last left.
+local WINDOW_IN = 0.34
+local WINDOW_OUT = 0.18
+
 function Window:toggle(show)
     local window = self.window
     if show == nil then show = not window.Visible end
@@ -4520,30 +4574,61 @@ function Window:toggle(show)
     if show and not self._resting then self._resting = window.Position end
     local resting = self._resting or window.Position
 
+    -- One driver for the whole thing, so the travel and the dissolve cannot come apart.
+    -- It runs from wherever the veil currently is, which is what lets a fast off and on
+    -- pick up mid animation instead of starting over.
+    if self._veilStop then
+        self._veilStop()
+        self._veilStop = nil
+    end
+    local veil = self._veil
+    local from = self._veilAlpha or (show and 0 or 1)
+    local target = show and 1 or 0
+    local liftFrom = show and WINDOW_LIFT(resting) or window.Position
+    local liftTo = show and resting or WINDOW_LIFT(resting)
+    local duration = show and WINDOW_IN or WINDOW_OUT
+
     if show then
         window.Visible = true
-        window.Position = WINDOW_LIFT(resting)
-        -- Back out, so it arrives with a little weight and settles rather than
-        -- gliding to a stop.
-        tween(window, 0.44, { Position = resting }, EASE_POP)
-        if shade then tween(shade, 0.34, { ImageTransparency = 0.55 }, EASE_SOFT) end
+        window.Position = liftFrom
+        if shade then tween(shade, 0.3, { ImageTransparency = 0.55 }, EASE_SOFT) end
     else
-        -- Where it sits now is where it should come back to.
         self._resting = window.Position
         resting = self._resting
-        if shade then tween(shade, 0.16, { ImageTransparency = 1 }, EASE_SOFT) end
-        -- Leaving accelerates away instead of easing out, which is what stops a
-        -- close from feeling like it is being dragged shut.
-        local out = tween(window, 0.2, { Position = WINDOW_LIFT(resting) }, EASE, Enum.EasingDirection.In)
-        out.Completed:Once(function()
+        liftTo = WINDOW_LIFT(resting)
+        if shade then tween(shade, 0.14, { ImageTransparency = 1 }, EASE_SOFT) end
+    end
+
+    if veil then veil.Visible = true end
+    local elapsed = 0
+    self._veilStop = addTicker(0, function(dt)
+        elapsed += dt
+        local t = math.min(elapsed / duration, 1)
+        -- Arriving settles, leaving accelerates away. A close that eases out reads as
+        -- the window being dragged shut.
+        local eased = show and (1 - (1 - t) ^ 4) or (t * t)
+        local alpha = from + (target - from) * eased
+        self._veilAlpha = alpha
+        if veil then veil.BackgroundTransparency = alpha end
+        window.Position = UDim2.new(
+            liftFrom.X.Scale,
+            math.floor(liftFrom.X.Offset + (liftTo.X.Offset - liftFrom.X.Offset) * eased + 0.5),
+            liftFrom.Y.Scale,
+            math.floor(liftFrom.Y.Offset + (liftTo.Y.Offset - liftFrom.Y.Offset) * eased + 0.5)
+        )
+        if t >= 1 then
+            if self._veilStop then self._veilStop() self._veilStop = nil end
+            -- Off either way: it has nothing to do between animations, and a sheet over
+            -- the interface that is not needed is a sheet that can catch a click.
+            if veil then veil.Visible = false end
             if not self._open then
                 window.Visible = false
-                -- Put it back, so the next open starts from the resting place and
-                -- a drag never inherits the lifted offset.
+                -- Put it back, so the next open starts from the resting place and a drag
+                -- never inherits the lifted offset.
                 window.Position = resting
             end
-        end)
-    end
+        end
+    end)
 end
 
 -- Recolour every part that follows this palette key, then refresh the dynamic
@@ -4561,7 +4646,9 @@ end
 -- same key while the first is still running picks up from the colour that is
 -- actually on screen, so dragging a colour picker trails the pointer smoothly
 -- instead of stepping.
-local THEME_FADE = 0.12
+-- Long enough to read as a colour moving rather than a colour being replaced. A tenth
+-- of a second is six frames, which is short enough that the eye takes it as a step.
+local THEME_FADE = 0.22
 local themeFade = {}
 local themeFadeStop = nil
 
@@ -4574,14 +4661,19 @@ local function paintKey(key, color, alpha)
             fadeProp(inst, entry.prop, alpha)
         end
     end)
+    -- The shading over a filled bar is derived from the accent, so it follows the colour
+    -- that is on screen rather than the one being headed for. Rebuilding it once at the
+    -- start instead meant the bar's fill eased while its shading jumped.
+    if key == "accent" then refreshBarRamps(color) end
 end
 
 local function driveThemeFade(dt)
     local running = false
     for key, state in pairs(themeFade) do
         state.t = math.min(state.t + dt / THEME_FADE, 1)
-        -- Ease out, so the last part of the change is the gentle part.
-        local a = 1 - (1 - state.t) * (1 - state.t)
+        -- Cubic out: most of the distance early, the last of it gently, which is what
+        -- makes a colour change read as one movement.
+        local a = 1 - (1 - state.t) ^ 3
         state.shown = state.from:Lerp(state.to, a)
         state.shownAlpha = state.alphaFrom + (state.alphaTo - state.alphaFrom) * a
         paintKey(key, state.shown, state.shownAlpha)
@@ -4606,10 +4698,6 @@ local function applyKey(key, new, alpha)
 
     PALETTE[key] = new
     PALETTE_A[key] = alpha
-    -- The shading over every filled bar is derived from the accent, so it is rebuilt
-    -- with it. Set at once rather than eased: it is a brightness ramp over a colour that
-    -- is already easing, and easing both reads as the bar changing twice.
-    if key == "accent" then refreshBarRamps() end
 
     if from == new and alphaFrom == alpha then
         themeFade[key] = nil
@@ -6250,6 +6338,28 @@ function Interface.new(opts)
     overlay.Parent = window
     self.overlay = overlay
 
+    -- The window's fade, and the only way it has one.
+    --
+    -- Fading the window itself would mean writing a transparency onto a few thousand
+    -- instances, and doing it in one write needs a CanvasGroup around all of them, which
+    -- is what put every label in the interface through a render target. So the window
+    -- does not fade: a sheet of the background colour over the top of it does, and the
+    -- window appears to dissolve out of its own background. One property, on one frame,
+    -- and no glyph is touched.
+    --
+    -- Only drawn while an animation is running, and never able to take a click.
+    local veil = Instance.new("Frame")
+    veil.Name = randomName()
+    veil.Size = UDim2.new(1, 0, 1, 0)
+    veil.BorderSizePixel = 0
+    veil.Active = false
+    veil.Visible = false
+    veil.ZIndex = 60
+    veil.Parent = window
+    themed(veil, "BackgroundColor3", "background", { fade = false })
+    corner(veil, 12)
+    self._veil = veil
+
     -- Close the floating panels, newest first. With keepPopovers the gear
     -- settings popovers stay open, so a dropdown or a colour picker opened from
     -- inside one does not take its host down with it. Tab switches, hiding the
@@ -6349,14 +6459,14 @@ function Interface.new(opts)
         end))
     end
 
-    -- Opening: the window rises the last few pixels into place with its shadow
-    -- coming up under it. Same motion the show/hide toggle uses, and for the same
-    -- reason it is a travel and not a scale.
+    -- The first open goes through the same path as every one after it, so there is one
+    -- description of what opening the window looks like rather than two that drift.
     self._resting = window.Position
-    window.Position = WINDOW_LIFT(self._resting)
     self._shadow.ImageTransparency = 1
-    tween(window, 0.46, { Position = self._resting }, EASE_POP)
-    tween(self._shadow, 0.36, { ImageTransparency = 0.55 }, EASE_SOFT)
+    self._veilAlpha = 0
+    self._open = false
+    window.Visible = false
+    self:toggle(true)
 
     return self
 end
