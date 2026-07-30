@@ -104,7 +104,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.31.2"
+Interface.version = "2026.07.31.3"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -287,17 +287,91 @@ Interface.contrastOn = contrastOn
 -- Recently used colours, shared by every picker in the session and saved with the
 -- config. Theming an interface means going back and forth between a handful of
 -- colours, and typing a hex code again each time is the slow way round.
-local RECENT_MAX = 8
+-- Seven, not eight: the eighth slot in the row is the button that empties it.
+local RECENT_MAX = 7
 local recentColors = {}
 Interface.recentColors = recentColors
 
+-- One colour, however it was written, as six upper case hex digits. A Color3 is
+-- recognised by carrying an R channel rather than by its type name, which keeps this
+-- working for a { r, g, b } table as well.
+local function normaliseHex(value)
+    if type(value) == "string" then
+        local hex = string.upper((string.gsub(value, "#", "")))
+        if #hex == 6 and string.match(hex, "^%x+$") then return hex end
+        return nil
+    end
+    local ok, red = pcall(function() return value.R end)
+    if ok and type(red) == "number" then
+        return string.format(
+            "%02X%02X%02X",
+            math.floor(value.R * 255 + 0.5),
+            math.floor(value.G * 255 + 0.5),
+            math.floor(value.B * 255 + 0.5)
+        )
+    end
+    if type(value) == "table" and type(value[1]) == "number" then
+        return string.format("%02X%02X%02X", value[1], value[2] or 0, value[3] or 0)
+    end
+    return nil
+end
+
 local function pushRecent(rgb)
-    local hex = string.format("%02X%02X%02X", rgb[1] or 0, rgb[2] or 0, rgb[3] or 0)
+    local hex = normaliseHex(rgb)
+    if not hex then return end
     for i = #recentColors, 1, -1 do
         if recentColors[i] == hex then table.remove(recentColors, i) end
     end
     table.insert(recentColors, 1, hex)
     while #recentColors > RECENT_MAX do table.remove(recentColors) end
+end
+
+-- Empty the row. The table is cleared in place rather than replaced, because
+-- Interface.recentColors is the same table a script may already be holding.
+function Interface.clearRecentColors()
+    table.clear(recentColors)
+end
+
+-- Put a colour at the front of the row by hand, for a build that wants to seed it
+-- from somewhere of its own. Same rules as a colour the picker records: duplicates
+-- move up rather than repeat, and the row keeps its length.
+function Interface.pushRecentColor(value)
+    pushRecent(value)
+end
+
+-- Fixed swatches every picker offers, above the recent row. A build with a house
+-- palette sets these once; a single picker can override them with opts.swatches.
+-- Empty by default, and an empty list means the row is not drawn at all rather than
+-- drawn empty.
+local swatches = {}
+Interface.swatches = swatches
+
+-- Accepts hex strings, { r, g, b } triples or Color3 values, in any mix, and hands
+-- back hex strings with the duplicates and the malformed entries dropped.
+local function swatchHexList(list)
+    local out, seen = {}, {}
+    if type(list) ~= "table" then return out end
+    for _, entry in ipairs(list) do
+        local hex = normaliseHex(entry)
+        if hex and not seen[hex] then
+            seen[hex] = true
+            out[#out + 1] = hex
+        end
+    end
+    return out
+end
+
+-- Replace the house palette. Filled in place, because the module table is frozen
+-- and because Interface.swatches is the same table a script may be holding. Rubbish
+-- is dropped here rather than at draw time, so a build finds out its palette was
+-- wrong by reading it back, not by opening a picker.
+function Interface.setSwatches(list)
+    local kept = swatchHexList(list)
+    table.clear(swatches)
+    for index, hex in ipairs(kept) do
+        swatches[index] = hex
+    end
+    return swatches
 end
 
 -- The accent, lifted or dropped until it can be seen against the surface it is
@@ -611,17 +685,76 @@ end
 -- listener instead of connecting on their own, so a window with a few hundred
 -- controls costs three connections instead of a few hundred that all wake up on
 -- every mouse move.
+--
+-- The three are also opened on the first listener and closed after the last one goes.
+-- Roblox drops a connection when the instance it was made on is destroyed, but these
+-- are on a service, so nothing destroys them: connected at load, they would still be
+-- running after the interface had been unloaded, iterating over an empty table on
+-- every mouse move for the rest of the session.
 local keyListeners = {}
+local keyListenerCount = 0
 local activeDrag = nil
+local inputConns = nil
 
 local function isPointer(inputType)
     return inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch
 end
 
+-- Declared ahead of the hub, because the release handler inside it closes the hub when
+-- the drag it was waiting for is the last thing that needed it.
+local closeInputHub
+
+local function openInputHub()
+    if inputConns then return end
+    inputConns = {
+        UserInputService.InputBegan:Connect(function(input, gpe)
+            for fn in pairs(keyListeners) do
+                local ok, err = pcall(fn, input, gpe)
+                if not ok then log("warn", "input listener: " .. tostring(err)) end
+            end
+        end),
+        UserInputService.InputChanged:Connect(function(input)
+            local drag = activeDrag
+            if not drag then return end
+            local kind = input.UserInputType
+            if kind == Enum.UserInputType.MouseMovement or kind == Enum.UserInputType.Touch then
+                drag.move(input.Position.X, input.Position.Y)
+            end
+        end),
+        UserInputService.InputEnded:Connect(function(input)
+            local drag = activeDrag
+            if drag and isPointer(input.UserInputType) then
+                activeDrag = nil
+                if drag.stop then drag.stop() end
+                closeInputHub()
+            end
+        end),
+    }
+end
+
+closeInputHub = function()
+    -- A drag in flight still needs the move and release signals.
+    if not inputConns or keyListenerCount > 0 or activeDrag then return end
+    local conns = inputConns
+    inputConns = nil
+    for _, conn in ipairs(conns) do
+        conn:Disconnect()
+    end
+end
+
 -- Register a key / mouse button listener: fn(input, gameProcessed).
 local function onKey(fn)
-    keyListeners[fn] = true
-    return function() keyListeners[fn] = nil end
+    if not keyListeners[fn] then
+        keyListeners[fn] = true
+        keyListenerCount += 1
+        openInputHub()
+    end
+    return function()
+        if not keyListeners[fn] then return end
+        keyListeners[fn] = nil
+        keyListenerCount -= 1
+        closeInputHub()
+    end
 end
 
 -- Take over the pointer. handlers.move(x, y) runs while it moves, handlers.stop()
@@ -630,42 +763,37 @@ end
 local function beginDrag(handlers)
     local previous = activeDrag
     activeDrag = handlers
+    openInputHub()
     if previous and previous.stop then previous.stop() end
 end
-
-UserInputService.InputBegan:Connect(function(input, gpe)
-    for fn in pairs(keyListeners) do
-        local ok, err = pcall(fn, input, gpe)
-        if not ok then log("warn", "input listener: " .. tostring(err)) end
-    end
-end)
-
-UserInputService.InputChanged:Connect(function(input)
-    local drag = activeDrag
-    if not drag then return end
-    local kind = input.UserInputType
-    if kind == Enum.UserInputType.MouseMovement or kind == Enum.UserInputType.Touch then
-        drag.move(input.Position.X, input.Position.Y)
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    local drag = activeDrag
-    if drag and isPointer(input.UserInputType) then
-        activeDrag = nil
-        if drag.stop then drag.stop() end
-    end
-end)
 
 -- Frame driver ----------------------------------------------------------------
 -- Everything that shows a live value (watermark, keybind panel, HUD, the brand
 -- gradient) shares one RenderStepped connection and runs on its own interval, so
 -- a panel that only needs a few updates a second is not rebuilt every frame.
+--
+-- Opened with the first timer and closed after the last one, for the same reason the
+-- input hub is: RenderStepped belongs to a service, so a connection left on it
+-- outlives everything the kit built and keeps waking up once a frame to find nothing
+-- to do.
 local tickers = {}
+local tickerCount = 0
 local tickerConn = nil
+
+local function dropTicker(entry)
+    if not tickers[entry] then return end
+    tickers[entry] = nil
+    tickerCount -= 1
+    if tickerCount <= 0 and tickerConn then
+        tickerConn:Disconnect()
+        tickerConn = nil
+    end
+end
+
 local function addTicker(interval, fn)
     local entry = { interval = interval or 0, acc = interval or 0, fn = fn }
     tickers[entry] = true
+    tickerCount += 1
     if not tickerConn then
         tickerConn = RunService.RenderStepped:Connect(function(dt)
             for e in pairs(tickers) do
@@ -677,14 +805,14 @@ local function addTicker(interval, fn)
                     -- object) must not take the whole driver down with it.
                     local ok, err = pcall(e.fn, step)
                     if not ok then
-                        tickers[e] = nil
+                        dropTicker(e)
                         log("warn", "timer stopped: " .. tostring(err))
                     end
                 end
             end
         end)
     end
-    return function() tickers[entry] = nil end
+    return function() dropTicker(entry) end
 end
 
 -- Viewport size, used to keep dragged panels and floating lists on screen.
@@ -693,28 +821,41 @@ local function viewport()
     return (cam and cam.ViewportSize) or Vector2.new(1920, 1080)
 end
 
+-- Round down to an even number. The card area is split in two by a scale of 0.5, so
+-- an odd width there puts the right hand column, every card on it and every label on
+-- those cards half a pixel off the grid. Text sampled between pixels is the whole of
+-- what "the font looks wrong" turned out to be, and this is the half of it that no
+-- amount of choosing fonts would have fixed.
+local function evenDown(value)
+    local n = math.floor(value)
+    return n - (n % 2)
+end
+
 -- How big the window should be on this screen.
 --
 -- A fixed 900 by 580 covered almost all of a 1366 by 768 laptop and looked like a
 -- postage stamp on a 4K monitor. This takes a share of the viewport and clamps it,
 -- so the window is the same shape everywhere and always leaves the game visible
--- around it. Whole pixels, so a border never lands on a half pixel and turns grey.
--- The share is set so a 1920 by 1080 screen lands on 902 by 583, near enough the
--- size this kit was designed at. A smaller screen gets a smaller window and a
--- larger one stops growing, rather than the window taking the same share of a 4K
--- monitor and turning into a wall.
+-- around it. The share is set so a 1920 by 1080 screen lands on 902 by 582, near
+-- enough the size this kit was designed at. A smaller screen gets a smaller window
+-- and a larger one stops growing, rather than the window taking the same share of a
+-- 4K monitor and turning into a wall.
+--
+-- Both dimensions come back even, and so does the sidebar, which keeps the width left
+-- for the cards even as well: page width is window minus sidebar minus a 48 margin,
+-- and even minus even minus even is even.
 local function windowFit(view)
-    local w = math.clamp(math.floor(view.X * 0.47), 600, 920)
-    local h = math.clamp(math.floor(view.Y * 0.54), 380, 600)
-    w = math.min(w, math.max(320, view.X - 32))
-    h = math.min(h, math.max(260, view.Y - 32))
+    local w = math.clamp(evenDown(view.X * 0.47), 600, 920)
+    local h = math.clamp(evenDown(view.Y * 0.54), 380, 600)
+    w = math.min(w, math.max(320, evenDown(view.X - 32)))
+    h = math.min(h, math.max(260, evenDown(view.Y - 32)))
     return w, h
 end
 
 -- The sidebar takes a quarter of the window, within reason: below about 176 the tab
 -- names start truncating, above 240 it is just empty space.
 local function sidebarFit(windowWidth)
-    return math.clamp(math.floor(windowWidth * 0.255), 176, 240)
+    return math.clamp(evenDown(windowWidth * 0.255), 176, 240)
 end
 
 -- Keep a detached panel on screen. A config written on a large monitor puts panels
@@ -1325,30 +1466,54 @@ local FADE_PROPS = {
     ScrollBarImageTransparency = true,
 }
 
+-- A part's resting transparency is read once, the first time that part is seen,
+-- and never read again. Reading it a second time is the trap: the list is rebuilt
+-- when the panel gains or loses a child, that can happen while the panel is faded
+-- out, and the second read then takes the faded value for the resting one. The
+-- panel has nothing left to come back to and stays invisible for good.
+--
+-- Two things hit exactly that. A toast gains its click target immediately after
+-- the first setAlpha(0), so every notification went out invisible. And a HUD given
+-- a row while it was hidden lost its whole panel the same way.
 local function fadeGroup(root)
+    local bases = {}
     local parts, count = {}, -1
+
     local function rebuild(kids)
         count = #kids
         table.clear(parts)
-        -- The root itself as well as its children: the panel's own surface and its
-        -- outline have to go with the rows on it.
-        for prop in pairs(FADE_PROPS) do
-            local ok, base = pcall(function() return root[prop] end)
-            if ok and type(base) == "number" then
-                parts[#parts + 1] = { node = root, prop = prop, base = base }
-            end
-        end
-        for _, node in ipairs(kids) do
-            for prop in pairs(FADE_PROPS) do
-                -- A number only. UIGradient also has a Transparency, and it is a
-                -- NumberSequence, which is not something to interpolate here.
-                local ok, base = pcall(function() return node[prop] end)
-                if ok and type(base) == "number" then
-                    parts[#parts + 1] = { node = node, prop = prop, base = base }
+        -- Rebuilt rather than added to, so parts that have been destroyed drop out
+        -- instead of collecting in a panel whose rows churn.
+        local kept = {}
+
+        local function collect(node)
+            local slots = bases[node]
+            if slots == nil then
+                slots = {}
+                for prop in pairs(FADE_PROPS) do
+                    -- Numbers only. UIGradient carries a Transparency as well and
+                    -- it is a NumberSequence, not something to interpolate here.
+                    local ok, base = pcall(function() return node[prop] end)
+                    if ok and type(base) == "number" then
+                        slots[prop] = base
+                    end
                 end
             end
+            kept[node] = slots
+            for prop, base in pairs(slots) do
+                parts[#parts + 1] = { node = node, prop = prop, base = base }
+            end
         end
+
+        -- The root itself as well as its children: the panel's own surface and its
+        -- outline have to go with the rows on it.
+        collect(root)
+        for _, node in ipairs(kids) do
+            collect(node)
+        end
+        bases = kept
     end
+
     -- alpha 1 is fully visible, 0 is gone.
     return function(alpha)
         local kids = root:GetDescendants()
@@ -1367,23 +1532,100 @@ local function WINDOW_LIFT(resting)
     return UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + WINDOW_RISE)
 end
 
+-- Swap one page for another.
+--
+-- The arriving page travels in from the side the selection moved towards and the
+-- leaving page goes out the other way, so a section change says which direction it
+-- went. Both of those were the complaint: every page used to arrive from the same
+-- place whichever one you came from, and the page you left vanished in a single frame
+-- while the new one was still sliding, which read as unfinished rather than as a
+-- change of section.
+--
+-- Only the two page frames move. Nothing inside them is touched, and nothing fades:
+-- fading a page means fading every card on it, and doing that in one write is what a
+-- CanvasGroup was for, which is what was costing the text its edges. The container
+-- clips instead, so a page is masked at the edge of the content area.
+--
+-- Leaving is quicker than arriving, and accelerates away while the new page eases in.
+-- Matching the two made the pair look like one rigid strip being dragged past.
+local PAGE_IN = 0.3
+local PAGE_OUT = 0.17
+
+-- Which page each frame is meant to end up as, so a quick change and change back
+-- cannot let an exit that is still running hide the page now being looked at. Weak
+-- keys: a page that has been destroyed should not be kept alive by this.
+local pageIntent = setmetatable({}, { __mode = "k" })
+
+local function pageAt(horizontal, amount)
+    if horizontal then return UDim2.new(0, amount, 0, 0) end
+    return UDim2.new(0, 0, 0, amount)
+end
+
+-- direction is 1 when the selection moved forward (down the sidebar, right along the
+-- sub-tab bar) and -1 when it moved back.
+local function swapPages(leaving, arriving, horizontal, distance, direction)
+    local home = UDim2.new(0, 0, 0, 0)
+    local enter = distance * (direction < 0 and -1 or 1)
+
+    if leaving and leaving ~= arriving and leaving.Visible then
+        pageIntent[leaving] = false
+        local going = leaving
+        local out = tween(going, PAGE_OUT, { Position = pageAt(horizontal, -enter) }, EASE, Enum.EasingDirection.In)
+        out.Completed:Once(function()
+            -- Only if leaving is still what it is meant to do.
+            if pageIntent[going] == false then
+                going.Visible = false
+                going.Position = home
+            end
+        end)
+    end
+
+    pageIntent[arriving] = true
+    arriving.Visible = true
+    arriving.Position = pageAt(horizontal, enter)
+    tween(arriving, PAGE_IN, { Position = home }, EASE)
+end
+
 -- Gentle icon colour transition.
 local function tintIcon(img, color)
     tween(img, 0.18, { ImageColor3 = color }, EASE_SOFT)
 end
 
--- The shading on a filled bar. A gradient modulates the fill it sits on, so this
--- is a brightness ramp rather than a second colour and it keeps working after the
--- accent is changed. Every bar in the kit uses it, sliders and progress rows
--- alike: one bar shaded and the next one flat reads as a mistake.
+-- The shading on a filled bar.
+--
+-- A gradient modulates the fill it sits on, so this is a brightness ramp rather than
+-- a second colour: it works on any accent and on any theme, and it keeps working
+-- after either is changed, with nothing to re-register. Every bar in the kit uses it,
+-- sliders and progress rows alike, because one bar shaded and the next one flat reads
+-- as a mistake.
+--
+-- What it has to adapt to is its own width. A gradient spans the element it is on and
+-- a fill is only as wide as its value, so left alone the entire ramp is crushed into
+-- a bar sitting at ten percent: a short bar was shaded as steeply as a full one and
+-- ended up visibly darker at the same point on the track. So the far end of the ramp
+-- is rewritten from the ratio, and the bar always shows the ramp from its start up to
+-- its own share of it. The slope is then the same at every value, which is what makes
+-- it read as one piece of shading across the track rather than per bar decoration.
+local BAR_RAMP_FLOOR = 0.48
 local function barRamp(fill)
     local ramp = newInstance("UIGradient")
-    ramp.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(122, 122, 122)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
-    })
+    local applied = nil
+    local function setSpan(ratio)
+        ratio = math.clamp(tonumber(ratio) or 1, 0, 1)
+        -- Rounded to a fiftieth: a slider drag would otherwise rebuild the sequence
+        -- on every frame for a change nobody can see.
+        ratio = math.floor(ratio * 50 + 0.5) / 50
+        if applied == ratio then return end
+        applied = ratio
+        local far = BAR_RAMP_FLOOR + (1 - BAR_RAMP_FLOOR) * ratio
+        ramp.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.new(BAR_RAMP_FLOOR, BAR_RAMP_FLOOR, BAR_RAMP_FLOOR)),
+            ColorSequenceKeypoint.new(1, Color3.new(far, far, far)),
+        })
+    end
+    setSpan(1)
     ramp.Parent = fill
-    return ramp
+    return setSpan
 end
 
 -- Hover on a filled surface: the fill lifts to the hover colour and nothing else
@@ -1473,33 +1715,50 @@ end
 -- Drag a frame by a handle. The frame is kept on screen (a margin of it always
 -- stays inside the viewport) and onDrop fires once the pointer is released, so
 -- the overlays can persist their new position.
+-- Take a press and turn it into a drag of the frame. Split out from makeDraggable
+-- because the window has a second way in: a press that lands on its title strip
+-- while a floating panel is open arrives at the panel's click catcher instead of at
+-- the strip, and it has to be handed on rather than swallowed.
+local function startDrag(frame, input, onDrop)
+    local origin = input.Position
+    local startPos = frame.Position
+    local startAbs = frame.AbsolutePosition
+    local size = frame.AbsoluteSize
+    local view = viewport()
+    beginDrag({
+        move = function(x, y)
+            local wantX = startAbs.X + (x - origin.X)
+            local wantY = startAbs.Y + (y - origin.Y)
+            local keptX = math.clamp(wantX, 40 - size.X, view.X - 40)
+            local keptY = math.clamp(wantY, 0, view.Y - 28)
+            -- Whole pixels only. A frame parked on a fractional offset is sampled
+            -- between pixels, and text on it comes out soft.
+            frame.Position = UDim2.new(
+                startPos.X.Scale, math.floor(startPos.X.Offset + (keptX - startAbs.X) + 0.5),
+                startPos.Y.Scale, math.floor(startPos.Y.Offset + (keptY - startAbs.Y) + 0.5)
+            )
+        end,
+        stop = function()
+            if onDrop then onDrop(frame) end
+        end,
+    })
+end
+
+-- Is this press inside the rectangle of that element?
+local function pressedOver(input, element)
+    if not (element and element.Parent) then return false end
+    local at = input.Position
+    local origin = element.AbsolutePosition
+    local size = element.AbsoluteSize
+    return at.X >= origin.X and at.X <= origin.X + size.X
+        and at.Y >= origin.Y and at.Y <= origin.Y + size.Y
+end
+
 local function makeDraggable(frame, handle, onDrop)
     handle.Active = true
     handle.InputBegan:Connect(function(input)
         if not isPointer(input.UserInputType) then return end
-        local origin = input.Position
-        local startPos = frame.Position
-        local startAbs = frame.AbsolutePosition
-        local size = frame.AbsoluteSize
-        local view = viewport()
-        beginDrag({
-            move = function(x, y)
-                local wantX = startAbs.X + (x - origin.X)
-                local wantY = startAbs.Y + (y - origin.Y)
-                local keptX = math.clamp(wantX, 40 - size.X, view.X - 40)
-                local keptY = math.clamp(wantY, 0, view.Y - 28)
-                -- Whole pixels only. A frame parked on a fractional offset is
-                -- sampled between pixels, and on a CanvasGroup that means every
-                -- glyph inside it comes out soft.
-                frame.Position = UDim2.new(
-                    startPos.X.Scale, math.floor(startPos.X.Offset + (keptX - startAbs.X) + 0.5),
-                    startPos.Y.Scale, math.floor(startPos.Y.Offset + (keptY - startAbs.Y) + 0.5)
-                )
-            end,
-            stop = function()
-                if onDrop then onDrop(frame) end
-            end,
-        })
+        startDrag(frame, input, onDrop)
     end)
 end
 
@@ -1616,11 +1875,11 @@ local function openPanel(ctx, cfg)
     backdrop.ZIndex = zBase
     backdrop.Parent = ctx.overlay
 
-    -- The panel is a CanvasGroup, which is not a button, so a click that lands on
-    -- its padding rather than on one of its controls went straight through to the
-    -- catcher underneath and closed the thing that was being clicked. The shield
-    -- swallows those. It is inflated a little past the panel as well, so nearly
-    -- missing the edge of an open panel does nothing instead of dismissing it.
+    -- The panel itself is not a button, so a click landing on its padding rather
+    -- than on one of its controls went straight through to the catcher underneath
+    -- and closed the thing that was being clicked. The shield swallows those. It is
+    -- inflated a little past the panel as well, so nearly missing the edge of an
+    -- open panel does nothing instead of dismissing it.
     local SHIELD_MARGIN = 10
     local shield = newInstance("TextButton")
     shield.Name = randomName()
@@ -1630,18 +1889,24 @@ local function openPanel(ctx, cfg)
     shield.ZIndex = zBase + 1
     shield.Parent = ctx.overlay
 
-    local panel = newInstance("CanvasGroup")
+    -- A frame, not a CanvasGroup. This was the last group in the kit with text in
+    -- it, and it had all of it: every dropdown option, every hex field, every
+    -- control inside a gear popover. A group rasterises its children into a texture
+    -- and blits that, and text through a render target comes out softer than text
+    -- drawn straight to the screen, which is why the labels on an open panel never
+    -- matched the labels on the card behind it.
+    local panel = newInstance("Frame")
     panel.Name = randomName()
     panel.Size = UDim2.new(0, width, 0, cfg.height or 0)
     panel.AutomaticSize = Enum.AutomaticSize.Y
     panel.BorderSizePixel = 0
-    panel.GroupTransparency = 1
     panel.ZIndex = zBase + 2
     panel.Parent = ctx.overlay
     themed(panel, "BackgroundColor3", "card")
     corner(panel, cfg.radius or 10)
-    -- A stroke is not composited by GroupTransparency, so it fades on its own.
-    local edge = stateStroke(panel, "stroke")
+    -- 0.35 is the outline's resting opacity and the fade treats it as the floor, so
+    -- the border arrives with the fill instead of ahead of it.
+    stroke(panel, "stroke", 1, 0.35)
 
     local scroller = scrollerOf(anchor)
     local controller, closed = nil, false
@@ -1658,6 +1923,16 @@ local function openPanel(ctx, cfg)
     -- can both be in flight and the panel is drawn from the sum of them.
     local slideOffset = 0
     local slideStop = nil
+    -- Which way the panel went when its row was scrolled out, so it can come back
+    -- the same way.
+    local lastExit = nil
+    -- Without a group there is no one number to fade, so the parts are written
+    -- directly. The list is built on first use and rebuilt when the panel gains
+    -- children, which is what happens the frame after it opens: the caller fills it
+    -- in after openPanel returns.
+    local setAlpha = fadeGroup(panel)
+    local alphaNow = 0
+    setAlpha(0)
 
     local function syncShield()
         local size = panel.AbsoluteSize
@@ -1687,13 +1962,25 @@ local function openPanel(ctx, cfg)
         )
     end
 
-    -- Move the offset between two values on the shared frame driver.
-    local function slide(from, to, duration)
+    -- Move the offset and the opacity together on the shared frame driver.
+    --
+    -- One ticker for both, because they have to agree: a travel that outlasts its
+    -- fade leaves the panel sliding after it is already fully drawn, which is the
+    -- thing that read as broken everywhere else in this kit. Both start and finish
+    -- on the same frame, and both pick up from where they are, so a panel that is
+    -- scrolled out and back mid animation does not restart.
+    --
+    -- The travel eases out on a quint and the opacity on a sine: an overshoot on a
+    -- position settles, an overshoot on a transparency clips and flickers.
+    -- offsetFrom nil means carry on from wherever the panel currently is.
+    local function slide(offsetFrom, offsetTo, alphaTo, duration, onDone)
         if slideStop then
             slideStop()
             slideStop = nil
         end
-        slideOffset = from
+        if offsetFrom then slideOffset = offsetFrom end
+        offsetFrom = slideOffset
+        local alphaFrom = alphaNow
         local elapsed = 0
         slideStop = addTicker(0, function(dt)
             if closed then
@@ -1702,48 +1989,58 @@ local function openPanel(ctx, cfg)
             end
             elapsed += dt
             local t = math.min(elapsed / duration, 1)
-            -- Quint out, the same curve the tweened parts of the kit travel on.
-            local eased = 1 - (1 - t) ^ 5
-            slideOffset = from + (to - from) * eased
-            if t >= 1 then
-                slideOffset = to
-                if slideStop then slideStop() slideStop = nil end
-            end
+            slideOffset = offsetFrom + (offsetTo - offsetFrom) * (1 - (1 - t) ^ 5)
+            alphaNow = alphaFrom + (alphaTo - alphaFrom) * math.sin(t * math.pi / 2)
+            setAlpha(alphaNow)
             place()
+            if t >= 1 then
+                slideOffset = offsetTo
+                alphaNow = alphaTo
+                setAlpha(alphaTo)
+                place()
+                if slideStop then slideStop() slideStop = nil end
+                if onDone then onDone() end
+            end
         end)
     end
 
-    -- Fade out while the control is scrolled past the top or bottom of its column,
-    -- the panel would otherwise float over the header or the next card, and fade
-    -- back in when the control comes back. Scrolling a picker off the list and back
-    -- used to snap it on and off.
+    -- The panel leaves while its control is scrolled past the top or bottom of the
+    -- column, otherwise it floats over the header or over the next card, and it
+    -- comes back when the control does.
+    --
+    -- It leaves the way the row left. Scrolled off the top, the panel goes up after
+    -- it; off the bottom, it goes down. A panel that only faded on the spot read as
+    -- being switched off, and a panel that always went the same way argued with the
+    -- direction of the scroll half the time. The travel is 26 pixels, enough to be
+    -- a movement rather than a twitch on a panel that is already going transparent.
+    local CLIP_TRAVEL = 26
     local shown = true
     local function clip()
         if closed then return end
-        local want = true
+        local want, upward = true, true
         if scroller then
             local top = scroller.AbsolutePosition.Y
             local bottom = top + scroller.AbsoluteSize.Y
             local at = anchor.AbsolutePosition.Y
-            want = (at + anchor.AbsoluteSize.Y > top + 2) and (at < bottom - 2)
+            local above = at + anchor.AbsoluteSize.Y <= top + 2
+            local below = at >= bottom - 2
+            want = not (above or below)
+            -- Remembered rather than recomputed on the way back in: by then the row
+            -- is inside the column again and there is no edge left to read.
+            if above then upward = true elseif below then upward = false end
         end
         if want == shown then return end
         shown = want
         backdrop.Visible = want
         shield.Visible = want
         if want then
-            -- Comes back the way it opened, so returning to a panel and opening one
-            -- are the same movement.
+            -- Comes back from the side it left by, so leaving and returning are one
+            -- movement reversed rather than two unrelated ones.
             panel.Visible = true
-            slide(-12, 0, 0.3)
-            tween(panel, 0.22, { GroupTransparency = 0 }, EASE_SOFT)
-            tween(edge, 0.22, { Transparency = 0.35 }, EASE_SOFT)
+            slide(lastExit or -CLIP_TRAVEL, 0, 1, 0.3)
         else
-            -- And it leaves by moving too. Fading on the spot read as the panel being
-            -- switched off rather than as the panel going with the row it belongs to.
-            slide(slideOffset, 14, 0.2)
-            tween(edge, 0.18, { Transparency = 1 }, EASE_SOFT)
-            tween(panel, 0.18, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
+            lastExit = upward and -CLIP_TRAVEL or CLIP_TRAVEL
+            slide(nil, lastExit, 0, 0.22, function()
                 if not shown and not closed then panel.Visible = false end
             end)
         end
@@ -1767,38 +2064,68 @@ local function openPanel(ctx, cfg)
         for i = #stack, 1, -1 do
             if stack[i] == controller then table.remove(stack, i) end
         end
+        backdrop:Destroy()
+        shield:Destroy()
+        if cfg.onClose then cfg.onClose() end
+
+        -- Leaving is the entry reversed: the panel sinks back under the control it
+        -- came out of while it goes transparent. Driven here rather than through
+        -- slide(), because the closed flag has already stopped that driver and it has
+        -- to stay stopped: it calls place(), and place() reads an anchor the caller
+        -- may be tearing down.
         if slideStop then
             slideStop()
             slideStop = nil
         end
-        backdrop:Destroy()
-        shield:Destroy()
-        if cfg.onClose then cfg.onClose() end
-        -- The outline is not composited by GroupTransparency, so it is faded on
-        -- the same clock as the fill. Any difference between the two and the
-        -- border is the last thing left on screen.
-        tween(edge, 0.16, { Transparency = 1 }, EASE_SOFT)
-        local out = tween(panel, 0.16, { GroupTransparency = 1 }, EASE_SOFT)
-        out.Completed:Once(function() panel:Destroy() end)
+        local base = resting
+        local fromOffset = slideOffset
+        local fromAlpha = alphaNow
+        local elapsed = 0
+        local stop
+        stop = addTicker(0, function(dt)
+            elapsed += dt
+            local t = math.min(elapsed / 0.18, 1)
+            local eased = 1 - (1 - t) ^  3
+            local offset = fromOffset + (10 - fromOffset) * eased
+            panel.Position = UDim2.new(
+                base.X.Scale, base.X.Offset,
+                base.Y.Scale, base.Y.Offset + offset
+            )
+            setAlpha(fromAlpha * (1 - eased))
+            if t >= 1 then
+                if stop then stop() end
+                panel:Destroy()
+            end
+        end)
     end
 
     controller = { frame = panel, close = close, popover = cfg.popover == true }
     stack[#stack + 1] = controller
-    backdrop.MouseButton1Click:Connect(close)
+
+    -- A press anywhere outside the panel dismisses it, except on the window's title
+    -- strip: that starts a window drag and leaves the panel open, so the window can
+    -- still be moved with a dropdown or a picker on screen. The panel travels with
+    -- it, because it is placed from its anchor and the anchor moves with the window.
+    --
+    -- On press rather than on click. The catcher covers the whole window, so waiting
+    -- for the release meant the drag had already been lost to it.
+    backdrop.InputBegan:Connect(function(input)
+        if not isPointer(input.UserInputType) then return end
+        if ctx.dragWindowFrom and ctx.dragWindowFrom(input) then return end
+        close()
+    end)
 
     place()
     clip()
-    -- Open: the panel drops the last few pixels into place while it fades up, so
-    -- it reads as coming out from under the control it belongs to.
+    -- Open: the panel rises the last few pixels into place as it comes up, so it
+    -- reads as coming out from under the control it belongs to.
     --
-    -- It is the group's own position that moves, and nothing inside it. A UIScale on
-    -- the group, which is what this used to be, grows it from whichever corner its
-    -- anchor point sits on (the top left, so every panel unrolled to the right) and
-    -- re-renders the text at a fractional size on every frame, which is what made
-    -- the labels crawl while a menu opened.
-    slide(-14, 0, 0.34)
-    tween(panel, 0.2, { GroupTransparency = 0 }, EASE_SOFT)
-    tween(edge, 0.2, { Transparency = 0.35 }, EASE_SOFT)
+    -- It is the panel's own position that moves and nothing inside it. A UIScale,
+    -- which is what this used to be, grows the panel from whichever corner its anchor
+    -- point sits on (the top left, so every panel unrolled to the right) and
+    -- re-renders the text at a fractional size on every frame, which is what made the
+    -- labels crawl while a menu opened.
+    slide(-14, 0, 1, 0.3)
 
     return panel, controller
 end
@@ -2136,7 +2463,7 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     fill.Parent = track
     themed(fill, "BackgroundColor3", "accent")
     corner(fill, 3)
-    barRamp(fill)
+    local setRampSpan = barRamp(fill)
 
     local knob = Instance.new("Frame")
     knob.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -2166,6 +2493,8 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
             tween(fill, 0.22, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
             tween(knob, 0.22, { Position = UDim2.new(ratio, 0, 0.5, 0) }, EASE_SOFT)
         end
+        -- The shading covers the same slice of the track whatever the value is.
+        setRampSpan(ratio)
         valueBox.Text = format and format(value) or tostring(value)
     end
     render(get(), true)
@@ -2479,7 +2808,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         if ctx.closeOverlays then ctx.closeOverlays(true) end
 
         local list = getOptions()
-        local guess = math.clamp(#list, 1, MAX_ROWS) * ROW_STEP + 12 + (opts.search and 38 or 0)
+        local guess = math.clamp(#list, 1, MAX_ROWS) * ROW_STEP + 12 + (opts.search and 36 or 0)
         local panel, controller = openPanel(ctx, {
             anchor = button,
             width = 210,
@@ -2494,29 +2823,42 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         tween(arrow, 0.25, { Rotation = 180 })
         listLayout(panel, 0)
 
-        -- Search as a flush header at the top of the panel (top corners follow
-        -- the panel rounding via the CanvasGroup clip, bottom edge is square).
+        -- Search sits inset at the top of the panel, on its own rounded surface. It
+        -- used to be flush to the panel's edges and leaned on the CanvasGroup to get
+        -- its top corners rounded off; the panel is a plain frame now, so it is an
+        -- inset control like every other field in the kit.
         local searchBox
         if opts.search then
-            local header = newInstance("Frame")
-            header.Name = randomName()
-            header.Size = UDim2.new(1, 0, 0, 38)
-            header.BorderSizePixel = 0
-            header.LayoutOrder = 0
-            header.Parent = panel
-            themed(header, "BackgroundColor3", "control")
-            local sicon = makeIcon(header, "search", UDim2.new(0, 16, 0, 16), "iconDim")
+            -- The holder takes the row height from the panel's layout, the field
+            -- inside it takes the inset.
+            local holder = newInstance("Frame")
+            holder.Name = randomName()
+            holder.Size = UDim2.new(1, 0, 0, 36)
+            holder.BackgroundTransparency = 1
+            holder.LayoutOrder = 0
+            holder.Parent = panel
+
+            local head = newInstance("Frame")
+            head.Name = randomName()
+            head.Size = UDim2.new(1, -12, 0, 30)
+            head.Position = UDim2.new(0, 6, 0, 3)
+            head.BorderSizePixel = 0
+            head.Parent = holder
+            themed(head, "BackgroundColor3", "control")
+            corner(head, 6)
+
+            local sicon = makeIcon(head, "search", UDim2.new(0, 16, 0, 16), "iconDim")
             sicon.AnchorPoint = Vector2.new(0, 0.5)
-            sicon.Position = UDim2.new(0, 12, 0.5, 0)
+            sicon.Position = UDim2.new(0, 9, 0.5, 0)
             searchBox = newInstance("TextBox")
             searchBox.BackgroundTransparency = 1
-            searchBox.Position = UDim2.new(0, 36, 0, 0)
-            searchBox.Size = UDim2.new(1, -46, 1, 0)
+            searchBox.Position = UDim2.new(0, 31, 0, 0)
+            searchBox.Size = UDim2.new(1, -41, 1, 0)
             searchBox.TextSize = 14
             searchBox.Text = ""
             searchBox.ClearTextOnFocus = false
             searchBox.TextXAlignment = Enum.TextXAlignment.Left
-            searchBox.Parent = header
+            searchBox.Parent = head
             faced(searchBox, "regular")
             themed(searchBox, "TextColor3", "text")
             themed(searchBox, "PlaceholderColor3", "subtext")
@@ -2714,8 +3056,23 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             return
         end
         if ctx.closeOverlays then ctx.closeOverlays(true) end
-        -- The extra 30 is the row of recent colours above the hex field.
-        local panelH = (useAlpha and 226 or 196) + 30
+
+        -- The picker's own swatches, if this picker or the build supplied any. Read
+        -- when the panel opens rather than when the control was built, so a script
+        -- can change the house palette at runtime.
+        local presets = swatchHexList((opts and opts.swatches) or Interface.swatches)
+
+        -- The layout is fixed, so the height is worked out rather than measured.
+        -- Top: the saturation square and the hue bar, then the opacity bar under
+        -- them. Bottom, stacked upward from the hex field: recent colours, and the
+        -- preset swatches above those if there are any.
+        local ROW_H, ROW_GAP, HEX_H = 22, 8, 28
+        local top = 138 + (useAlpha and 28 or 0)
+        local recentY = HEX_H + ROW_GAP
+        local presetY = recentY + ROW_H + ROW_GAP
+        local bottom = (#presets > 0 and presetY or recentY) + ROW_H
+        local panelH = 24 + top + 14 + bottom
+
         local panel, controller = openPanel(ctx, {
             anchor = swatch,
             width = 232,
@@ -2803,14 +3160,31 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
 
         -- Opacity bar: the grid first, then the colour over it with a
         -- transparency ramp, so the left end shows the grid straight through.
-        local alphaHolder, alphaBar, alphaCursor
+        local alphaHolder, alphaBar, alphaCursor, alphaValue
         if useAlpha then
             alphaHolder = Instance.new("Frame")
             alphaHolder.Position = UDim2.new(0, 0, 0, 150)
-            alphaHolder.Size = UDim2.new(1, 0, 0, 16)
+            -- Short of the full width: the number lives in the gap on the right.
+            -- Reading opacity off the position of a cursor is guesswork, and the one
+            -- value in this panel that has no digits anywhere was the one people
+            -- asked about.
+            alphaHolder.Size = UDim2.new(1, -44, 0, 16)
             alphaHolder.BackgroundTransparency = 1
             alphaHolder.BorderSizePixel = 0
             alphaHolder.Parent = panel
+
+            alphaValue = Instance.new("TextLabel")
+            alphaValue.AnchorPoint = Vector2.new(1, 0.5)
+            alphaValue.Position = UDim2.new(1, 0, 0, 158)
+            alphaValue.Size = UDim2.new(0, 40, 0, 16)
+            alphaValue.BackgroundTransparency = 1
+            alphaValue.TextSize = 13
+            alphaValue.TextXAlignment = Enum.TextXAlignment.Right
+            alphaValue.Text = math.floor(alpha * 100 + 0.5) .. "%"
+            alphaValue.Parent = panel
+            faced(alphaValue, "medium")
+            themed(alphaValue, "TextColor3", "subtext")
+
             checkerboard(alphaHolder, 8, 0, 4)
 
             alphaBar = Instance.new("ImageButton")
@@ -2855,6 +3229,7 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
                 alphaBar.BackgroundColor3 = final
                 alphaCursor.Position = UDim2.new(alpha, 0, 0.5, 0)
                 swatchFill.BackgroundTransparency = 1 - alpha
+                alphaValue.Text = math.floor(alpha * 100 + 0.5) .. "%"
                 rgb[4] = alpha
             end
             if setRgb then setRgb(rgb) end
@@ -2917,44 +3292,107 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             end)
         end
 
-        -- Recent colours, above the hex field. Rebuilt rather than reordered: eight
-        -- swatches is cheaper to make again than to keep in sync.
-        local recentRow = Instance.new("Frame")
-        recentRow.AnchorPoint = Vector2.new(0, 1)
-        recentRow.Position = UDim2.new(0, 0, 1, -34)
-        recentRow.Size = UDim2.new(1, 0, 0, 22)
-        recentRow.BackgroundTransparency = 1
-        recentRow.Parent = panel
-        listLayout(recentRow, 4, Enum.FillDirection.Horizontal)
-
         local function applyHsv(color)
             h, s, v = color:ToHSV()
             apply()
         end
+
+        -- A colour chip. Clicking one loads it, which is the whole point of both the
+        -- preset row and the recent row.
+        local function chipFor(hex, parent, order)
+            local r = tonumber(string.sub(hex, 1, 2), 16)
+            local g = tonumber(string.sub(hex, 3, 4), 16)
+            local b = tonumber(string.sub(hex, 5, 6), 16)
+            if not (r and g and b) then return nil end
+            local chip = Instance.new("TextButton")
+            chip.Size = UDim2.new(0, 22, 0, 22)
+            chip.BackgroundColor3 = Color3.fromRGB(r, g, b)
+            chip.BorderSizePixel = 0
+            chip.AutoButtonColor = false
+            chip.Text = ""
+            chip.LayoutOrder = order
+            chip.Parent = parent
+            corner(chip, 5)
+            stroke(chip, "stroke", 1, 0.35)
+            chip.MouseButton1Click:Connect(function()
+                applyHsv(Color3.fromRGB(r, g, b))
+                if commitRecent then commitRecent() end
+            end)
+            return chip
+        end
+
+        -- The build's own swatches, if it has any. Fixed, so they are drawn once.
+        if #presets > 0 then
+            local presetRow = Instance.new("Frame")
+            presetRow.AnchorPoint = Vector2.new(0, 1)
+            presetRow.Position = UDim2.new(0, 0, 1, -presetY)
+            presetRow.Size = UDim2.new(1, 0, 0, ROW_H)
+            presetRow.BackgroundTransparency = 1
+            presetRow.Parent = panel
+            listLayout(presetRow, 4, Enum.FillDirection.Horizontal)
+            -- Eight fit across the panel; a longer list is the script's problem and
+            -- the row simply stops rather than wrapping into the hex field.
+            for index = 1, math.min(#presets, 8) do
+                chipFor(presets[index], presetRow, index)
+            end
+        end
+
+        -- Recent colours, above the hex field. Rebuilt rather than reordered: seven
+        -- swatches are cheaper to make again than to keep in sync.
+        local recentRow = Instance.new("Frame")
+        recentRow.AnchorPoint = Vector2.new(0, 1)
+        recentRow.Position = UDim2.new(0, 0, 1, -recentY)
+        recentRow.Size = UDim2.new(1, 0, 0, ROW_H)
+        recentRow.BackgroundTransparency = 1
+        recentRow.Parent = panel
+        listLayout(recentRow, 4, Enum.FillDirection.Horizontal)
+
         local function drawRecent()
             for _, child in ipairs(recentRow:GetChildren()) do
                 if child:IsA("GuiObject") then child:Destroy() end
             end
             for index, hex in ipairs(recentColors) do
-                local r = tonumber(string.sub(hex, 1, 2), 16)
-                local g = tonumber(string.sub(hex, 3, 4), 16)
-                local b = tonumber(string.sub(hex, 5, 6), 16)
-                if r and g and b then
-                    local chip = Instance.new("TextButton")
-                    chip.Size = UDim2.new(0, 22, 0, 22)
-                    chip.BackgroundColor3 = Color3.fromRGB(r, g, b)
-                    chip.BorderSizePixel = 0
-                    chip.AutoButtonColor = false
-                    chip.Text = ""
-                    chip.LayoutOrder = index
-                    chip.Parent = recentRow
-                    corner(chip, 5)
-                    stroke(chip, "stroke", 1, 0.35)
-                    chip.MouseButton1Click:Connect(function()
-                        applyHsv(Color3.fromRGB(r, g, b))
-                    end)
-                end
+                chipFor(hex, recentRow, index)
             end
+            -- The eighth slot empties the row. It is only drawn when there is
+            -- something to empty, so an untouched picker shows colours and nothing
+            -- else.
+            if #recentColors == 0 then return end
+            local clear = Instance.new("TextButton")
+            clear.Size = UDim2.new(0, 22, 0, 22)
+            clear.BackgroundTransparency = 0
+            clear.BorderSizePixel = 0
+            clear.AutoButtonColor = false
+            clear.Text = ""
+            clear.LayoutOrder = 99
+            clear.Parent = recentRow
+            themed(clear, "BackgroundColor3", "control")
+            corner(clear, 5)
+            stroke(clear, "stroke", 1, 0.35)
+            local mark = makeIcon(clear, "trash", UDim2.new(0, 13, 0, 13), "iconDim")
+            mark.AnchorPoint = Vector2.new(0.5, 0.5)
+            mark.Position = UDim2.new(0.5, 0, 0.5, 0)
+            mark.Active = false
+            if mark.Image == "" then
+                mark:Destroy()
+                clear.Text = "x"
+                clear.TextSize = 13
+                faced(clear, "medium")
+                themed(clear, "TextColor3", "subtext")
+            end
+            clear.MouseEnter:Connect(function()
+                tween(clear, 0.12, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT)
+                if mark.Parent then tintIcon(mark, PALETTE.icon) end
+            end)
+            clear.MouseLeave:Connect(function()
+                tween(clear, 0.16, { BackgroundColor3 = PALETTE.control }, EASE_SOFT)
+                if mark.Parent then tintIcon(mark, PALETTE.iconDim) end
+            end)
+            clear.MouseButton1Click:Connect(function()
+                Interface.clearRecentColors()
+                if ctx and ctx.markDirty then ctx:markDirty() end
+                drawRecent()
+            end)
         end
         commitRecent = function()
             local rgb = getRgb()
@@ -3554,21 +3992,27 @@ function Tab:sub(name)
     local leftCol = makeColumn("Left", 0)
     local rightCol = makeColumn("Right", 0.5)
 
-    local sub = { name = name, btn = btn, page = page, columns = columns, tab = self }
+    local sub = { name = name, btn = btn, page = page, columns = columns, tab = self, order = order }
     table.insert(self._subs, sub)
 
+    -- The sub-tabs sit in a row, so their pages travel sideways, along the bar.
+    local SUB_SLIDE = 26
+
     local function activate()
+        local leaving, from = nil, order
         for _, other in ipairs(self._subs) do
-            other.page.Visible = false
-            tween(other.btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
+            if other ~= sub then
+                if other.page.Visible then
+                    leaving = other.page
+                    from = other.order
+                else
+                    other.page.Visible = false
+                end
+                tween(other.btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
+            end
         end
         if self._ctx.closeOverlays then self._ctx.closeOverlays() end
-        -- The page arrives by moving, over a short distance and in one beat. It used
-        -- to fade over 0.2 while travelling for 0.34, so the content went on sliding
-        -- after it was already fully visible, which is the part that read as wrong.
-        page.Visible = true
-        page.Position = UDim2.new(0, 0, 0, 10)
-        tween(page, 0.24, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        swapPages(leaving, page, true, SUB_SLIDE, order >= from and 1 or -1)
         tween(btn, 0.16, { TextColor3 = PALETTE.text }, EASE_SOFT)
         self._placeUnderline(btn, true)
     end
@@ -3724,22 +4168,30 @@ function Window:tab(opts)
         name = opts.name, btn = btn, icon = icon, label = label, page = tabPage,
     }, Tab)
     table.insert(self.tabs, tabObj)
+    -- Where this tab sits in the sidebar, which is the direction its page travels in.
+    local myIndex = #self.tabs
+
+    -- The tabs are a vertical list, so their pages travel vertically, with the
+    -- sidebar: pick a tab further down and the page comes up from below.
+    local TAB_SLIDE = 18
 
     local function activate()
-        for _, other in ipairs(self.tabs) do
+        local leaving, from = nil, myIndex
+        for index, other in ipairs(self.tabs) do
             if other ~= tabObj then
-                other.page.Visible = false
+                if other.page.Visible then
+                    leaving = other.page
+                    from = index
+                else
+                    other.page.Visible = false
+                end
                 if other.fill then tween(other.fill, 0.18, { BackgroundTransparency = 1 }, EASE_SOFT) end
                 tween(other.label, 0.18, { TextColor3 = PALETTE.subtext }, EASE_SOFT)
                 tintIcon(other.icon, PALETTE.iconDim)
             end
         end
         if self.closeOverlays then self.closeOverlays() end
-        -- Same rule as the sub-pages: the page frame itself travels, nothing inside
-        -- it moves, and the travel is one short beat.
-        tabPage.Visible = true
-        tabPage.Position = UDim2.new(0, 0, 0, 12)
-        tween(tabPage, 0.26, { Position = UDim2.new(0, 0, 0, 0) }, EASE)
+        swapPages(leaving, tabPage, false, TAB_SLIDE, myIndex >= from and 1 or -1)
         -- The fill slides in from the left as the section opens.
         fillGrad.Offset = Vector2.new(-0.6, 0)
         tween(fill, 0.2, { BackgroundTransparency = 0 }, EASE_SOFT)
@@ -3857,18 +4309,17 @@ function Window:_buildSearch(parent)
 
     -- The result list floats in the overlay layer, like every other panel, so it is
     -- not clipped by the sidebar and draws over the content.
-    local list = newInstance("CanvasGroup")
+    local list = newInstance("Frame")
     list.Name = randomName()
     list.Size = UDim2.new(0, 260, 0, 0)
     list.AutomaticSize = Enum.AutomaticSize.Y
     list.BorderSizePixel = 0
-    list.GroupTransparency = 1
     list.Visible = false
     list.ZIndex = 300
     list.Parent = self.overlay
     themed(list, "BackgroundColor3", "card")
     corner(list, 10)
-    local listEdge = stateStroke(list, "stroke")
+    stroke(list, "stroke", 1, 0.35)
     local body = newInstance("Frame")
     body.BackgroundTransparency = 1
     body.Size = UDim2.new(1, 0, 0, 0)
@@ -3877,26 +4328,60 @@ function Window:_buildSearch(parent)
     listLayout(body, 2)
     padding(body, 6)
 
+    local setAlpha = fadeGroup(list)
+    setAlpha(0)
+
+    -- Where the list sits when it is fully open, and how far below that it starts.
+    -- Only the offset moves, so a result list that grows a row while it is opening
+    -- still lands in the right place.
+    local restY = 0
+    local dropOffset = 0
+    local LIST_DROP = 10
+
+    local function draw()
+        list.Position = UDim2.new(0, list.Position.X.Offset, 0, restY + dropOffset)
+    end
+
     local shown = false
+    local alphaNow = 0
+    local fadeStop = nil
     local function setShown(want)
         if want == shown then return end
         shown = want
-        if want then
-            list.Visible = true
-            tween(list, 0.18, { GroupTransparency = 0 }, EASE_SOFT)
-            tween(listEdge, 0.18, { Transparency = 0.35 }, EASE_SOFT)
-        else
-            tween(listEdge, 0.14, { Transparency = 1 }, EASE_SOFT)
-            tween(list, 0.14, { GroupTransparency = 1 }, EASE_SOFT).Completed:Once(function()
-                if not shown then list.Visible = false end
-            end)
+        if fadeStop then
+            fadeStop()
+            fadeStop = nil
         end
+        if want then list.Visible = true end
+        local fromAlpha = alphaNow
+        local fromOffset = dropOffset
+        local toAlpha = want and 1 or 0
+        local toOffset = want and 0 or LIST_DROP
+        if want and fromAlpha <= 0 then fromOffset = -LIST_DROP end
+        local duration = want and 0.24 or 0.16
+        local elapsed = 0
+        dropOffset = fromOffset
+        draw()
+        fadeStop = addTicker(0, function(dt)
+            elapsed += dt
+            local t = math.min(elapsed / duration, 1)
+            local eased = 1 - (1 - t) ^ 4
+            alphaNow = fromAlpha + (toAlpha - fromAlpha) * eased
+            dropOffset = fromOffset + (toOffset - fromOffset) * eased
+            setAlpha(alphaNow)
+            draw()
+            if t >= 1 then
+                if fadeStop then fadeStop() fadeStop = nil end
+                if not shown then list.Visible = false end
+            end
+        end)
     end
 
     local function place()
         local origin = self.window.AbsolutePosition
         local at = box.AbsolutePosition
-        list.Position = UDim2.new(0, math.floor(at.X - origin.X + 0.5), 0, math.floor(at.Y - origin.Y + 36))
+        restY = math.floor(at.Y - origin.Y + 36)
+        list.Position = UDim2.new(0, math.floor(at.X - origin.X + 0.5), 0, restY + dropOffset)
     end
 
     local function jump(entry)
@@ -4636,6 +5121,16 @@ function Window:notify(opts)
         localized(msg, "Text", opts.text)
     end
 
+    -- Anywhere on the toast dismisses it early. Built before the fade so the fade
+    -- sees the finished toast and never has to rebuild its list.
+    local hit = newInstance("TextButton")
+    hit.Size = UDim2.new(1, 0, 1, 0)
+    hit.BackgroundTransparency = 1
+    hit.AutoButtonColor = false
+    hit.Text = ""
+    hit.ZIndex = 10
+    hit.Parent = toast
+
     -- The toast is a frame, so its parts are faded one by one. There are five of
     -- them, and the alternative was putting the text through a render target.
     local setAlpha = fadeGroup(toast)
@@ -4696,14 +5191,6 @@ function Window:notify(opts)
     tween(toast, 0.42, { Position = UDim2.new(1, 0, 1, entry.y) }, EASE)
     runFade(1, 0.24)
 
-    -- Anywhere on the toast dismisses it early.
-    local hit = newInstance("TextButton")
-    hit.Size = UDim2.new(1, 0, 1, 0)
-    hit.BackgroundTransparency = 1
-    hit.AutoButtonColor = false
-    hit.Text = ""
-    hit.ZIndex = 10
-    hit.Parent = toast
     hit.MouseButton1Click:Connect(dismiss)
 
     -- A run of toasts should not climb off the top of the screen.
@@ -5351,7 +5838,7 @@ function Hud:bar(label, getRatio, opts)
     -- The same brightness ramp a slider fill carries, so the two kinds of bar in
     -- the kit read as the same object. One with a ramp next to one without looks
     -- like one of them is shaded by mistake.
-    barRamp(fill)
+    local setRampSpan = barRamp(fill)
 
     local last = nil
     local function apply(ratio)
@@ -5359,6 +5846,7 @@ function Hud:bar(label, getRatio, opts)
         if last and math.abs(ratio - last) < 0.005 then return end
         last = ratio
         tween(fill, 0.2, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
+        setRampSpan(ratio)
         valueText.Text = opts.text and tostring(opts.text(ratio)) or (math.floor(ratio * 100 + 0.5) .. "%")
     end
     apply(hudRead(getRatio) or 0)
@@ -5723,6 +6211,12 @@ function Interface.new(opts)
     pages.Position = UDim2.new(0, 24, 0, 56)
     pages.Size = UDim2.new(1, -48, 1, -72)
     pages.BackgroundTransparency = 1
+    -- Clipped, so a page changing travels in and out behind the edge of the content
+    -- area instead of sliding across the window's margin. It is what turns the
+    -- movement into one page replacing another rather than two frames drifting.
+    -- Nothing needs to escape this rectangle: the dropdowns, pickers and popovers all
+    -- live in the overlay layer, which is a sibling of the window.
+    pages.ClipsDescendants = true
     pages.Parent = content
     self.pages = pages
 
@@ -5786,17 +6280,29 @@ function Interface.new(opts)
             sy = math.max(8, vp.Y - 8 - h)
         end
 
-        -- Whole pixels: a panel is a CanvasGroup, and half a pixel of offset is
-        -- half a pixel of blur across everything written on it.
+        -- Whole pixels. Half a pixel of offset is half a pixel of blur across
+        -- everything written on the panel.
         return UDim2.new(0, math.floor(sx - winPos.X + 0.5), 0, math.floor(sy - winPos.Y + 0.5))
     end
 
     -- Dropping the window updates where the open animation returns it to, and marks
     -- it as placed by hand so a viewport change stops re-centring it.
-    makeDraggable(window, topDrag, function(frame)
+    local function dropped(frame)
         self._resting = frame.Position
         self._moved = true
-    end)
+    end
+    makeDraggable(window, topDrag, dropped)
+
+    -- The second way in. A floating panel puts a full window click catcher under
+    -- itself, so while a dropdown or a picker is open a press on the title strip
+    -- never reaches the strip. The catcher asks this first, and a press that landed
+    -- on the strip becomes a window drag with the panel left open.
+    self._dragStrip = topDrag
+    self.dragWindowFrom = function(input)
+        if not pressedOver(input, topDrag) then return false end
+        startDrag(window, input, dropped)
+        return true
+    end
 
     -- Follow the screen. A player can change resolution, go full screen or rotate a
     -- device mid session, and a window sized for the old viewport is either off the
