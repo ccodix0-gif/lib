@@ -104,7 +104,7 @@ local LocalPlayer = Players.LocalPlayer
 local Interface = {}
 -- Bump this whenever interface.luau changes so the host build can be verified
 -- from the console (helps catch a stale nw.lua served from the GitHub CDN).
-Interface.version = "2026.07.31.5"
+Interface.version = "2026.07.31.6"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -231,36 +231,31 @@ local TRANS_OF = {
 }
 
 -- Type ------------------------------------------------------------------------
--- Two faces, and only two, because only two exist.
+-- One weight for the whole interface, and it is a heavy one. Hierarchy comes from size
+-- and colour, not from mixing faces, so a card title and a control label differ by scale
+-- rather than by two weights sitting next to each other.
 --
--- What Roblox serves for the Arial family is Arimo, and Arimo ships Regular and
--- Bold. Ask for anything else and the client fakes it by thickening Regular, which
--- grows the letterforms without growing the space between them, so at fourteen
--- pixels pairs of letters close up on each other. That is why Heavy was wrong.
+-- Bold by default rather than Heavy. What Roblox serves for the Arial family is Arimo,
+-- which ships Regular and Bold as drawn faces; ask for Heavy and the client makes one by
+-- thickening Bold, which grows the letterforms without growing the space between them, so
+-- pairs of letters close up at interface sizes. Bold has its own metrics and does not.
 --
--- Setting every role to Bold to avoid the fake was also wrong, and it is what made
--- the type look off everywhere while nothing about it was measurably broken. Bold at
--- thirteen to fifteen pixels is a display weight being used for body copy: the stems
--- are wide, the counters inside the letters close up, and a paragraph of it reads as
--- a grey slab. Every other interface uses Regular for anything you actually read and
--- saves the heavy face for the two or three things that need to stand out, and that
--- is the difference the eye picks up as "theirs looks normal and ours does not".
+-- Both of those are one call away, because which one looks right is a matter of taste and
+-- not something a library should decide for a build:
 --
--- So the roles map onto the two real faces by what they are for, not by name:
---   regular, medium     Regular, everything that gets read
---   semibold, bold      Bold, titles, brand, section captions
+--   UI.setWeight(Enum.FontWeight.Heavy)     -- heavier, tighter
+--   UI.setWeight(Enum.FontWeight.Regular)   -- lighter, wider
+--
+-- Roles are still named at the call sites and still resolve through the registry, so a
+-- build that wants a real two weight scale can hand them different faces.
 local FONT_FAMILY = "rbxasset://fonts/families/Arial.json"
-local ROLE_WEIGHT = {
-    regular = Enum.FontWeight.Regular,
-    medium = Enum.FontWeight.Regular,
-    semibold = Enum.FontWeight.Bold,
-    bold = Enum.FontWeight.Bold,
-}
+local FONT_WEIGHT = Enum.FontWeight.Bold
 local ROLES = { "regular", "medium", "semibold", "bold" }
 local FACES = {}
 local function rebuildFaces()
+    local face = Font.new(FONT_FAMILY, FONT_WEIGHT, Enum.FontStyle.Normal)
     for _, role in ipairs(ROLES) do
-        FACES[role] = Font.new(FONT_FAMILY, ROLE_WEIGHT[role], Enum.FontStyle.Normal)
+        FACES[role] = face
     end
 end
 rebuildFaces()
@@ -475,15 +470,38 @@ local function faced(instance, role)
     return instance
 end
 
+-- Re-face everything already on screen, at each part's own role.
+local function refaceAll()
+    rebuildFaces()
+    tagWalk(FONT_REG, function(inst, role)
+        inst.FontFace = FACES[role] or FACES.regular
+    end)
+end
+
 -- Swap the type family for the whole interface (a language the default family
 -- has no glyphs for). Existing labels are re-faced in place.
 function Interface.setFont(family)
     if type(family) ~= "string" or family == "" then return end
     FONT_FAMILY = family
-    rebuildFaces()
-    tagWalk(FONT_REG, function(inst, role)
-        inst.FontFace = FACES[role] or FACES.regular
-    end)
+    refaceAll()
+end
+
+-- Swap the weight. Takes an Enum.FontWeight, or one of "regular", "medium", "bold",
+-- "heavy" for convenience. Live, like setFont.
+local WEIGHT_NAMES = {
+    regular = Enum.FontWeight.Regular,
+    medium = Enum.FontWeight.Medium,
+    semibold = Enum.FontWeight.SemiBold,
+    bold = Enum.FontWeight.Bold,
+    heavy = Enum.FontWeight.Heavy,
+}
+function Interface.setWeight(weight)
+    if type(weight) == "string" then
+        weight = WEIGHT_NAMES[string.lower(weight)]
+    end
+    if weight == nil then return end
+    FONT_WEIGHT = weight
+    refaceAll()
 end
 
 -- Translations ----------------------------------------------------------------
@@ -1420,32 +1438,39 @@ local function tween(instance, time, props, style, dir)
     return t
 end
 
--- Nothing that carries text fades. Ever.
+-- Fade a whole panel, text and all, with one number.
 --
--- Fading a panel as a whole means writing a transparency on every part of it, and
--- that only works if nothing else writes the same property. In a kit this size
--- something always does: the palette opacity has its own opinion about text
--- transparency, a dropdown row paints its own background by state, a hover lifts a
--- fill. Three rounds of bugs came out of that one idea, all of them the same shape
--- and all of them looking like something unrelated. A notification that arrived
--- blank. A HUD that never came back. A dropdown drawn with no words in it.
+-- This is what a CanvasGroup is for and there is no substitute for it. Two other ways
+-- were tried and both were worse. Writing a transparency onto every part of the panel
+-- only works if nothing else writes the same property, and in a kit this size something
+-- always does: the palette opacity has an opinion about text transparency, a dropdown
+-- row paints its own background by state, a hover lifts a fill. Fading only the panel's
+-- own surface and leaving the content alone is worse still, because a panel on its way
+-- out then leaves its words hanging in the air, and a half faded card with solid text on
+-- it does not read as a panel leaving, it reads as a rendering fault.
 --
--- So a panel fades its own surface and its own outline, and nothing else. Two
--- properties on two instances, written by one thing. The content is opaque from the
--- first frame it exists and is hidden by Visible when the panel is gone. What makes
--- the panel read as arriving is the travel, which is what the window does too.
-local function surfaceFade(root)
+-- The reason a group was taken out in the first place was soft text, and the condition
+-- for that is worth stating, because it is avoidable. A group renders its children into
+-- a texture and blits it. If the blit is one to one the result is pixel exact and the
+-- text is identical to text drawn straight to the screen. It is only soft when the blit
+-- is not one to one: a fractional position, a UIScale, a size that is not a whole number
+-- of pixels. So the rule is not "no groups", it is "no group is ever moved to half a
+-- pixel and nothing is ever scaled", and the kit holds to that: whole pixel drags, whole
+-- pixel placement, even window and sidebar widths, no UIScale on anything with text.
+--
+-- A UIStroke is drawn outside the raster, so GroupTransparency does not composite it and
+-- it is faded on the same clock by hand. Any difference between the two and the border
+-- is the last thing left on screen.
+local function groupFade(root)
     local edge = nil
     for _, child in ipairs(root:GetChildren()) do
         if child:IsA("UIStroke") then edge = child end
     end
-    -- Resting values, read once here, before anything has had a chance to move them.
-    local fill = root.BackgroundTransparency
     local line = edge and edge.Transparency or 0
 
-    -- alpha 1 is the panel at rest, 0 is the surface gone.
+    -- alpha 1 is the panel at rest, 0 is gone.
     return function(alpha)
-        root.BackgroundTransparency = fill + (1 - fill) * (1 - alpha)
+        root.GroupTransparency = 1 - alpha
         if edge then
             edge.Transparency = line + (1 - line) * (1 - alpha)
         end
@@ -1597,36 +1622,19 @@ local function hoverSurface(part, opts)
     return settle
 end
 
--- Press feedback: a short squash on mouse down, released on mouse up. Kept for
--- the toggle pill, which carries no text.
+-- There is no press animation anywhere in the kit, and this is the note that says so
+-- rather than an implementation.
 --
--- It is deliberately not used on anything with a label. A UIScale re-renders the
--- glyphs at a fractional size on every frame of the tween, and the label crawls
--- while it settles. The expanding ring that used to mark a click is gone for the
--- same class of reason: it was clipped to the button's rectangle, so on a rounded
--- button it squared off the corners as it passed them.
-local function pressScale(button, amount)
-    local scale = newInstance("UIScale")
-    scale.Parent = button
-    local down = amount or 0.97
-    -- One tween at a time. Pressing repeatedly used to stack a squash on a release
-    -- on a squash, and the overlapping tweens fought over the same property until
-    -- the clicking stopped.
-    local held = false
-    button.MouseButton1Down:Connect(function()
-        if held then return end
-        held = true
-        tween(scale, 0.08, { Scale = down }, EASE_SOFT)
-    end)
-    local function release(curve)
-        if not held then return end
-        held = false
-        tween(scale, 0.18, { Scale = 1 }, curve)
-    end
-    button.MouseButton1Up:Connect(function() release(EASE_POP) end)
-    button.MouseLeave:Connect(function() release(EASE_SOFT) end)
-    return scale
-end
+-- A squash on mouse down was the last one left, on the toggle pill. It was a UIScale, and
+-- a UIScale inside the body group means that part of the raster is re-rendered at a
+-- fractional size for the length of the tween. Three separate things came out of that: the
+-- knob shivered, the pill's rounded corner was resampled and showed a bright edge, and
+-- pressing repeatedly stacked a squash on a release on a squash. The expanding ring that
+-- used to mark a click went earlier for a related reason: it was clipped to the button's
+-- rectangle, so on a rounded button it squared off the corners on the way past.
+--
+-- A press is already answered by what the control does. A toggle moves its knob, a button
+-- lifts its fill, a slider follows the pointer. None of them need to be squeezed as well.
 
 -- Drag a frame by a handle. The frame is kept on screen (a margin of it always
 -- stays inside the viewport) and onDrop fires once the pointer is released, so
@@ -1805,13 +1813,11 @@ local function openPanel(ctx, cfg)
     shield.ZIndex = zBase + 1
     shield.Parent = ctx.overlay
 
-    -- A frame, not a CanvasGroup. This was the last group in the kit with text in
-    -- it, and it had all of it: every dropdown option, every hex field, every
-    -- control inside a gear popover. A group rasterises its children into a texture
-    -- and blits that, and text through a render target comes out softer than text
-    -- drawn straight to the screen, which is why the labels on an open panel never
-    -- matched the labels on the card behind it.
-    local panel = newInstance("Frame")
+    -- A group, so the whole panel fades as one thing: the rows, the words on them and
+    -- the surface under them, all at the same rate. Placed on whole pixels and never
+    -- scaled, which is the condition for the blit being one to one and the text being
+    -- pixel exact. See groupFade.
+    local panel = newInstance("CanvasGroup")
     panel.Name = randomName()
     panel.Size = UDim2.new(0, width, 0, cfg.height or 0)
     panel.AutomaticSize = Enum.AutomaticSize.Y
@@ -1845,27 +1851,9 @@ local function openPanel(ctx, cfg)
     -- Which way the panel went when its row was scrolled out, so it can come back
     -- the same way.
     local lastExit = nil
-    -- The surface and the outline fade. The rows on the panel do not: they are opaque
-    -- from the frame the caller creates them, which is after this function returns.
-    local setAlpha = surfaceFade(panel)
+    local setAlpha = groupFade(panel)
     local alphaNow = 0
     setAlpha(0)
-
-    -- Show or hide everything on the panel with one write per direct child.
-    --
-    -- Needed because the surface fades and the content does not: a panel on its way out
-    -- would otherwise leave its words hanging in the air over whatever is underneath,
-    -- and with a new panel opening in the same place you get two lists of text on top of
-    -- each other. So the content goes at the moment the panel stops being the panel, and
-    -- only the empty card animates away.
-    --
-    -- Visible on a container hides its whole subtree, so this is a handful of writes
-    -- rather than one per label, and nothing else in the kit writes Visible on these.
-    local function showContent(want)
-        for _, child in ipairs(panel:GetChildren()) do
-            if child:IsA("GuiObject") then child.Visible = want end
-        end
-    end
 
     -- Where the panel is drawn on the vertical axis, as opposed to where it belongs.
     -- place() explains why those are two different things.
@@ -2061,14 +2049,10 @@ local function openPanel(ctx, cfg)
             -- Comes back from the side it left by, so leaving and returning are one
             -- movement reversed rather than two unrelated ones.
             panel.Visible = true
-            showContent(true)
             slide(lastExit or -CLIP_TRAVEL, 0, 1, 0.3)
         else
-            -- Content off first, so nothing is left readable over the header the panel
-            -- is being moved out from behind.
-            showContent(false)
             lastExit = upward and -CLIP_TRAVEL or CLIP_TRAVEL
-            slide(nil, lastExit, 0, 0.18, function()
+            slide(nil, lastExit, 0, 0.22, function()
                 if not shown and not closed then panel.Visible = false end
             end)
         end
@@ -2119,11 +2103,10 @@ local function openPanel(ctx, cfg)
         shield:Destroy()
         if cfg.onClose then cfg.onClose() end
 
-        -- The content goes at once and the empty card sinks back under the control it
-        -- came out of. Driven here rather than through slide(), because the closed flag
-        -- has already stopped that driver and it has to stay stopped: it calls place(),
-        -- and place() reads an anchor the caller may be tearing down.
-        showContent(false)
+        -- The panel sinks back under the control it came out of as it goes. Driven here
+        -- rather than through slide(), because the closed flag has already stopped that
+        -- driver and it has to stay stopped: it calls place(), and place() reads an anchor
+        -- the caller may be tearing down.
         if slideStop then
             slideStop()
             slideStop = nil
@@ -2272,7 +2255,6 @@ local function makePill(row, ctx, get, set)
     pill.MouseLeave:Connect(function()
         if not get() then tween(pill, 0.18, { BackgroundColor3 = PALETTE.track }, EASE_SOFT) end
     end)
-    pressScale(pill, 0.94)
     pill.MouseButton1Click:Connect(function()
         -- Without a setter the control is a read out of someone else's value, so
         -- the press is ignored rather than raising. win:flag returns two values
@@ -3342,6 +3324,9 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
             })
         end)
         if useAlpha then
+            -- Moving the opacity does not record anything in the recent row. The row is a
+            -- list of colours, and the colour has not changed: making it 40 percent
+            -- transparent put an entry in that looked identical to the one already there.
             alphaBar.InputBegan:Connect(function(i)
                 if not isPointer(i.UserInputType) then return end
                 updAlpha(i.Position.X)
@@ -3350,7 +3335,6 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
                     move = function(x) updAlpha(x) end,
                     stop = function()
                         tween(alphaCursor, 0.16, { Size = UDim2.new(0, 4, 1, 4) }, EASE_SOFT)
-                        if commitRecent then commitRecent() end
                     end,
                 })
             end)
@@ -4362,7 +4346,7 @@ function Window:_buildSearch(parent)
 
     -- The result list floats in the overlay layer, like every other panel, so it is
     -- not clipped by the sidebar and draws over the content.
-    local list = newInstance("Frame")
+    local list = newInstance("CanvasGroup")
     list.Name = randomName()
     list.Size = UDim2.new(0, 260, 0, 0)
     list.AutomaticSize = Enum.AutomaticSize.Y
@@ -4381,7 +4365,7 @@ function Window:_buildSearch(parent)
     listLayout(body, 2)
     padding(body, 6)
 
-    local setAlpha = surfaceFade(list)
+    local setAlpha = groupFade(list)
     setAlpha(0)
 
     -- Where the list sits when it is fully open, and how far below that it starts.
@@ -4543,23 +4527,23 @@ function Window:_buildSearch(parent)
     return box
 end
 
--- Show or hide the window: it travels, and it dissolves through the veil.
+-- Show or hide the window: it travels, and all of it fades together.
 --
--- The veil is a sheet of the background colour over the whole window, and it is the
--- only reason the window has a fade at all. Fading the window itself means writing a
--- transparency onto a few thousand instances, and doing that in one write needs a
--- CanvasGroup around all of them, which is what put every label in the interface
--- through a render target. Fading a sheet over the top is one property on one frame
--- and no glyph is touched.
+-- The fade is one number on the body group, so the sidebar, the cards, the labels on them
+-- and the outlines all go at the same rate. Both alternatives were tried and both are
+-- worse. Fading the parts one at a time is thousands of property writes a frame and it
+-- fights everything else that writes a transparency. Fading a sheet of background colour
+-- over the top leaves the text under it fully solid behind a grey film, which does not
+-- read as the window leaving, it reads as the window being covered up.
 --
--- It used to scale as well. A scale re-renders every glyph under it at a fractional
--- size on each frame of the tween, which is the shimmer that came with it, and it
--- resamples the rounded corner at sizes it was not drawn at, which is the striping
--- that showed up along the curve while the window arrived. Travel does neither.
+-- Nothing is scaled, though, and that part stands. A scale re-renders every glyph under
+-- it at a fractional size on each frame, which is a shimmer, and it resamples the rounded
+-- corner at sizes it was not drawn at, which is the striping that used to show along the
+-- curve. Travel and a group fade do neither.
 --
 -- The resting position is remembered rather than assumed, because the window is
 -- draggable and its resting place is wherever it was last left.
-local WINDOW_IN = 0.34
+local WINDOW_IN = 0.32
 local WINDOW_OUT = 0.18
 
 function Window:toggle(show)
@@ -4574,15 +4558,15 @@ function Window:toggle(show)
     if show and not self._resting then self._resting = window.Position end
     local resting = self._resting or window.Position
 
-    -- One driver for the whole thing, so the travel and the dissolve cannot come apart.
-    -- It runs from wherever the veil currently is, which is what lets a fast off and on
-    -- pick up mid animation instead of starting over.
-    if self._veilStop then
-        self._veilStop()
-        self._veilStop = nil
+    -- One driver for the travel and the fade, so they cannot come apart, and it starts
+    -- from wherever the window currently is, which is what lets a fast off and on pick up
+    -- mid animation instead of starting over.
+    if self._fadeStop then
+        self._fadeStop()
+        self._fadeStop = nil
     end
-    local veil = self._veil
-    local from = self._veilAlpha or (show and 0 or 1)
+    local setAlpha = self._bodyFade
+    local from = self._alphaNow or (show and 0 or 1)
     local target = show and 1 or 0
     local liftFrom = show and WINDOW_LIFT(resting) or window.Position
     local liftTo = show and resting or WINDOW_LIFT(resting)
@@ -4599,17 +4583,18 @@ function Window:toggle(show)
         if shade then tween(shade, 0.14, { ImageTransparency = 1 }, EASE_SOFT) end
     end
 
-    if veil then veil.Visible = true end
     local elapsed = 0
-    self._veilStop = addTicker(0, function(dt)
+    self._fadeStop = addTicker(0, function(dt)
         elapsed += dt
         local t = math.min(elapsed / duration, 1)
         -- Arriving settles, leaving accelerates away. A close that eases out reads as
         -- the window being dragged shut.
         local eased = show and (1 - (1 - t) ^ 4) or (t * t)
         local alpha = from + (target - from) * eased
-        self._veilAlpha = alpha
-        if veil then veil.BackgroundTransparency = alpha end
+        self._alphaNow = alpha
+        if setAlpha then setAlpha(alpha) end
+        -- Whole pixels on every frame of the travel. A group blitted between two pixel
+        -- rows is the one thing that would soften the text inside it.
         window.Position = UDim2.new(
             liftFrom.X.Scale,
             math.floor(liftFrom.X.Offset + (liftTo.X.Offset - liftFrom.X.Offset) * eased + 0.5),
@@ -4617,10 +4602,7 @@ function Window:toggle(show)
             math.floor(liftFrom.Y.Offset + (liftTo.Y.Offset - liftFrom.Y.Offset) * eased + 0.5)
         )
         if t >= 1 then
-            if self._veilStop then self._veilStop() self._veilStop = nil end
-            -- Off either way: it has nothing to do between animations, and a sheet over
-            -- the interface that is not needed is a sheet that can catch a click.
-            if veil then veil.Visible = false end
+            if self._fadeStop then self._fadeStop() self._fadeStop = nil end
             if not self._open then
                 window.Visible = false
                 -- Put it back, so the next open starts from the resting place and a drag
@@ -5162,7 +5144,7 @@ function Window:notify(opts)
     local height = hasText and 58 or 42
     local offscreen = TOAST_WIDTH + 48
 
-    local toast = newInstance("Frame")
+    local toast = newInstance("CanvasGroup")
     toast.Name = randomName()
     toast.AnchorPoint = Vector2.new(1, 1)
     toast.Size = UDim2.new(0, TOAST_WIDTH, 0, height)
@@ -5225,10 +5207,8 @@ function Window:notify(opts)
     hit.ZIndex = 10
     hit.Parent = toast
 
-    -- The card fades, the words on it do not. A toast already travels the width of
-    -- itself to get on screen, so its content needs no fade of its own, and every
-    -- attempt to give it one ended with notifications that arrived blank.
-    local setAlpha = surfaceFade(toast)
+    -- The whole toast fades, words included, as one number.
+    local setAlpha = groupFade(toast)
     setAlpha(0)
     local fadeStop = nil
     local alphaNow = 0
@@ -5317,11 +5297,9 @@ end
 local OVERLAY_Z = 150
 
 local function overlayShell(self, name, opts)
-    -- A frame, not a group. These panels are almost nothing but text, and a group
-    -- would put all of it through a render target for the sake of one fade number.
-    -- The fade is done by walking the parts instead, which is affordable here: a
-    -- panel like this is a few dozen instances, not a few thousand.
-    local frame = newInstance("Frame")
+    -- A group, so the panel and its rows fade together. It is dragged with whole pixel
+    -- deltas and never scaled, so the blit stays one to one.
+    local frame = newInstance("CanvasGroup")
     frame.Name = randomName()
     frame.Size = opts.size or UDim2.new(0, 0, 0, 34)
     frame.AutomaticSize = opts.autoSize or Enum.AutomaticSize.X
@@ -5332,10 +5310,7 @@ local function overlayShell(self, name, opts)
     themed(frame, "BackgroundColor3", "card")
     corner(frame, opts.radius or 8)
     stroke(frame, "stroke", 1, 0.3)
-    -- The card fades and the panel travels. The rows on it are left alone, so a HUD
-    -- that gains a row while it is hidden cannot lose the panel, and a value written
-    -- into a row is never fighting an animation for the same property.
-    local setAlpha = surfaceFade(frame)
+    local setAlpha = groupFade(frame)
 
     -- A position saved in the config wins over the default one.
     local saved = self._overlayPos and self._overlayPos[name]
@@ -6200,9 +6175,16 @@ function Interface.new(opts)
     self.window = window
     self._shadow = shadow(window)
 
-    -- A plain frame, not a CanvasGroup. Everything the window draws lives in here,
-    -- and a group would put every label in the interface through a render target.
-    local body = Instance.new("Frame")
+    -- Everything the window draws lives in here, and it is a group so that opening and
+    -- closing fades all of it by one number: the sidebar, the cards, the labels on them
+    -- and the outlines, at the same rate.
+    --
+    -- The group is safe because of what surrounds it rather than because of anything it
+    -- does. Its size is the window's, the window is sized to an even number of pixels and
+    -- positioned on whole ones, dragging only ever adds whole pixel deltas, and nothing
+    -- anywhere carries a UIScale. So the raster is blitted one to one and every glyph
+    -- lands exactly where it would have without the group.
+    local body = Instance.new("CanvasGroup")
     body.Name = randomName()
     body.Size = UDim2.new(1, 0, 1, 0)
     body.BorderSizePixel = 0
@@ -6338,27 +6320,7 @@ function Interface.new(opts)
     overlay.Parent = window
     self.overlay = overlay
 
-    -- The window's fade, and the only way it has one.
-    --
-    -- Fading the window itself would mean writing a transparency onto a few thousand
-    -- instances, and doing it in one write needs a CanvasGroup around all of them, which
-    -- is what put every label in the interface through a render target. So the window
-    -- does not fade: a sheet of the background colour over the top of it does, and the
-    -- window appears to dissolve out of its own background. One property, on one frame,
-    -- and no glyph is touched.
-    --
-    -- Only drawn while an animation is running, and never able to take a click.
-    local veil = Instance.new("Frame")
-    veil.Name = randomName()
-    veil.Size = UDim2.new(1, 0, 1, 0)
-    veil.BorderSizePixel = 0
-    veil.Active = false
-    veil.Visible = false
-    veil.ZIndex = 60
-    veil.Parent = window
-    themed(veil, "BackgroundColor3", "background", { fade = false })
-    corner(veil, 12)
-    self._veil = veil
+    self._bodyFade = groupFade(body)
 
     -- Close the floating panels, newest first. With keepPopovers the gear
     -- settings popovers stay open, so a dropdown or a colour picker opened from
@@ -6463,7 +6425,7 @@ function Interface.new(opts)
     -- description of what opening the window looks like rather than two that drift.
     self._resting = window.Position
     self._shadow.ImageTransparency = 1
-    self._veilAlpha = 0
+    self._alphaNow = 0
     self._open = false
     window.Visible = false
     self:toggle(true)
