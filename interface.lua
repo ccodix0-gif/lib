@@ -118,7 +118,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.15"
+Interface.version = "2026.07.31.16"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -3460,6 +3460,14 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
     -- stops growing at seven rows and starts scrolling instead.
     local ROW_STEP = 35
     local MAX_ROWS = 7
+    -- The search field is an option row's rectangle with the panel's inset above it, and it
+    -- is declared here rather than where it is built because the panel's first height is
+    -- worked out before the field exists. Two copies of the number is how the guess drifts
+    -- away from the real height, and a guess that is wrong is a panel that corrects itself
+    -- part way through opening.
+    local SEARCH_INSET = 6
+    local SEARCH_HEIGHT = 32
+    local SEARCH_BLOCK = SEARCH_INSET + SEARCH_HEIGHT
     local opened = nil
 
     button.MouseButton1Click:Connect(function()
@@ -3478,7 +3486,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         if ctx.closeOverlays then ctx.closeOverlays(true) end
 
         local list = getOptions()
-        local guess = math.clamp(#list, 1, MAX_ROWS) * ROW_STEP + 12 + (opts.search and 36 or 0)
+        local guess = math.clamp(#list, 1, MAX_ROWS) * ROW_STEP + 12 + (opts.search and SEARCH_BLOCK or 0)
         local panel, controller = openPanel(ctx, {
             anchor = button,
             width = 210,
@@ -3493,37 +3501,48 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         tween(arrow, 0.25, { Rotation = 180 })
         listLayout(panel, 0)
 
-        -- Search sits inset at the top of the panel, on its own rounded surface. It
-        -- used to be flush to the panel's edges and leaned on the CanvasGroup to get
-        -- its top corners rounded off; the panel is a plain frame now, so it is an
-        -- inset control like every other field in the kit.
+        -- Search sits at the top of the panel, in the same rectangle an option row gets.
+        --
+        -- The same rectangle, exactly, and that is the whole point of the numbers below. The
+        -- field used to be its own shape: 30 tall against a row's 32, a radius of 6 against a
+        -- row's 8, and six pixels of inset at the sides but only three at the top, so it sat
+        -- pressed against the panel's edge with a nine pixel gap under it. Four small
+        -- differences, none of them worth anything, and together they made the one control
+        -- above the list look like it belonged to something else.
+        --
+        -- The vertical rhythm now reads 6, field, 6, first row, and the six under the field is
+        -- the body's own top padding rather than a second number written here. So the holder
+        -- is the inset plus the field and nothing more, and if the body's padding ever changes
+        -- the gap follows it instead of drifting away from it.
+        --
+        -- The icon and the text sit where the inline list puts them, because that is the other
+        -- search field in the kit and two search fields that are nearly the same are worse
+        -- than two that are different on purpose.
         local searchBox
         if opts.search then
-            -- The holder takes the row height from the panel's layout, the field
-            -- inside it takes the inset.
             local holder = newInstance("Frame")
             holder.Name = randomName()
-            holder.Size = UDim2.new(1, 0, 0, 36)
+            holder.Size = UDim2.new(1, 0, 0, SEARCH_BLOCK)
             holder.BackgroundTransparency = 1
             holder.LayoutOrder = 0
             holder.Parent = panel
 
             local head = newInstance("Frame")
             head.Name = randomName()
-            head.Size = UDim2.new(1, -12, 0, 30)
-            head.Position = UDim2.new(0, 6, 0, 3)
+            head.Size = UDim2.new(1, -SEARCH_INSET * 2, 0, SEARCH_HEIGHT)
+            head.Position = UDim2.new(0, SEARCH_INSET, 0, SEARCH_INSET)
             head.BorderSizePixel = 0
             head.Parent = holder
             themed(head, "BackgroundColor3", "control")
-            corner(head, 6)
+            corner(head, 8)
 
-            local sicon = makeIcon(head, "search", UDim2.new(0, 16, 0, 16), "iconDim")
+            local sicon = makeIcon(head, "search", UDim2.new(0, 15, 0, 15), "iconDim")
             sicon.AnchorPoint = Vector2.new(0, 0.5)
-            sicon.Position = UDim2.new(0, 9, 0.5, 0)
+            sicon.Position = UDim2.new(0, 10, 0.5, 0)
             searchBox = newInstance("TextBox")
             searchBox.BackgroundTransparency = 1
-            searchBox.Position = UDim2.new(0, 31, 0, 0)
-            searchBox.Size = UDim2.new(1, -41, 1, 0)
+            searchBox.Position = UDim2.new(0, 32, 0, 0)
+            searchBox.Size = UDim2.new(1, -42, 1, 0)
             searchBox.TextSize = 14
             searchBox.Text = ""
             searchBox.ClearTextOnFocus = false
