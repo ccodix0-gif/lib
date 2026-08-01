@@ -35,6 +35,8 @@
 --   card:segmented(text, options, get, set)         -- inline pills, no popover
 --   card:list(options, get, set)                    -- inline searchable list
 --   card:stepper(text, min, max, step, get, set)
+--   card:status(text, get [, { lit = fn }])         -- read only row: a dot and the value
+--   card:theme([{ preset = false, keys = {..}, reset = false }])  -- the whole palette editor
 --   card:section(text)                              -- small caption between groups of controls
 --   card:label(text)                                -- wraps to multiple lines
 --   card:divider()
@@ -60,8 +62,9 @@
 -- CONFIGS: win:saveConfig(name) / loadConfig(name) / listConfigs() / deleteConfig(name)
 --   win:setAutoLoad(name|nil) / getAutoLoad()       -- which config loads on launch
 --   win:setAutoSave(name|nil)                        -- auto persists that config a moment after any change
---   A config holds the flags, the palette with its opacity, the toggle key, the
---   language and the position and visibility of every detached panel.
+--   A config holds the flags, the palette with its opacity, the type family and its
+--   weights, the toggle key, the language and the position and visibility of every
+--   detached panel.
 --
 -- OVERLAYS (detached, draggable, positions saved with the config):
 --   win:watermark{...}      -- logo, brand, fps, time strip
@@ -77,9 +80,16 @@
 --   (show/hide the window), win:unload() (remove everything the library made).
 --   win:refit() re-fits to the screen, and it already runs on a timer.
 --   win:applyTheme(name) / UI.themeNames() for the palette presets.
+--   win:settingsTab(opts) builds the whole settings page (window key, theme, configs,
+--     language) and returns the tab and its page, so a script can add its own cards:
+--     local tab, page = win:settingsTab({ language = { { label = "English", code = "en" } } })
 --   win:exportConfig() / win:importConfig(text) move a config through the clipboard.
 --   UI.licence(fn [, seconds]) gates window creation on your own check.
 --   UI.setFont(family) swaps the type family for a language the default misses.
+--   UI.setWeight(w) puts one weight under all of the text, UI.setRoleWeight(role, w) under
+--     one kind of it; roles are regular, medium, semibold, bold and w is a name
+--     ("thin".."heavy") or an Enum.FontWeight. UI.roleWeights() reads them back, and both
+--     the family and the weights are saved with the config.
 --   UI.setLogger(fn) receives the diagnostics; nothing is printed without it.
 
 -- Services and the executor globals we rely on are captured once, at load time,
@@ -106,7 +116,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.7"
+Interface.version = "2026.07.31.8"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -204,15 +214,64 @@ local THEMES = {
 }
 Interface.themes = THEMES
 
+-- The order presets are offered in, which is not alphabetical on purpose.
+--
+-- THEMES is a hash, so it has no order of its own and the list used to be sorted by
+-- name. That put the kit's own scheme fifth of six, below schemes it is the default
+-- for, which reads as though the thing you are looking at were one of the
+-- alternatives. So the default leads and the rest follow in alphabetical order, and a
+-- preset added later goes on the end, where a caller expects the one they just added
+-- to be rather than somewhere in the middle.
+local THEME_ORDER = { "NewReality", "Ember", "Graphite", "Midnight", "Moss", "Paper" }
+
+-- What a palette key is called on a card. Kept here rather than in the caller so the
+-- built in theme card names its rows the same way everywhere and a translation covers
+-- them once, instead of every script inventing its own wording for the same key.
+local THEME_KEY_LABEL = {
+    accent = "Accent",
+    background = "Background",
+    sidebar = "Sidebar",
+    card = "Cards",
+    cardTop = "Card Header",
+    control = "Controls",
+    controlHover = "Control Hover",
+    track = "Track",
+    stroke = "Outline",
+    text = "Text",
+    subtext = "Subtext",
+    icon = "Icons",
+    iconDim = "Dim Icons",
+    knob = "Knob",
+}
+
+-- The six a user actually reaches for. The rest are still there through opts.keys, but
+-- a card that lists all fourteen is a wall of swatches nobody reads.
+local THEME_KEYS_SHOWN = { "accent", "background", "sidebar", "card", "control", "track" }
+
 function Interface.addTheme(name, keys)
     if type(name) ~= "string" or type(keys) ~= "table" then return end
+    if THEMES[name] == nil then THEME_ORDER[#THEME_ORDER + 1] = name end
     THEMES[name] = keys
 end
 
 function Interface.themeNames()
     local out = {}
-    for name in pairs(THEMES) do out[#out + 1] = name end
-    table.sort(out)
+    local listed = {}
+    for _, name in ipairs(THEME_ORDER) do
+        if THEMES[name] and not listed[name] then
+            listed[name] = true
+            out[#out + 1] = name
+        end
+    end
+    -- Anything in THEMES that the order list has not heard of, which is a preset
+    -- written straight into UI.themes rather than through addTheme. Sorted, because
+    -- there is no stated order to respect.
+    local rest = {}
+    for name in pairs(THEMES) do
+        if not listed[name] then rest[#rest + 1] = name end
+    end
+    table.sort(rest)
+    for _, name in ipairs(rest) do out[#out + 1] = name end
     return out
 end
 
@@ -474,11 +533,18 @@ end
 --   opts.fade = false  the part animates its own transparency between states
 --                      (an inactive sidebar tab, an unselected list row), so the
 --                      palette opacity must not fight the animation.
+--   opts.paint = false the part's colour belongs to something else and only its
+--                      opacity follows the key. A bar's fill is the case: the shading
+--                      gradient over it owns the colour, and the fill underneath has to
+--                      stay white for the gradient to be able to lighten as well as
+--                      darken. Without this the fill would need either two owners
+--                      fighting over one property or its own opacity handling.
 local function themed(instance, prop, key, opts)
-    instance[prop] = PALETTE[key]
+    local paints = not (opts and opts.paint == false)
+    if paints then instance[prop] = PALETTE[key] end
     local reg = THEME_REG[key]
     if reg then
-        tagAdd(reg, instance, { prop = prop, fade = not (opts and opts.fade == false) })
+        tagAdd(reg, instance, { prop = prop, fade = not (opts and opts.fade == false), paint = paints })
     end
     if not (opts and opts.fade == false) then
         local alpha = PALETTE_A[key]
@@ -593,6 +659,28 @@ function Interface.setRoleWeight(role, weight)
     if weight == nil then return end
     ROLE_WEIGHT[role] = weight
     refaceAll()
+end
+
+-- What each role is wearing, by the same names setWeight takes.
+--
+-- Written as names rather than as the enums because this goes into a config file, and a
+-- file holding "bold" can still be read by a build whose enum values have moved. It also
+-- means a script can read the weights back, offer them and write them again without
+-- knowing anything about Enum.FontWeight.
+local WEIGHT_OF = {}
+for name, weight in pairs(WEIGHT_NAMES) do WEIGHT_OF[weight] = name end
+
+function Interface.roleWeights()
+    local out = {}
+    for _, role in ipairs(ROLES) do
+        out[role] = WEIGHT_OF[ROLE_WEIGHT[role]] or "regular"
+    end
+    return out
+end
+
+-- The family the interface is drawing in, so a config can put it back.
+function Interface.getFont()
+    return FONT_FAMILY
 end
 
 -- Translations ----------------------------------------------------------------
@@ -1628,54 +1716,65 @@ end
 
 -- The shading on a filled bar.
 --
--- A gradient modulates the fill it sits on, so this is a brightness ramp rather than
--- a second colour: it works on any accent and on any theme, and it keeps working
--- after either is changed, with nothing to re-register. Every bar in the kit uses it,
--- sliders and progress rows alike, because one bar shaded and the next one flat reads
--- as a mistake.
+-- Every bar in the kit carries it, sliders and progress rows alike, because one bar
+-- shaded and the next one flat reads as a mistake. It runs the full width of the fill
+-- at every value, so the slope is the same whether the bar is at a tenth or full, and
+-- the shading reads as one piece across the track rather than as per bar decoration.
 --
--- What it has to adapt to is its own width. A gradient spans the element it is on and
--- a fill is only as wide as its value, so left alone the entire ramp is crushed into
--- a bar sitting at ten percent: a short bar was shaded as steeply as a full one and
--- ended up visibly darker at the same point on the track. So the far end of the ramp
--- is rewritten from the ratio, and the bar always shows the ramp from its start up to
--- its own share of it. The slope is then the same at every value, which is what makes
--- it read as one piece of shading across the track rather than per bar decoration.
--- Every bar's gradient, so a palette change can rebuild them. Weak keys: a ramp goes
--- when the bar it shades does.
+-- The gradient owns the bar's colour, and the fill under it is white.
+--
+-- That is the whole trick, and it is there because a UIGradient multiplies whatever it
+-- sits on. Over a coloured fill it can therefore only ever darken, which is fine over
+-- cyan and useless over navy: multiplying a dark accent takes it to black and the
+-- shading vanishes into the track behind it. Painting the fill white and putting the
+-- real colour in the keypoints puts both directions in reach, so the ramp can run
+-- below the accent at one end and above it at the other.
+--
+-- The fill still follows the accent's opacity through the theme registry, it just does
+-- not follow its colour. See themed() and opts.paint.
+--
+-- Weak keys: a ramp goes when the bar it shades does. The value is the fixed colour a
+-- bar was given, or false when it follows the accent.
 local BAR_RAMPS = setmetatable({}, { __mode = "k" })
+local RAMP_DARK = Color3.new(0, 0, 0)
+local RAMP_LIGHT = Color3.new(1, 1, 1)
 
-local function rampColours(accent)
-    -- The ramp adapts to the colour it is shading, which is the one thing a hardcoded
-    -- grey to white sequence could not do. It is a multiply, so these are brightness
-    -- factors: the same depth that reads well over cyan takes a dark blue fill most of
-    -- the way to black, and over a pale accent on a light theme it reads as dirt. So the
-    -- depth comes from how bright the accent is. A bright accent gets the full ramp, a
-    -- dark one gets a shallow one.
-    local lit = luminance(accent or PALETTE.accent)
-    local floor = math.clamp(0.72 - 0.32 * lit, 0.42, 0.86)
+local function rampColours(color)
+    local base = color or PALETTE.accent
+    -- Which way the ramp runs comes from how bright the colour is, and it rotates
+    -- rather than switching over: a bright accent is shaded down towards the start of
+    -- the bar, which is the look the kit has always had, and as the accent darkens that
+    -- shading gives way to a lift towards the end. In the middle both are present and
+    -- shallow. A hard threshold was the obvious version and the wrong one, since two
+    -- accents a shade apart would then be shaded in opposite directions.
+    local weight = math.clamp((luminance(base) - 0.15) / 0.45, 0, 1)
     return ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.new(floor, floor, floor)),
-        ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)),
+        ColorSequenceKeypoint.new(0, base:Lerp(RAMP_DARK, 0.55 * weight)),
+        ColorSequenceKeypoint.new(1, base:Lerp(RAMP_LIGHT, 0.48 * (1 - weight))),
     })
 end
 
 local function refreshBarRamps(accent)
-    local colours = rampColours(accent)
-    for ramp in pairs(BAR_RAMPS) do
+    for ramp, fixed in pairs(BAR_RAMPS) do
         if ramp.Parent then
-            ramp.Color = colours
+            ramp.Color = rampColours(typeof(fixed) == "Color3" and fixed or accent)
         else
             BAR_RAMPS[ramp] = nil
         end
     end
 end
 
-local function barRamp(fill)
+-- barRamp(fill [, color]) takes over the fill's colour. Without a colour the bar
+-- follows the accent, with one it stays that colour through a theme change.
+local function barRamp(fill, color)
+    fill.BackgroundColor3 = RAMP_LIGHT
+    if not color then
+        themed(fill, "BackgroundColor3", "accent", { paint = false })
+    end
     local ramp = newInstance("UIGradient")
-    ramp.Color = rampColours()
+    ramp.Color = rampColours(color)
     ramp.Parent = fill
-    BAR_RAMPS[ramp] = true
+    BAR_RAMPS[ramp] = color or false
     return ramp
 end
 
@@ -1961,6 +2060,10 @@ local function openPanel(ctx, cfg)
     -- Which way the panel went when its row was scrolled out, so it can come back
     -- the same way.
     local lastExit = nil
+    -- Which side of its row the panel ended up on, written by place(). It decides which
+    -- way the panel travels on the way in: out of the row and away from it, whichever
+    -- side that turns out to be.
+    local onTop = false
     local setAlpha = groupFade(panel)
     local alphaNow = 0
     setAlpha(0)
@@ -2043,7 +2146,7 @@ local function openPanel(ctx, cfg)
         local x = at.X - origin.X + (cfg.offsetX or 0)
         local below = at.Y - origin.Y + size.Y + gap
         local above = at.Y - origin.Y - gap
-        resting = ctx.fitPanel(x, below, width, height, above)
+        resting, onTop = ctx.fitPanel(x, below, width, height, above)
 
         -- Two different things can move a panel, and they want opposite treatment.
         --
@@ -2136,6 +2239,21 @@ local function openPanel(ctx, cfg)
     -- direction of the scroll half the time. The travel is 26 pixels, enough to be
     -- a movement rather than a twitch on a panel that is already going transparent.
     local CLIP_TRAVEL = 26
+
+    -- Where the panel starts its entry, measured from where it belongs.
+    --
+    -- A panel sitting below its row starts a little higher and settles down, so it reads
+    -- as coming out from under the control that opened it. One that has been flipped above
+    -- its row for lack of room below has to do the opposite. Starting higher there means
+    -- starting further from the control and travelling onto it, which tells the wrong
+    -- story and is what read as a panel dropping in from nowhere: the movement argued with
+    -- the placement every time a control near the bottom of the screen was used. So the
+    -- sign follows the side, and in both cases the panel comes out of its row.
+    local ENTER_TRAVEL = 14
+    local function entryOffset()
+        return onTop and ENTER_TRAVEL or -ENTER_TRAVEL
+    end
+
     local shown = true
     local function clip()
         if closed then return end
@@ -2159,7 +2277,7 @@ local function openPanel(ctx, cfg)
             -- Comes back from the side it left by, so leaving and returning are one
             -- movement reversed rather than two unrelated ones.
             panel.Visible = true
-            slide(lastExit or -CLIP_TRAVEL, 0, 1, 0.3)
+            slide(lastExit or entryOffset(), 0, 1, 0.3)
         else
             lastExit = upward and -CLIP_TRAVEL or CLIP_TRAVEL
             slide(nil, lastExit, 0, 0.22, function()
@@ -2237,13 +2355,18 @@ local function openPanel(ctx, cfg)
         local fromOffset = slideOffset
         local fromAlpha = alphaNow
         local drawn = drawnY or base.Y.Offset
+        -- Back into the row it came out of, which is the entry reversed. A panel above its
+        -- row sinks upwards. Sinking down from there would have it move across the control
+        -- as it goes, and the last thing a closing panel should do is cover the thing that
+        -- closed it.
+        local sink = onTop and -8 or 8
         local elapsed = 0
         local stop
         stop = addTicker(0, function(dt)
             elapsed += dt
             local t = math.min(elapsed / 0.14, 1)
             local eased = 1 - (1 - t) ^ 3
-            local offset = fromOffset + (8 - fromOffset) * eased
+            local offset = fromOffset + (sink - fromOffset) * eased
             panel.Position = UDim2.new(
                 base.X.Scale, base.X.Offset,
                 base.Y.Scale, drawn + offset
@@ -2295,7 +2418,10 @@ local function openPanel(ctx, cfg)
     -- point sits on (the top left, so every panel unrolled to the right) and
     -- re-renders the text at a fractional size on every frame, which is what made the
     -- labels crawl while a menu opened.
-    slide(-14, 0, 1, 0.3)
+    --
+    -- place() ran just above, so the side the panel landed on is already known and the
+    -- entry can travel out of the row rather than always downwards.
+    slide(entryOffset(), 0, 1, 0.3)
 
     return panel, controller
 end
@@ -2381,12 +2507,22 @@ local function makePill(row, ctx, get, set)
             render(get())
         end)
     end
-    pill.MouseEnter:Connect(function()
-        if not get() then tween(pill, 0.14, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT) end
-    end)
-    pill.MouseLeave:Connect(function()
-        if not get() then tween(pill, 0.18, { BackgroundColor3 = PALETTE.track }, EASE_SOFT) end
-    end)
+    -- Hover feedback only where there is something to press.
+    --
+    -- A toggle built without a setter is a read out of a value the script owns, and it used
+    -- to light up under the pointer like any other switch and then do nothing when clicked.
+    -- Offering the affordance and refusing the press is worse than not offering it: it reads
+    -- as a control that has broken rather than as a value being reported. Card:status is
+    -- the row to use for a value like that, and this keeps the toggle honest for the scripts
+    -- that already pass a getter on its own.
+    if set then
+        pill.MouseEnter:Connect(function()
+            if not get() then tween(pill, 0.14, { BackgroundColor3 = PALETTE.controlHover }, EASE_SOFT) end
+        end)
+        pill.MouseLeave:Connect(function()
+            if not get() then tween(pill, 0.18, { BackgroundColor3 = PALETTE.track }, EASE_SOFT) end
+        end)
+    end
     pill.MouseButton1Click:Connect(function()
         -- Without a setter the control is a read out of someone else's value, so
         -- the press is ignored rather than raising. win:flag returns two values
@@ -2647,8 +2783,8 @@ function Controls.slider(parent, ctx, text, min, max, get, set, decimals, format
     local fill = Instance.new("Frame")
     fill.BorderSizePixel = 0
     fill.Parent = track
-    themed(fill, "BackgroundColor3", "accent")
     corner(fill, 3)
+    -- Paints the fill as well as shading it, so the accent is written in one place.
     barRamp(fill)
 
     local knob = Instance.new("Frame")
@@ -3642,6 +3778,92 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     return row
 end
 
+-- A value the script owns and the user only reads: the label, a dot and the value.
+--
+-- This exists because of what it replaces. A toggle built without a setter draws the right
+-- state and then ignores every press, which is correct and still wrong: it looks exactly
+-- like a switch, so it gets clicked, and a switch that will not move reads as a broken
+-- control rather than as a read out. A dot and a word cannot be mistaken for something
+-- operable.
+--
+-- get returns a boolean, drawn as On or Off with a dot the accent lights when it is true,
+-- or a string, drawn as it is with no dot. opts.lit is a getter for the dot on a row whose
+-- value is a string, for the case where the words and the light say different things.
+function Controls.status(parent, ctx, text, get, opts)
+    opts = opts or {}
+    local row = controlRow(parent, 26)
+    rowLabel(row, text, 140)
+
+    -- A dot only where there is a state for it to show. A permanently unlit dot beside a
+    -- number reads as a warning light that never comes on. nil counts as a state, because a
+    -- getter reading something that has not been set yet returns nil first and a boolean
+    -- afterwards, and the row would otherwise be built without the dot it needs.
+    local lit = opts.lit
+    if lit == nil then
+        local sample = get()
+        if type(sample) == "boolean" or sample == nil then lit = get end
+    end
+
+    local dot
+    if lit then
+        dot = Instance.new("Frame")
+        dot.AnchorPoint = Vector2.new(1, 0.5)
+        dot.Position = UDim2.new(1, 0, 0.5, 0)
+        dot.Size = UDim2.new(0, 8, 0, 8)
+        dot.BorderSizePixel = 0
+        dot.Parent = row
+        corner(dot, 4)
+    end
+
+    local value = Instance.new("TextLabel")
+    value.AnchorPoint = Vector2.new(1, 0.5)
+    value.Position = UDim2.new(1, dot and -14 or 0, 0.5, 0)
+    value.Size = UDim2.new(0, 120, 1, 0)
+    value.BackgroundTransparency = 1
+    value.TextSize = 14
+    value.TextXAlignment = Enum.TextXAlignment.Right
+    value.TextTruncate = Enum.TextTruncate.AtEnd
+    value.Parent = row
+    faced(value, "medium")
+
+    -- Through the phrase table, so On and Off are translated along with everything else the
+    -- kit draws, and so is a word the script reports if the script has a phrase for it.
+    local setPhrase = localized(value, "Text", "")
+    local shownPhrase = nil
+
+    -- The word is text rather than subtext while the row is on, so a row that is on can be
+    -- picked out of a column of rows that are off without reading any of them. Neither the
+    -- word nor the dot is in the palette registry, because which colour each wants depends
+    -- on the value rather than on the key.
+    local function repaint()
+        local raw = get()
+        local phrase
+        if type(raw) == "boolean" or raw == nil then
+            phrase = raw and "On" or "Off"
+        else
+            phrase = tostring(raw)
+        end
+        -- Only on a change: this runs on every frame of a palette change, and rebinding the
+        -- phrase each time would put a translation lookup on the frame driver for nothing.
+        if phrase ~= shownPhrase then
+            shownPhrase = phrase
+            setPhrase(phrase)
+        end
+        local on = lit and lit() and true or false
+        value.TextColor3 = on and shownColor("text") or shownColor("subtext")
+        if dot then
+            dot.BackgroundColor3 = on and shownColor("accent") or shownColor("iconDim")
+        end
+    end
+    addStatePainter(row, repaint)
+    -- A read out has no event of its own to follow, so it is re-read whenever anything else
+    -- is: a config load, or a script calling refreshAll after changing what it reports.
+    if ctx and ctx._refresh then
+        table.insert(ctx._refresh, repaint)
+    end
+    return row
+end
+
 -- Segmented control: a row of mutually exclusive pills (Toggle / Hold / Always).
 -- One accent block slides between them instead of each pill repainting itself,
 -- which is what makes the change read as one movement.
@@ -3727,6 +3949,10 @@ function Controls.segmented(parent, ctx, text, options, get, set)
             marker.Size = target.Size
         end
     end
+    -- Which option the pointer is over, so a repaint does not undo a hover. The palette
+    -- pass below runs on every frame of a theme change, and without this a change made
+    -- while the pointer rested on an option kept snapping that option back to subtext.
+    local hovered = nil
     local function render(animate)
         local current = get()
         -- The selected label sits on the accent block, so its colour is picked
@@ -3757,9 +3983,11 @@ function Controls.segmented(parent, ctx, text, options, get, set)
         bpad.Parent = btn
         buttons[option] = btn
         btn.MouseEnter:Connect(function()
+            hovered = option
             if get() ~= option then tween(btn, 0.14, { TextColor3 = PALETTE.text }, EASE_SOFT) end
         end)
         btn.MouseLeave:Connect(function()
+            if hovered == option then hovered = nil end
             if get() ~= option then tween(btn, 0.16, { TextColor3 = PALETTE.subtext }, EASE_SOFT) end
         end)
         btn.MouseButton1Click:Connect(function()
@@ -3768,6 +3996,29 @@ function Controls.segmented(parent, ctx, text, options, get, set)
             render(true)
         end)
     end
+
+    -- These labels are not in the palette registry, because which colour each one wants
+    -- depends on which option is selected. So they repaint themselves at the end of every
+    -- palette pass, from the colour on screen at that moment rather than the one the
+    -- change is heading for.
+    --
+    -- Without this the selected label kept the contrast colour worked out against the old
+    -- accent: switching from a light preset to a dark one left the one option sitting on
+    -- the accent block dark on dark until it happened to be clicked, which is the label in
+    -- the row that is guaranteed to be unreadable.
+    addStatePainter(row, function()
+        local current = get()
+        local onAccent = contrastOn(shownColor("accent"))
+        for value, btn in pairs(buttons) do
+            if value == current then
+                btn.TextColor3 = onAccent
+            elseif value == hovered then
+                btn.TextColor3 = shownColor("text")
+            else
+                btn.TextColor3 = shownColor("subtext")
+            end
+        end
+    end)
     -- The track follows the strip, so the recess is exactly as wide as the labels,
     -- and the row's own label gives up whatever room the strip takes. A fixed
     -- reservation was enough for the English options and not for a translation
@@ -3892,6 +4143,17 @@ function Controls.list(parent, ctx, options, get, set, opts)
     end
     render()
     if ctx and ctx._refresh then table.insert(ctx._refresh, render) end
+    -- The selected row's name is the corrected accent and every other name is text, so which
+    -- colour each one wants depends on which row is selected. render() runs only when the
+    -- selection changes, which left the selected name wearing the accent it happened to be
+    -- selected under: pick a preset of a different colour and one row in the list stayed the
+    -- old colour until it was clicked. These repaint from the colour on screen at the end of
+    -- every palette pass instead, so they follow the change like everything around them.
+    addStatePainter(container, function()
+        for _, refs in pairs(rows) do
+            refs.label.TextColor3 = refs.on and shownColor("accentSoft") or shownColor("text")
+        end
+    end)
     if searchBox then
         searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             local q = searchBox.Text:lower()
@@ -4001,6 +4263,7 @@ function Card:_index(label, row)
 end
 
 function Card:label(text) return Controls.label(self._frame, text) end
+function Card:status(text, get, opts) return self:_index(text, Controls.status(self._frame, self._ctx, text, get, opts)) end
 function Card:section(text) return Controls.section(self._frame, text) end
 function Card:button(text, fn) return self:_index(text, Controls.button(self._frame, self._ctx, text, fn)) end
 function Card:input(text, placeholder, get, set) return self:_index(text, Controls.input(self._frame, self._ctx, text, placeholder, get, set)) end
@@ -4012,6 +4275,47 @@ function Card:colorpicker(text, getRgb, setRgb, opts) return self:_index(text, C
 function Card:segmented(text, options, get, set) return self:_index(text, Controls.segmented(self._frame, self._ctx, text, options, get, set)) end
 function Card:list(options, get, set, opts) return Controls.list(self._frame, self._ctx, options, get, set, opts) end
 function Card:stepper(text, min, max, step, get, set) return self:_index(text, Controls.stepper(self._frame, self._ctx, text, min, max, step, get, set)) end
+
+-- The palette editor, as a card method.
+--
+-- A preset dropdown, a colour row per key and a reset. Every script that ships a
+-- settings page was writing this same block out by hand, and it existed twice inside
+-- this repo in two slightly different shapes, which is the usual sign it belongs in the
+-- library. Because the rows are named here they also go through the phrase table once
+-- rather than once per script.
+--
+-- opts.preset = false   drop the preset dropdown and keep the colour rows
+-- opts.keys = { .. }    which palette keys get a row, in that order
+-- opts.reset = false    drop the reset button
+function Card:theme(opts)
+    opts = opts or {}
+    local win = self._ctx
+    if opts.preset ~= false then
+        -- The list is passed as a function, so a preset registered by the script after
+        -- the card was built still turns up in the dropdown.
+        self:dropdown("Preset", Interface.themeNames, function()
+            return win:getTheme() or THEME_ORDER[1]
+        end, function(name)
+            win:applyTheme(name)
+        end, { search = opts.search == true })
+    end
+    for _, key in ipairs(opts.keys or THEME_KEYS_SHOWN) do
+        -- Only real keys, and never accentSoft: it is computed from the accent and the
+        -- background, so a row for it would offer a colour that is overwritten the next
+        -- time either of those moves.
+        if DEFAULTS[key] and key ~= "accentSoft" then
+            self:colorpicker(THEME_KEY_LABEL[key] or key, function()
+                return win:getColor(key)
+            end, function(rgb)
+                win:setColor(key, rgb)
+            end)
+        end
+    end
+    if opts.reset ~= false then
+        self:button("Reset Theme", function() win:resetTheme() end)
+    end
+    return self
+end
 -- A thin divider line inside a card body.
 function Card:divider()
     local line = Instance.new("Frame")
@@ -4795,7 +5099,7 @@ local function paintKey(key, color, alpha)
     local reg = THEME_REG[key]
     if not reg then return end
     tagWalk(reg, function(inst, entry)
-        inst[entry.prop] = color
+        if entry.paint ~= false then inst[entry.prop] = color end
         if entry.fade then
             fadeProp(inst, entry.prop, alpha)
         end
@@ -4905,6 +5209,123 @@ end
 
 function Window:getTheme()
     return self.theme
+end
+
+-- A settings page, built in.
+--
+-- The window's own key, the palette, the configs and the language: none of it belongs to
+-- the script, all of it was being written out by every script that used the kit, and
+-- because each one wrote it slightly differently the same page looked different in every
+-- product. So the kit ships the page and a caller drops whatever it does not want.
+--
+-- The tab and its page both come back, so a script can hang its own cards on the same page
+-- instead of having to choose between this and a page of its own. The page is returned
+-- rather than looked up again because tab:sub(name) builds a new sub-tab every time it is
+-- called: asking for "Settings" a second time would put a second identical sub-tab beside
+-- the first.
+--
+-- opts.name / icon / group / subtitle / page   how the tab and its sub-page are labelled
+-- opts.window = false    drop the show and hide key and the unload button
+-- opts.theme  = false    drop the palette card, or a table passed on to Card:theme
+-- opts.configs = false   drop the config manager
+-- opts.language          list of { label = "English", code = "en" } for the language card
+function Window:settingsTab(opts)
+    opts = opts or {}
+    local tab = self:tab({
+        name = opts.name or "Settings",
+        icon = opts.icon or "settings",
+        group = opts.group or "Other",
+        subtitle = opts.subtitle or "Interface options",
+    })
+    local page = tab:sub(opts.page or "Settings")
+
+    if opts.window ~= false then
+        local card = page:card({ title = "Window", icon = "settings", subtitle = "Show and hide", column = "left" })
+        card:keybind("Toggle Interface", function()
+            return self.toggleKey and self.toggleKey.Name
+        end, function(name)
+            local ok, key = pcall(function() return Enum.KeyCode[name] end)
+            if ok and key then
+                self.toggleKey = key
+                self:markDirty()
+            end
+        end)
+        card:button("Unload", function() self:unload() end)
+    end
+
+    if opts.theme ~= false then
+        local card = page:card({ title = "Theme", icon = "palette", subtitle = "Every key is live", column = "left" })
+        card:theme(type(opts.theme) == "table" and opts.theme or nil)
+    end
+
+    if opts.configs ~= false then
+        -- default is always offered, whether or not it has been written yet, because it
+        -- is the name the kit itself saves under and a list that hides it until the first
+        -- save leaves the card with nothing in it.
+        local selected = self:getAutoLoad() or "default"
+        local newName = ""
+        local function names()
+            local list = { "default" }
+            for _, name in ipairs(self:listConfigs()) do
+                if name ~= "default" then list[#list + 1] = name end
+            end
+            return list
+        end
+
+        local card = page:card({ title = "Configs", icon = "device-floppy", subtitle = "Per game", column = "right" })
+        card:dropdown("Config", names, function() return selected end, function(v) selected = v end, { search = true })
+        card:input("Name", "new config name", function() return newName end, function(v) newName = v end)
+        card:button("Create", function()
+            if newName == "" then return end
+            if self:saveConfig(newName) then
+                selected = newName
+                newName = ""
+                self:refreshAll()
+            end
+        end)
+        card:button("Save", function() self:saveConfig(selected) end)
+        card:button("Load", function()
+            if self:loadConfig(selected) then self:refreshAll() end
+        end)
+        card:button("Delete", function()
+            -- default is the fallback the kit loads from, so it stays.
+            if selected ~= "default" and self:deleteConfig(selected) then
+                selected = "default"
+                self:refreshAll()
+            end
+        end)
+        card:divider()
+        card:toggle("Load on launch", function() return self:getAutoLoad() ~= nil end, function(v)
+            self:setAutoLoad(v and selected or nil)
+        end)
+        card:toggle("Auto save", function() return self:getAutoSave() ~= nil end, function(v)
+            self:setAutoSave(v and selected or nil)
+        end)
+    end
+
+    -- Only when the caller names the languages, and only when there is more than one of
+    -- them. The kit knows which codes have been registered but not what to call them on
+    -- screen: a language's name belongs in its own language, so "Русский" rather than
+    -- "ru", and that is the caller's to supply.
+    local langs = opts.language
+    if type(langs) == "table" and #langs > 1 then
+        local labels = {}
+        for _, entry in ipairs(langs) do labels[#labels + 1] = entry.label end
+        local card = page:card({ title = "Language", icon = "world", subtitle = "Re-labels without a rebuild", column = "right" })
+        card:list(labels, function()
+            local code = self:getLocale()
+            for _, entry in ipairs(langs) do
+                if entry.code == code then return entry.label end
+            end
+            return labels[1]
+        end, function(label)
+            for _, entry in ipairs(langs) do
+                if entry.label == label then self:setLocale(entry.code) return end
+            end
+        end, { search = false })
+    end
+
+    return tab, page
 end
 
 -- Re-apply every control's visual from its current value (used after loading a
@@ -5045,6 +5466,11 @@ function Window:snapshot()
         themeName = self.theme,
         toggleKey = (typeof(self.toggleKey) == "EnumItem") and self.toggleKey.Name or nil,
         locale = Interface.getLocale(),
+        -- The type as well as the palette. Weight is as much a matter of taste as colour
+        -- is, and a choice that had to be made again on every launch is not a choice the
+        -- kit was really offering.
+        font = Interface.getFont(),
+        weights = Interface.roleWeights(),
         recent = recent,
         overlays = overlays,
     }
@@ -5084,6 +5510,17 @@ function Window:restore(data)
     if type(data.locale) == "string" and data.locale ~= "" then
         Interface.setLocale(data.locale)
         self.locale = data.locale
+    end
+    -- Then the type, for the same reason and one more: both of these re-face every label
+    -- in the interface, and doing that after the colour pass would repaint work that is
+    -- about to be thrown away.
+    if type(data.font) == "string" and data.font ~= "" then
+        Interface.setFont(data.font)
+    end
+    if type(data.weights) == "table" then
+        for role, weight in pairs(data.weights) do
+            Interface.setRoleWeight(role, weight)
+        end
     end
     -- Restore the saved theme colours through the themed registry. A three
     -- number entry comes from an older config and means full opacity.
@@ -5784,7 +6221,11 @@ function Window:keybindList(opts)
         dot.BorderSizePixel = 0
         dot.ZIndex = OVERLAY_Z
         dot.Parent = row
-        themed(dot, "BackgroundColor3", "subtext", { fade = false })
+        -- Deliberately not in the theme registry. The dot is the corrected accent while its
+        -- bind is live and subtext while it is not, so a registry that painted it by key
+        -- would paint a live one subtext along with every other subtext coloured thing, and
+        -- it would read as switched off. The painter below owns it.
+        dot.BackgroundColor3 = PALETTE.subtext
         corner(dot, 4)
 
         local lbl = newInstance("TextLabel")
@@ -5797,7 +6238,8 @@ function Window:keybindList(opts)
         lbl.ZIndex = OVERLAY_Z
         lbl.Parent = row
         faced(lbl, "medium")
-        themed(lbl, "TextColor3", "subtext", { fade = false })
+        -- Same again: full text while the bind is live, subtext while it is not.
+        lbl.TextColor3 = PALETTE.subtext
         localized(lbl, "Text", bind.label)
 
         local keyLbl = newInstance("TextLabel")
@@ -5817,12 +6259,26 @@ function Window:keybindList(opts)
         rows[#rows + 1] = { row = row, dot = dot, lbl = lbl, key = keyLbl, bind = bind }
     end
 
-    -- The ticker below only repaints a row when its active state changes, which
-    -- means a row that was already lit kept the accent it was lit with. Dropping
-    -- the cached state on a palette change makes the next tick repaint it.
+    -- The ticker below only writes a row when its own state changes, so on a palette change
+    -- a row that was already lit kept the accent it was lit with. This repaints the two
+    -- state coloured parts of every row from the colour on screen at the end of each palette
+    -- pass, which means they follow the ease rather than snapping when it ends.
+    --
+    -- Clearing the cached state and waiting for the next tick was the earlier attempt. It
+    -- picked the right colour up eventually, but a tick is a tenth of a second away and the
+    -- registry was repainting the dot subtext on every frame until then, so a lit dot
+    -- flickered for the length of the change.
+    addStatePainter(panel, function()
+        for _, r in ipairs(rows) do
+            local live = r.lastActive and true or false
+            r.dot.BackgroundColor3 = live and shownColor("accentSoft") or shownColor("subtext")
+            r.lbl.TextColor3 = live and shownColor("text") or shownColor("subtext")
+        end
+    end)
+    -- The key text is not state coloured, but it is translated, and a language change has to
+    -- reach the "None" a row falls back to.
     table.insert(self._refresh, function()
         for _, r in ipairs(rows) do
-            r.lastActive = nil
             r.lastKey = nil
         end
     end)
@@ -5933,7 +6389,10 @@ function Hud:row(label, value, opts)
         dot.BorderSizePixel = 0
         dot.ZIndex = OVERLAY_Z
         dot.Parent = row
-        themed(dot, "BackgroundColor3", "subtext", { fade = false })
+        -- Out of the theme registry on purpose: lit it is the corrected accent, unlit it is
+        -- subtext, so painting it by key would paint a lit one as though it were off. The
+        -- painter further down owns both it and the name beside it.
+        dot.BackgroundColor3 = PALETTE.subtext
         corner(dot, 4)
         textX = 16
     elseif cfg.icon then
@@ -5954,7 +6413,13 @@ function Hud:row(label, value, opts)
     labelText.ZIndex = OVERLAY_Z
     labelText.Parent = row
     faced(labelText, "medium")
-    themed(labelText, "TextColor3", "text", { fade = false })
+    if dot then
+        -- A row with a dot has a state, and the name follows it: full text while the dot is
+        -- lit, subtext while it is not. So it is painted with the dot rather than by key.
+        labelText.TextColor3 = PALETTE.text
+    else
+        themed(labelText, "TextColor3", "text", { fade = false })
+    end
     local setLabelPhrase = localized(labelText, "Text", cfg.label or "")
 
     local valueText = newInstance("TextLabel")
@@ -5992,12 +6457,18 @@ function Hud:row(label, value, opts)
         end,
     }
 
-    -- A lit dot keeps the accent it was lit with, because the poll below only
-    -- repaints on a change of state. Clearing the cache on a palette change lets
-    -- the next tick pick the new accent up.
-    if dot and self._ctx and self._ctx._refresh then
-        table.insert(self._ctx._refresh, function()
-            handle._lastDot = nil
+    -- The poll below only writes the dot and the name when the state they show changes, so on
+    -- a palette change a lit row kept the accent it was lit with. This repaints both from the
+    -- colour on screen at the end of every palette pass, so they follow the ease.
+    --
+    -- Clearing the cached state and letting the next tick sort it out was the earlier
+    -- version: it landed on the right colour a tenth of a second later, which is long enough
+    -- to watch happen.
+    if dot then
+        addStatePainter(row, function()
+            local on = handle._lastDot and true or false
+            dot.BackgroundColor3 = on and shownColor("accentSoft") or shownColor("subtext")
+            labelText.TextColor3 = on and shownColor("text") or shownColor("subtext")
         end)
     end
 
@@ -6073,15 +6544,11 @@ function Hud:bar(label, getRatio, opts)
     fill.ZIndex = OVERLAY_Z
     fill.Parent = track
     corner(fill, 3)
-    if opts.color then
-        fill.BackgroundColor3 = colorOf(opts.color)
-    else
-        themed(fill, "BackgroundColor3", "accent")
-    end
-    -- The same brightness ramp a slider fill carries, so the two kinds of bar in
-    -- the kit read as the same object. One with a ramp next to one without looks
-    -- like one of them is shaded by mistake.
-    barRamp(fill)
+    -- The same shading a slider fill carries, so the two kinds of bar in the kit read
+    -- as the same object. One with a ramp next to one without looks like one of them is
+    -- shaded by mistake. A row given its own colour keeps it through a theme change,
+    -- otherwise the bar follows the accent.
+    barRamp(fill, opts.color and colorOf(opts.color) or nil)
 
     local last = nil
     local function apply(ratio)
@@ -6508,6 +6975,12 @@ function Interface.new(opts)
     -- screen. That last case used to clamp the below position into the viewport,
     -- which for a tall panel next to a control in the middle of the screen parked it
     -- straight over the row that opened it.
+    --
+    -- Returns the position and which side it settled on, because the side decides which
+    -- way the panel animates in: a panel below its row comes down out of it, one above
+    -- comes up out of it. Without the second value the caller cannot tell the two apart,
+    -- and every panel travelled the same way, so half of them opened by moving away from
+    -- the control they belong to.
     self.fitPanel = function(xOff, yBelow, w, h, yAbove)
         local winPos = self.window.AbsolutePosition
         local cam = workspace.CurrentCamera
@@ -6520,20 +6993,22 @@ function Interface.new(opts)
 
         local roomBelow = (vp.Y - 8) - below
         local roomAbove = above - 8
-        local sy
+        local sy, onTop
         if h <= roomBelow then
-            sy = below
+            sy, onTop = below, false
         elseif h <= roomAbove then
-            sy = above - h
+            sy, onTop = above - h, true
         elseif roomAbove > roomBelow then
-            sy = 8
+            -- Pinned to the top of the screen because that is the roomier side, which
+            -- puts the panel above its row even though it did not fit there either.
+            sy, onTop = 8, true
         else
-            sy = math.max(8, vp.Y - 8 - h)
+            sy, onTop = math.max(8, vp.Y - 8 - h), false
         end
 
         -- Whole pixels. Half a pixel of offset is half a pixel of blur across
         -- everything written on the panel.
-        return UDim2.new(0, math.floor(sx - winPos.X + 0.5), 0, math.floor(sy - winPos.Y + 0.5))
+        return UDim2.new(0, math.floor(sx - winPos.X + 0.5), 0, math.floor(sy - winPos.Y + 0.5)), onTop
     end
 
     -- Dropping the window updates where the open animation returns it to, and marks
@@ -6720,17 +7195,9 @@ function Interface.showcase()
         overlays:toggle("Keybind List", function() return binds.Visible end, function(v) win:showOverlay(binds, v) end)
         overlays:toggle("Session HUD", function() return demoHud.frame.Visible end, function(v) demoHud:setVisible(v) end)
 
-        -- Live theme colours: every tagged part recolours instantly.
-        local theme = s:card({ title = "Theme", icon = "palette", subtitle = "Colour every part", column = "left" })
-        local function themePicker(label, key)
-            theme:colorpicker(label, function() return win:getColor(key) end, function(rgb) win:setColor(key, rgb) end)
-        end
-        themePicker("Accent", "accent")
-        themePicker("Background", "background")
-        themePicker("Sidebar", "sidebar")
-        themePicker("Cards", "card")
-        themePicker("Controls", "control")
-        theme:button("Reset Theme", function() win:resetTheme() end)
+        -- Live theme colours, from the card method rather than written out here: the
+        -- preset dropdown and a row per key, every tagged part recolouring as it changes.
+        s:card({ title = "Theme", icon = "palette", subtitle = "Colour every part", column = "left" }):theme()
 
         local cfg = s:card({ title = "Save Manager", icon = "device-floppy", subtitle = "Configurations", column = "right" })
         local cfgSel = "default"
