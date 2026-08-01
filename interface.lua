@@ -116,7 +116,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.12"
+Interface.version = "2026.07.31.14"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -334,10 +334,18 @@ local THEME_KEYS_SHOWN = { "accent", "background", "sidebar", "card", "control",
 
 -- The weights the type card offers, and what each role is called on it.
 --
--- Six of the nine names setWeight takes. Thin and ExtraLight are unreadable at interface
+-- Four of the nine names setWeight takes, and the argument for stopping at four is the same
+-- one that stopped the earlier list at six. Thin and ExtraLight are unreadable at interface
 -- sizes on a family the client fakes them from, and ExtraBold is indistinguishable from
--- Bold, so offering them is offering a choice that does nothing.
-local TYPE_WEIGHTS = { "Light", "Regular", "Medium", "SemiBold", "Bold", "Heavy" }
+-- Bold. SemiBold and Heavy go for the same reason, one step further on: on the families the
+-- client ships, only Regular and Bold are real faces and everything else is made from the
+-- nearest one, so SemiBold lands between Medium and Bold without being either and Heavy is
+-- Bold with the letter spacing squeezed out. Offering them is offering a choice that does
+-- nothing, and it cost two of the four pills a row can hold.
+--
+-- setRoleWeight still takes all nine. This is what the card puts on screen, and every
+-- weight the kit ships as a default is in here.
+local TYPE_WEIGHTS = { "Light", "Regular", "Medium", "Bold" }
 
 -- Named by what the text is rather than by the role, because "semibold" is the weight it
 -- happens to wear today and "Captions" is what it is for.
@@ -2235,6 +2243,10 @@ local function openPanel(ctx, cfg)
     -- can both be in flight and the panel is drawn from the sum of them.
     local slideOffset = 0
     local slideStop = nil
+    -- Set by slide() while it is running. Shifts the rest of the travel by a number of
+    -- pixels without moving its destination, which is how a change of target part way
+    -- through an entry is absorbed instead of snapped. See place().
+    local slideRebase = nil
     -- Which way the panel went when its row was scrolled out, so it can come back
     -- the same way.
     local lastExit = nil
@@ -2257,10 +2269,19 @@ local function openPanel(ctx, cfg)
         return (drawnY or resting.Y.Offset) + slideOffset
     end
 
+    -- Whole pixels, every frame of the travel and not only at the end of it.
+    --
+    -- fitPanel already rounds the resting place, for the reason given there: this is a
+    -- CanvasGroup, so it is rendered into a texture and blitted, and half a pixel of offset
+    -- is half a pixel of blur across everything written on it. The travel offset is a float,
+    -- so during the slide the panel sat on fractions and only landed on a whole pixel on the
+    -- last frame, which sharpened the whole panel in one step at the end of an animation
+    -- that was otherwise smooth. Rounding here costs the last pixel or two of creep, which
+    -- was below the threshold of being movement anyway.
     local function write()
         panel.Position = UDim2.new(
             resting.X.Scale, resting.X.Offset,
-            resting.Y.Scale, drawY()
+            resting.Y.Scale, math.floor(drawY() + 0.5)
         )
     end
 
@@ -2343,11 +2364,43 @@ local function openPanel(ctx, cfg)
         -- placement changed its mind and the difference is eased away.
         local anchorY = at.Y
         local target = resting.Y.Offset
-        if drawnY == nil or slideStop then
-            -- Straight through while the panel is arriving or leaving. An auto sized
-            -- panel reports a new height on each of its first few frames, so the place
-            -- it belongs moves several times before it settles: easing that as though it
-            -- were a decision reads as the panel shivering on its way in.
+        if drawnY == nil then
+            -- First placement. Nothing is on screen yet, so there is nothing to be
+            -- continuous with.
+            drawnY = target
+        elseif slideStop then
+            -- The panel is arriving or leaving, and the place it belongs is moving under it
+            -- while it travels.
+            --
+            -- It moves because the height is not known when the panel opens. The panel is
+            -- auto sized and its content goes in after openPanel has returned, and cfg.height
+            -- is a guess: exact for a dropdown, which knows its row count, and a flat 220 for
+            -- a gear popover, which cannot know what the caller is about to build. Every
+            -- placement that depends on the height then moves once the real one arrives, which
+            -- is a panel flipped above its row (above - h) or one pinned to the bottom of the
+            -- screen (vp.Y - 8 - h), and the side it lands on can flip outright.
+            --
+            -- This used to write the new target straight through, on the grounds that easing
+            -- it read as the panel shivering. Both are true and both are wrong: a panel mid
+            -- slide jumped a few pixels, which is small, sudden, and in the middle of the one
+            -- animation the eye is following.
+            --
+            -- So the difference is folded into the travel instead. The rest of the path is
+            -- shifted by exactly the amount that was not the row moving, which leaves the
+            -- panel where it is on this frame, and the destination is untouched, so the same
+            -- slide carries the correction away and still lands where it should. No second
+            -- animation, no shiver, and nothing to interrupt.
+            --
+            -- Only the part that was not the row moving. A column scrolled while a panel is
+            -- still arriving has to be followed exactly, for the reason given below: a panel
+            -- that lags a scroll by a few pixels reads as coming loose from its control. So
+            -- the two are told apart here the same way they are told apart once the panel has
+            -- settled, by comparing how far the target moved with how far the row did.
+            local rowMoved = lastAnchorY and (anchorY - lastAnchorY) or 0
+            local decided = (target - lastTarget) - rowMoved
+            if math.abs(decided) >= 1.5 and slideRebase and slideRebase(-decided) then
+                slideOffset -= decided
+            end
             drawnY = target
         else
             local rowMoved = lastAnchorY and (anchorY - lastAnchorY) or 0
@@ -2385,9 +2438,30 @@ local function openPanel(ctx, cfg)
         offsetFrom = slideOffset
         local alphaFrom = alphaNow
         local elapsed = 0
+
+        -- Shift the remaining travel by `shift` pixels and leave its destination alone.
+        --
+        -- The frame's offset is offsetFrom * (1 - e) + offsetTo * e, so moving offsetFrom by
+        -- shift / (1 - e) moves this frame by exactly shift and every later frame by less,
+        -- reaching zero at e = 1. The panel therefore does not move on the frame the
+        -- correction arrives, and the correction is gone by the time the slide is.
+        --
+        -- Declined near the end, where 1 - e is small enough that the division would ask the
+        -- last frame or two to travel a long way. A correction that late means the panel's
+        -- height changed a quarter second after it opened, which is a filter being typed
+        -- rather than the content arriving, and that path is the one place() eases anyway.
+        slideRebase = function(shift)
+            local e = 1 - (1 - math.min(elapsed / duration, 1)) ^ 5
+            local room = 1 - e
+            if room < 0.05 then return false end
+            offsetFrom = offsetFrom + shift / room
+            return true
+        end
+
         slideStop = addTicker(0, function(dt)
             if closed then
                 if slideStop then slideStop() slideStop = nil end
+                slideRebase = nil
                 return
             end
             elapsed += dt
@@ -2400,8 +2474,12 @@ local function openPanel(ctx, cfg)
                 slideOffset = offsetTo
                 alphaNow = alphaTo
                 setAlpha(alphaTo)
-                place()
+                -- Cleared before the last place(), so a target that moved on this very frame
+                -- is handled by the settled path rather than being rebased into a travel that
+                -- is already over.
+                slideRebase = nil
                 if slideStop then slideStop() slideStop = nil end
+                place()
                 if onDone then onDone() end
             end
         end)
@@ -2545,9 +2623,11 @@ local function openPanel(ctx, cfg)
             local t = math.min(elapsed / 0.14, 1)
             local eased = 1 - (1 - t) ^ 3
             local offset = fromOffset + (sink - fromOffset) * eased
+            -- Whole pixels here too, for the same reason write() rounds: the panel is a
+            -- CanvasGroup and a fractional offset blurs everything on it.
             panel.Position = UDim2.new(
                 base.X.Scale, base.X.Offset,
-                base.Y.Scale, drawn + offset
+                base.Y.Scale, math.floor(drawn + offset + 0.5)
             )
             setAlpha(fromAlpha * (1 - eased))
             if t >= 1 then
@@ -4061,11 +4141,40 @@ end
 -- Segmented control: a row of mutually exclusive pills (Toggle / Hold / Always).
 -- One accent block slides between them instead of each pill repainting itself,
 -- which is what makes the change read as one movement.
-function Controls.segmented(parent, ctx, text, options, get, set)
-    local row = controlRow(parent, 30)
+--
+-- opts.fill = true puts the strip on its own line under the label and divides the row's
+-- whole width between the options equally, instead of sitting beside the label and growing
+-- from the text. Two different shapes because they fail in different places, and a card
+-- column is only about 270 pixels wide inside its padding:
+--
+--   beside the label, auto sized   three or four short words. Anything more runs off the
+--                                  left of the row, and a translation half again as long
+--                                  does it with three.
+--   own line, shared width         four or five options of any length, because a pill that
+--                                  is too narrow truncates its own text rather than pushing
+--                                  the strip past the edge of the card.
+--
+-- So the default stays as it was and the second shape is asked for. It is what the weight
+-- rows on the type card use: four options whose names are long in English and longer once
+-- translated.
+function Controls.segmented(parent, ctx, text, options, get, set, opts)
+    opts = opts or {}
+    local fill = opts.fill == true
+    local named = text ~= nil and text ~= ""
+    -- Filled and named is two lines: the caption, then the strip. Filled and unnamed is the
+    -- strip alone, so the row is the height of the strip and not of a caption that is not
+    -- there. Asking for the height before the label exists is why this is worked out here.
+    local row = controlRow(parent, fill and (named and 52 or 30) or 30)
     local label = nil
-    if text and text ~= "" then
-        label = rowLabel(row, text, 200)
+    if named then
+        label = rowLabel(row, text, fill and 0 or 200)
+        if fill then
+            -- Above the strip rather than beside it, and the caption size the section
+            -- headings use, because at fifteen it reads as a row of its own rather than as
+            -- the name of the thing under it.
+            label.Size = UDim2.new(1, 0, 0, 18)
+            label.TextSize = 13
+        end
     end
     -- Three siblings of the row, in draw order: the recessed track, the accent
     -- marker, then the strip of labels.
@@ -4079,10 +4188,16 @@ function Controls.segmented(parent, ctx, text, options, get, set)
     -- The marker stays out of the strip because the strip is padded, and a padded
     -- parent would offset it a second time on top of the rectangle it was already
     -- measured from.
+    -- Where the strip and the track sit. Filled: pinned to the left, under the label, the
+    -- full width of the row. Otherwise: pinned to the right of the row, as wide as its text.
+    local stripAnchor = fill and Vector2.new(0, 0) or Vector2.new(1, 0.5)
+    local stripPosition = fill and UDim2.new(0, 0, 0, named and 22 or 0) or UDim2.new(1, 0, 0.5, 0)
+    local stripHeight = fill and UDim2.new(1, 0, 0, 30) or UDim2.new(0, 0, 1, -2)
+
     local track = Instance.new("Frame")
-    track.AnchorPoint = Vector2.new(1, 0.5)
-    track.Position = UDim2.new(1, 0, 0.5, 0)
-    track.Size = UDim2.new(0, 0, 1, -2)
+    track.AnchorPoint = stripAnchor
+    track.Position = stripPosition
+    track.Size = stripHeight
     track.BorderSizePixel = 0
     track.ZIndex = 1
     track.Parent = row
@@ -4101,12 +4216,13 @@ function Controls.segmented(parent, ctx, text, options, get, set)
 
     -- The strip is auto sized from its labels and the track is sized to match, so
     -- a translated option twice as long as the English one still fits instead of
-    -- being cut off at a fixed pill width.
+    -- being cut off at a fixed pill width. Filled, it is the row's width instead and the
+    -- options share it, so the same growth truncates a pill rather than moving the strip.
     local strip = Instance.new("Frame")
-    strip.AnchorPoint = Vector2.new(1, 0.5)
-    strip.Position = UDim2.new(1, 0, 0.5, 0)
-    strip.Size = UDim2.new(0, 0, 1, -2)
-    strip.AutomaticSize = Enum.AutomaticSize.X
+    strip.AnchorPoint = stripAnchor
+    strip.Position = stripPosition
+    strip.Size = stripHeight
+    if not fill then strip.AutomaticSize = Enum.AutomaticSize.X end
     strip.BackgroundTransparency = 1
     strip.ZIndex = 3
     strip.Parent = row
@@ -4160,10 +4276,22 @@ function Controls.segmented(parent, ctx, text, options, get, set)
         end
         place(buttons[current], animate)
     end
+    -- An equal share of the strip each, less the gap the layout puts between them, so the
+    -- n options and the n-1 gaps come to the strip's width and no more. Auto sized instead
+    -- when the strip is the one that grows.
+    local share = 1 / math.max(#options, 1)
     for _, option in ipairs(options) do
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0, 0, 1, 0)
-        btn.AutomaticSize = Enum.AutomaticSize.X
+        if fill then
+            btn.Size = UDim2.new(share, -3, 1, 0)
+            -- Written rather than left at the default, because the share is the point: an
+            -- auto sized pill here would grow past it and push the strip off the row.
+            btn.AutomaticSize = Enum.AutomaticSize.None
+            btn.TextTruncate = Enum.TextTruncate.AtEnd
+        else
+            btn.Size = UDim2.new(0, 0, 1, 0)
+            btn.AutomaticSize = Enum.AutomaticSize.X
+        end
         btn.BackgroundTransparency = 1
         btn.BorderSizePixel = 0
         btn.AutoButtonColor = false
@@ -4172,8 +4300,10 @@ function Controls.segmented(parent, ctx, text, options, get, set)
         faced(btn, "medium")
         localized(btn, "Text", tostring(option))
         local bpad = Instance.new("UIPadding")
-        bpad.PaddingLeft = UDim.new(0, 12)
-        bpad.PaddingRight = UDim.new(0, 12)
+        -- Narrower when the width is shared: the padding is there to keep a pill off the
+        -- marker's rounded corner, and at a fixed share it is competing with the text.
+        bpad.PaddingLeft = UDim.new(0, fill and 4 or 12)
+        bpad.PaddingRight = UDim.new(0, fill and 4 or 12)
         bpad.Parent = btn
         buttons[option] = btn
         btn.MouseEnter:Connect(function()
@@ -4218,6 +4348,9 @@ function Controls.segmented(parent, ctx, text, options, get, set)
     -- reservation was enough for the English options and not for a translation
     -- twice their length, which then ran under the strip.
     local function fitTrack()
+        -- Filled, the track is already the row's width and the label is above it rather than
+        -- beside it, so there is nothing to measure and nothing to give up.
+        if fill then return end
         local width = strip.AbsoluteSize.X
         track.Size = UDim2.new(0, width, 1, -2)
         if label then
@@ -4466,7 +4599,7 @@ function Card:slider(text, min, max, get, set, decimals, format) return self:_in
 function Card:keybind(text, getKey, setKey, opts) return self:_index(text, Controls.keybind(self._frame, self._ctx, text, getKey, setKey, opts)) end
 function Card:dropdown(text, options, get, set, opts) return self:_index(text, Controls.dropdown(self._frame, self._ctx, text, options, get, set, opts)) end
 function Card:colorpicker(text, getRgb, setRgb, opts) return self:_index(text, Controls.colorpicker(self._frame, self._ctx, text, getRgb, setRgb, opts)) end
-function Card:segmented(text, options, get, set) return self:_index(text, Controls.segmented(self._frame, self._ctx, text, options, get, set)) end
+function Card:segmented(text, options, get, set, opts) return self:_index(text, Controls.segmented(self._frame, self._ctx, text, options, get, set, opts)) end
 function Card:list(options, get, set, opts) return Controls.list(self._frame, self._ctx, options, get, set, opts) end
 function Card:stepper(text, min, max, step, get, set) return self:_index(text, Controls.stepper(self._frame, self._ctx, text, min, max, step, get, set)) end
 
@@ -4523,16 +4656,26 @@ end
 -- the kit names a role at every call site, so one control here moves a whole category of
 -- text at once. Both the family and the weights are saved with the config.
 --
--- Dropdowns rather than a row of pills. Six weights side by side do not fit a card column at
--- any width the kit uses, and what that looked like was the first two options cut off past
--- the left edge of the row.
+-- Pills rather than dropdowns, filled across the row. A weight is a point on a scale of four
+-- and the interesting thing about it is where it sits relative to the others, which a row
+-- shows and a closed dropdown does not: four dropdowns reading Regular, Medium, Bold, Bold
+-- tell you the four values and nothing about the shape of the choice. It is also one click
+-- instead of two, on the one card where the point is to try a setting and look at the result.
+--
+-- The earlier build used dropdowns because six weights side by side ran off the left edge of
+-- the row. Two things changed: the list is four now, for reasons of its own, and the strip
+-- can take its own line and share the width rather than growing from its text. See
+-- Controls.segmented and opts.fill.
+--
+-- The family stays a dropdown. Thirteen families is a list to search, not a scale to see.
 --
 -- opts.family = false   drop the family list and keep the weights
+-- opts.reset = false    drop the two buttons that move all four roles at once
 function Card:typography(opts)
     opts = opts or {}
     local win = self._ctx
     for _, role in ipairs(TYPE_ROLES) do
-        self:dropdown(role.label, TYPE_WEIGHTS, function()
+        self:segmented(role.label, TYPE_WEIGHTS, function()
             local current = Interface.roleWeights()[role.key] or "regular"
             for _, name in ipairs(TYPE_WEIGHTS) do
                 if string.lower(name) == current then return name end
@@ -4543,7 +4686,7 @@ function Card:typography(opts)
         end, function(name)
             Interface.setRoleWeight(role.key, name)
             win:markDirty()
-        end)
+        end, { fill = true })
     end
     if opts.family ~= false then
         self:dropdown("Family", FONT_FAMILIES, function()
@@ -4552,6 +4695,32 @@ function Card:typography(opts)
             Interface.setFont("rbxasset://fonts/families/" .. family .. ".json")
             win:markDirty()
         end, { search = true })
+    end
+    -- The two that move all four roles together, on the same card as the four they move.
+    -- They were a second card beside this one, headed "All of it at once", which is a card
+    -- holding a sentence and two buttons: the page then read as two things to understand
+    -- when it is one, and the sentence was there to explain a split that did not need to
+    -- exist. Under a divider on this card they are what they are, the coarse end of the
+    -- control above them.
+    if opts.reset ~= false then
+        self:divider()
+        -- refreshAll after both, because these write the same four values the pills above
+        -- read: without it the strips keep pointing at the weight that was there before, and
+        -- the one control on the card that says what the type is now disagrees with the type.
+        -- The old pair sat on a card of their own and had this same fault.
+        self:button("One Weight Everywhere", function()
+            Interface.setWeight("bold")
+            win:markDirty()
+            win:refreshAll()
+        end)
+        self:button("Reset Type", function()
+            for _, role in ipairs(TYPE_ROLES) do
+                Interface.setRoleWeight(role.key, DEFAULT_ROLE_WEIGHT[role.key])
+            end
+            Interface.setFont(DEFAULT_FONT_FAMILY)
+            win:markDirty()
+            win:refreshAll()
+        end)
     end
     return self
 end
@@ -5596,13 +5765,17 @@ function Window:settingsTab(opts)
         end, { search = false })
     end
 
-    -- The type on a sub-page of its own.
+    -- The type on a sub-page of its own, as one card.
     --
-    -- It is four dropdowns and a family list, and none of it is something anyone changes
+    -- It is four weight rows and a family list, and none of it is something anyone changes
     -- twice. Sitting on the main page it pushed the palette, the configs and the language
     -- down past the fold, which is the wrong trade: the settings people actually open are the
     -- colours and the configs. So the fine detail moves one sub-tab across, where it is one
     -- click away and not in the way.
+    --
+    -- One card and not two. The second one held a sentence and two buttons, and the sentence
+    -- was there to explain why the two buttons were not on the card they act on. They are on
+    -- it now, under a divider, and the page has one thing on it instead of two.
     --
     -- Built after the main page, so the main page is the one that opens: the first sub-tab
     -- asked for is the active one.
@@ -5614,20 +5787,6 @@ function Window:settingsTab(opts)
             subtitle = "Family and weight",
             column = "left",
         }):typography(type(opts.type) == "table" and opts.type or nil)
-
-        local whole = detail:card({ title = "All of it at once", icon = "adjustments", column = "right" })
-        whole:label("The weights above are per kind of text. These two move all four together.")
-        whole:button("One weight everywhere", function()
-            Interface.setWeight("bold")
-            self:markDirty()
-        end)
-        whole:button("Reset Type", function()
-            for _, role in ipairs(TYPE_ROLES) do
-                Interface.setRoleWeight(role.key, DEFAULT_ROLE_WEIGHT[role.key])
-            end
-            Interface.setFont(DEFAULT_FONT_FAMILY)
-            self:markDirty()
-        end)
     end
 
     return tab, page
