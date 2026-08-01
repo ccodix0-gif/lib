@@ -88,8 +88,10 @@
 --   UI.setFont(family) swaps the type family for a language the default misses.
 --   UI.setWeight(w) puts one weight under all of the text, UI.setRoleWeight(role, w) under
 --     one kind of it; roles are regular, medium, semibold, bold and w is a name
---     ("thin".."heavy") or an Enum.FontWeight. UI.roleWeights() reads them back, and both
---     the family and the weights are saved with the config.
+--     ("thin".."heavy") or an Enum.FontWeight. UI.roleWeights() reads them back.
+--   UI.setTextScale(n) scales every size the kit writes, 0.85 to 1.15; UI.getTextScale() and
+--     UI.textScaleRange() read it back. The family, the weights and the scale are all saved
+--     with the config.
 --   UI.setLogger(fn) receives the diagnostics; nothing is printed without it.
 
 -- Services and the executor globals we rely on are captured once, at load time,
@@ -116,7 +118,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.14"
+Interface.version = "2026.07.31.15"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -730,11 +732,55 @@ end
 -- failure would throw on top of it.
 local log
 
+-- Text size, as a scale over the sizes the kit already writes rather than a size per control.
+--
+-- The kit has one scale of six sizes and every call site names one of them, so this is the
+-- third axis of the type beside the family and the weight: a build that wants more on screen
+-- at once turns it down, one being read from across a room turns it up. A size per control
+-- would be the same idea with eighty knobs and no way to keep them in proportion.
+--
+-- The base is the size a control was built with, remembered the first time the scale moves it.
+-- That is the trick the palette already uses for a part's own transparency, and it is the
+-- right way round here for a specific reason: recording the base in faced() instead would
+-- mean every call site had to set TextSize before faced(), and one that got the order wrong
+-- would silently stop scaling with no sign of why.
+--
+-- It is kept on the font registry's own entry rather than in a table beside it, so it is
+-- pruned when the registry prunes and there is no second table to leak.
+--
+-- The ceiling is 1.15 and not more because the boxes do not scale with the text. A card title
+-- at 17 sits in a 20 pixel row and a HUD row's label at 13 sits in 15, so past about a seventh
+-- over, the tallest text starts clipping the row it is in rather than growing.
+local DEFAULT_TEXT_SCALE = 1
+local TEXT_SCALE = DEFAULT_TEXT_SCALE
+local TEXT_SCALE_MIN, TEXT_SCALE_MAX = 0.85, 1.15
+
+local function sizeFor(instance)
+    local entry = FONT_REG[instance]
+    if not entry then return nil end
+    if entry.base == nil then
+        local ok, current = pcall(function() return instance.TextSize end)
+        if not ok or type(current) ~= "number" then return nil end
+        entry.base = current
+    end
+    return math.max(1, math.floor(entry.base * TEXT_SCALE + 0.5))
+end
+
 -- faced(inst, role): pick a weight and follow the family.
+--
+-- Set TextSize before calling this, on a build that is running at a scale other than 1. The
+-- size written afterwards is the one the scale is measured from, so a call site that writes it
+-- the other way round leaves that one label at its unscaled size.
 local function faced(instance, role)
     role = role or "regular"
     instance.FontFace = FACES[role] or FACES.regular
     tagAdd(FONT_REG, instance, role)
+    -- Only when there is a scale to apply, so at the default nothing is recorded and the
+    -- first change reads every base off a finished interface.
+    if TEXT_SCALE ~= 1 then
+        local size = sizeFor(instance)
+        if size then instance.TextSize = size end
+    end
     return instance
 end
 
@@ -743,6 +789,14 @@ local function refaceAll()
     rebuildFaces()
     tagWalk(FONT_REG, function(inst, role)
         inst.FontFace = FACES[role] or FACES.regular
+    end)
+end
+
+-- Re-size everything already on screen, from each part's own base.
+local function resizeAll()
+    tagWalk(FONT_REG, function(inst)
+        local size = sizeFor(inst)
+        if size then inst.TextSize = size end
     end)
 end
 
@@ -829,6 +883,37 @@ end
 -- The family the interface is drawing in, so a config can put it back.
 function Interface.getFont()
     return FONT_FAMILY
+end
+
+-- Scale every size the kit writes. Live, like setFont and setWeight.
+--
+-- Clamped, and rounded to whole percents before anything is written: that is the granularity
+-- the control offers, and a walk over every label in the interface is not worth doing for a
+-- hundredth of a point. A value that rounds to the one already in use writes nothing at all,
+-- which is what keeps dragging the control cheap.
+--
+-- Returns whether the value was usable, not whether anything moved, so a caller handed a
+-- number out of range can tell it was refused rather than merely clamped.
+function Interface.setTextScale(scale)
+    scale = tonumber(scale)
+    if not scale then return false end
+    local wanted = math.floor(scale * 100 + 0.5) / 100
+    local clamped = math.clamp(wanted, TEXT_SCALE_MIN, TEXT_SCALE_MAX)
+    if clamped ~= TEXT_SCALE then
+        TEXT_SCALE = clamped
+        resizeAll()
+    end
+    return wanted == clamped
+end
+
+function Interface.getTextScale()
+    return TEXT_SCALE
+end
+
+-- The range the control offers, so a caller building its own does not have to guess and
+-- cannot offer a value setTextScale will refuse.
+function Interface.textScaleRange()
+    return TEXT_SCALE_MIN, TEXT_SCALE_MAX
 end
 
 -- Translations ----------------------------------------------------------------
@@ -4669,7 +4754,14 @@ end
 --
 -- The family stays a dropdown. Thirteen families is a list to search, not a scale to see.
 --
+-- Size is a slider, and it is the one control on this card whose effect you cannot see by
+-- reading it: a weight is a word, a family is a name, and a size is only worth anything next
+-- to the size it was. So it is the shape that moves continuously and reports a number, and it
+-- sits under the family because both of them are about the whole interface rather than about
+-- one kind of text in it.
+--
 -- opts.family = false   drop the family list and keep the weights
+-- opts.size = false     drop the size slider
 -- opts.reset = false    drop the two buttons that move all four roles at once
 function Card:typography(opts)
     opts = opts or {}
@@ -4696,6 +4788,17 @@ function Card:typography(opts)
             win:markDirty()
         end, { search = true })
     end
+    if opts.size ~= false then
+        -- Whole percents, and the range comes from the library rather than being written here,
+        -- so the slider cannot offer a value setTextScale would refuse.
+        local low, high = Interface.textScaleRange()
+        self:slider("Text Size", math.floor(low * 100 + 0.5), math.floor(high * 100 + 0.5), function()
+            return math.floor(Interface.getTextScale() * 100 + 0.5)
+        end, function(percent)
+            Interface.setTextScale(percent / 100)
+            win:markDirty()
+        end, 0, function(value) return value .. "%" end)
+    end
     -- The two that move all four roles together, on the same card as the four they move.
     -- They were a second card beside this one, headed "All of it at once", which is a card
     -- holding a sentence and two buttons: the page then read as two things to understand
@@ -4718,6 +4821,7 @@ function Card:typography(opts)
                 Interface.setRoleWeight(role.key, DEFAULT_ROLE_WEIGHT[role.key])
             end
             Interface.setFont(DEFAULT_FONT_FAMILY)
+            Interface.setTextScale(DEFAULT_TEXT_SCALE)
             win:markDirty()
             win:refreshAll()
         end)
@@ -5784,7 +5888,7 @@ function Window:settingsTab(opts)
         detail:card({
             title = "Type",
             icon = "quote",
-            subtitle = "Family and weight",
+            subtitle = "Family, weight and size",
             column = "left",
         }):typography(type(opts.type) == "table" and opts.type or nil)
     end
@@ -5937,6 +6041,7 @@ function Window:snapshot()
         -- kit was really offering.
         font = Interface.getFont(),
         weights = Interface.roleWeights(),
+        textScale = Interface.getTextScale(),
         recent = recent,
         overlays = overlays,
     }
@@ -5987,6 +6092,11 @@ function Window:restore(data)
         for role, weight in pairs(data.weights) do
             Interface.setRoleWeight(role, weight)
         end
+    end
+    -- Absent in a config written before the size was a setting, which is the same as the
+    -- default, so there is nothing to migrate.
+    if type(data.textScale) == "number" then
+        Interface.setTextScale(data.textScale)
     end
     -- Restore the saved theme colours through the themed registry. A three
     -- number entry comes from an older config and means full opacity.
@@ -6590,12 +6700,15 @@ function Window:watermark(opts)
     -- gradient = true for a label a UIGradient is about to take over: it stays in the
     -- text key's registry for its opacity but the key does not write its colour, because
     -- a gradient multiplies what is underneath it. See animateBrand.
-    local function textSeg(initial, role, gradient)
+    local function textSeg(initial, role, gradient, size)
         local t = newInstance("TextLabel")
         t.AutomaticSize = Enum.AutomaticSize.X
         t.Size = UDim2.new(0, 0, 1, 0)
         t.BackgroundTransparency = 1
-        t.TextSize = 14
+        -- Passed in rather than written over afterwards. faced() measures the text scale from
+        -- the size the label already has, so a caller that sets it after the fact leaves that
+        -- one label at its unscaled size on a build running at anything but 100%.
+        t.TextSize = size or 14
         t.TextYAlignment = Enum.TextYAlignment.Center
         t.Text = initial
         t.ZIndex = OVERLAY_Z
@@ -6612,9 +6725,7 @@ function Window:watermark(opts)
         if empty then mark:Destroy() end
     end
     if show.brand ~= false then
-        local brand = textSeg(opts.brand or "NewReality", "bold", true)
-        brand.TextSize = 15
-        animateBrand(brand)
+        animateBrand(textSeg(opts.brand or "NewReality", "bold", true, 15))
     end
 
     local fpsLabel, timeLabel
