@@ -116,7 +116,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.9"
+Interface.version = "2026.07.31.11"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -248,6 +248,30 @@ local THEME_KEY_LABEL = {
 -- a card that lists all fourteen is a wall of swatches nobody reads.
 local THEME_KEYS_SHOWN = { "accent", "background", "sidebar", "card", "control", "track" }
 
+-- The weights the type card offers, and what each role is called on it.
+--
+-- Six of the nine names setWeight takes. Thin and ExtraLight are unreadable at interface
+-- sizes on a family the client fakes them from, and ExtraBold is indistinguishable from
+-- Bold, so offering them is offering a choice that does nothing.
+local TYPE_WEIGHTS = { "Light", "Regular", "Medium", "SemiBold", "Bold", "Heavy" }
+
+-- Named by what the text is rather than by the role, because "semibold" is the weight it
+-- happens to wear today and "Captions" is what it is for.
+local TYPE_ROLES = {
+    { key = "regular", label = "Body" },
+    { key = "medium", label = "Labels" },
+    { key = "semibold", label = "Captions" },
+    { key = "bold", label = "Titles" },
+}
+
+-- Families the client ships. A name that is not one of these makes a Font the client cannot
+-- resolve, and that Font would then be written to every label the kit owns, so the list is
+-- kept here rather than left to each caller to get right.
+local FONT_FAMILIES = {
+    "Arial", "Arimo", "BuilderSans", "GothamSSm", "Merriweather", "Montserrat", "Nunito",
+    "Roboto", "RobotoCondensed", "RobotoMono", "SourceSansPro", "TitilliumWeb", "Ubuntu",
+}
+
 function Interface.addTheme(name, keys)
     if type(name) ~= "string" or type(keys) ~= "table" then return end
     if THEMES[name] == nil then THEME_ORDER[#THEME_ORDER + 1] = name end
@@ -338,6 +362,13 @@ local ROLE_WEIGHT = {
     semibold = Enum.FontWeight.Bold,
     bold = Enum.FontWeight.Bold,
 }
+
+-- What the kit ships with, snapshotted before anything can change it, so a reset has
+-- somewhere to go back to. The palette keeps its own snapshot for the same reason.
+local DEFAULT_FONT_FAMILY = FONT_FAMILY
+local DEFAULT_ROLE_WEIGHT = {}
+for role, weight in pairs(ROLE_WEIGHT) do DEFAULT_ROLE_WEIGHT[role] = weight end
+
 local FACES = {}
 local function rebuildFaces()
     for _, role in ipairs(ROLES) do
@@ -1915,19 +1946,45 @@ local function makeDraggable(frame, handle, onDrop)
     end)
 end
 
--- The NewReality brand text with the white to accent scrolling gradient. The
+-- The NewReality brand text with the text to accent scrolling gradient. The
 -- sweep runs off the shared ticker and stops itself when the label is gone.
+--
+-- The colours cannot come from the theme registry. The registry writes one property
+-- per entry, and this needs a whole ColorSequence rebuilt out of two keys at once, so
+-- there is nothing for it to write. It goes in with the state painters instead, which
+-- is where everything whose colour is not a single palette key already lives: they run
+-- at the end of every palette pass, so the wordmark eases along with the rest of the
+-- interface rather than snapping when the ease ends.
+--
+-- The rebuild used to be handed back for the caller to drop into _refresh. That is the
+-- list that re-reads control values, and setColor does not walk it, so the one accent
+-- coloured thing at the top of the sidebar sat on the old accent through every theme
+-- change until something unrelated happened to force a refresh.
 local function animateBrand(label)
     local gradient = newInstance("UIGradient")
-    local function rebuild()
-        gradient.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, PALETTE.text),
-            ColorSequenceKeypoint.new(0.5, PALETTE.accent),
-            ColorSequenceKeypoint.new(1, PALETTE.text),
-        })
-    end
-    rebuild()
     gradient.Parent = label
+    -- shownColor, not PALETTE: during a change the first is the colour on screen and
+    -- the second is the one it is heading for.
+    --
+    -- The label itself is held white, because a UIGradient multiplies the colour of the
+    -- thing it sits on. Painting the label the text colour as well squared it: the ends
+    -- came out dimmer than text everywhere else, and the accent in the middle came out
+    -- dimmer than the accent everywhere else. On a light preset it stopped being a shade
+    -- and became the whole of it, since text there is nearly black and the wordmark was
+    -- the accent multiplied by a tenth: a dark smear with no accent in it at all.
+    --
+    -- Written here rather than left to the builder because a TextLabel starts out black,
+    -- and a gradient over black is invisible. The label still goes into the text key's
+    -- registry for its opacity, with paint = false so the key does not write its colour
+    -- (see themed and opts.paint), which leaves nothing else to set it.
+    addStatePainter(label, function()
+        label.TextColor3 = RAMP_LIGHT
+        gradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, shownColor("text")),
+            ColorSequenceKeypoint.new(0.5, shownColor("accent")),
+            ColorSequenceKeypoint.new(1, shownColor("text")),
+        })
+    end)
     local phase, stop = 0, nil
     stop = addTicker(0, function(dt)
         if not label.Parent then
@@ -1937,7 +1994,6 @@ local function animateBrand(label)
         phase = (phase + dt * 0.55) % 1
         gradient.Offset = Vector2.new(-1 + phase * 2, 0)
     end)
-    return rebuild
 end
 
 -- An accent underline that slides between the buttons of a bar instead of one
@@ -3316,6 +3372,19 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         end
         fitBody()
 
+        -- A picked row's label wears the accent, so it is not in the registry under a key
+        -- of its own and a palette pass would leave it on the accent it was opened with.
+        -- The panel is short lived, so this only shows when the theme is changed while a
+        -- list is open, which is exactly what the theme card is: a dropdown of presets
+        -- sitting open over the interface it is repainting.
+        addStatePainter(panel, function()
+            for _, refs in pairs(optRows) do
+                if refs.label.Parent then
+                    refs.label.TextColor3 = refs.on and shownColor("accentSoft") or shownColor("text")
+                end
+            end
+        end)
+
         if searchBox then
             searchBox:GetPropertyChangedSignal("Text"):Connect(function()
                 local q = searchBox.Text:lower()
@@ -4339,6 +4408,45 @@ function Card:theme(opts)
     end
     return self
 end
+
+-- The type controls, as a card method.
+--
+-- Weight is the first thing anyone asks to change, and it is four values rather than one:
+-- the kit names a role at every call site, so one control here moves a whole category of
+-- text at once. Both the family and the weights are saved with the config.
+--
+-- Dropdowns rather than a row of pills. Six weights side by side do not fit a card column at
+-- any width the kit uses, and what that looked like was the first two options cut off past
+-- the left edge of the row.
+--
+-- opts.family = false   drop the family list and keep the weights
+function Card:typography(opts)
+    opts = opts or {}
+    local win = self._ctx
+    for _, role in ipairs(TYPE_ROLES) do
+        self:dropdown(role.label, TYPE_WEIGHTS, function()
+            local current = Interface.roleWeights()[role.key] or "regular"
+            for _, name in ipairs(TYPE_WEIGHTS) do
+                if string.lower(name) == current then return name end
+            end
+            -- A weight set through setRoleWeight that this list does not offer, so the
+            -- control names the nearest thing it can rather than showing nothing.
+            return "Regular"
+        end, function(name)
+            Interface.setRoleWeight(role.key, name)
+            win:markDirty()
+        end)
+    end
+    if opts.family ~= false then
+        self:dropdown("Family", FONT_FAMILIES, function()
+            return string.match(Interface.getFont(), "families/(.-)%.json") or FONT_FAMILIES[1]
+        end, function(family)
+            Interface.setFont("rbxasset://fonts/families/" .. family .. ".json")
+            win:markDirty()
+        end, { search = true })
+    end
+    return self
+end
 -- A thin divider line inside a card body.
 function Card:divider()
     local line = Instance.new("Frame")
@@ -5292,6 +5400,10 @@ function Window:settingsTab(opts)
 
     if opts.window ~= false then
         local card = page:card({ title = "Window", icon = "settings", subtitle = "Show and hide", column = "left" })
+        -- Kept out of the keybind panel. That panel is a list of what the script binds, and
+        -- the key that shows and hides the interface is not one of those: it is chrome, it
+        -- belongs to the kit rather than to the product, and listing it alongside the real
+        -- binds pads the panel with a row nobody put there.
         card:keybind("Toggle Interface", function()
             return self.toggleKey and self.toggleKey.Name
         end, function(name)
@@ -5300,7 +5412,7 @@ function Window:settingsTab(opts)
                 self.toggleKey = key
                 self:markDirty()
             end
-        end)
+        end, { list = false })
         card:button("Unload", function() self:unload() end)
     end
 
@@ -5374,6 +5486,40 @@ function Window:settingsTab(opts)
                 if entry.label == label then self:setLocale(entry.code) return end
             end
         end, { search = false })
+    end
+
+    -- The type on a sub-page of its own.
+    --
+    -- It is four dropdowns and a family list, and none of it is something anyone changes
+    -- twice. Sitting on the main page it pushed the palette, the configs and the language
+    -- down past the fold, which is the wrong trade: the settings people actually open are the
+    -- colours and the configs. So the fine detail moves one sub-tab across, where it is one
+    -- click away and not in the way.
+    --
+    -- Built after the main page, so the main page is the one that opens: the first sub-tab
+    -- asked for is the active one.
+    if opts.type ~= false then
+        local detail = tab:sub(opts.typePage or "Type")
+        detail:card({
+            title = "Type",
+            icon = "quote",
+            subtitle = "Family and weight",
+            column = "left",
+        }):typography(type(opts.type) == "table" and opts.type or nil)
+
+        local whole = detail:card({ title = "All of it at once", icon = "adjustments", column = "right" })
+        whole:label("The weights above are per kind of text. These two move all four together.")
+        whole:button("One weight everywhere", function()
+            Interface.setWeight("bold")
+            self:markDirty()
+        end)
+        whole:button("Reset Type", function()
+            for _, role in ipairs(TYPE_ROLES) do
+                Interface.setRoleWeight(role.key, DEFAULT_ROLE_WEIGHT[role.key])
+            end
+            Interface.setFont(DEFAULT_FONT_FAMILY)
+            self:markDirty()
+        end)
     end
 
     return tab, page
@@ -6174,7 +6320,10 @@ function Window:watermark(opts)
         f.Parent = wm
         themed(f, "BackgroundColor3", "stroke")
     end
-    local function textSeg(initial, role)
+    -- gradient = true for a label a UIGradient is about to take over: it stays in the
+    -- text key's registry for its opacity but the key does not write its colour, because
+    -- a gradient multiplies what is underneath it. See animateBrand.
+    local function textSeg(initial, role, gradient)
         local t = newInstance("TextLabel")
         t.AutomaticSize = Enum.AutomaticSize.X
         t.Size = UDim2.new(0, 0, 1, 0)
@@ -6186,7 +6335,7 @@ function Window:watermark(opts)
         t.LayoutOrder = nextO()
         t.Parent = wm
         faced(t, role or "medium")
-        themed(t, "TextColor3", "text")
+        themed(t, "TextColor3", "text", gradient and { paint = false } or nil)
         return t
     end
 
@@ -6196,9 +6345,9 @@ function Window:watermark(opts)
         if empty then mark:Destroy() end
     end
     if show.brand ~= false then
-        local brand = textSeg(opts.brand or "NewReality", "bold")
+        local brand = textSeg(opts.brand or "NewReality", "bold", true)
         brand.TextSize = 15
-        table.insert(self._refresh, animateBrand(brand))
+        animateBrand(brand)
     end
 
     local fpsLabel, timeLabel
@@ -6928,9 +7077,9 @@ function Interface.new(opts)
     brand.Text = opts.brand or "NewReality"
     brand.Parent = brandRow
     faced(brand, "bold")
-    themed(brand, "TextColor3", "text")
-    local rebuildBrand = animateBrand(brand)
-    table.insert(self._refresh, rebuildBrand)
+    -- The gradient owns the colour, the key owns the opacity. See animateBrand.
+    themed(brand, "TextColor3", "text", { paint = false })
+    animateBrand(brand)
 
     local sidebarList = Instance.new("ScrollingFrame")
     -- Below the search field, which the window builds after the overlay layer exists.
