@@ -9,7 +9,7 @@
 -- is only the short reference.
 --
 -- LOADING
---   local UI = loadstring(game:HttpGet("<url>/nw.lua"))()
+--   local UI = loadstring(game:HttpGet("<url>/interface.lua"))()
 --   local win = UI.new({ toggleKey = Enum.KeyCode.RightShift })
 --
 -- LAYOUT: window -> tab -> sub -> card -> controls
@@ -102,8 +102,10 @@ local customAsset = getcustomasset
 local LocalPlayer = Players.LocalPlayer
 
 local Interface = {}
--- Bump this whenever interface.luau changes so the host build can be verified
--- from the console (helps catch a stale nw.lua served from the GitHub CDN).
+-- Bump this whenever interface.luau changes so the host build can be verified from the
+-- console, which catches a stale copy on the CDN. Loaders also search for this field by
+-- name to tell the library apart from the scripts that load it, so the assignment has to
+-- stay spelled exactly like this in the source text.
 Interface.version = "2026.07.31.7"
 
 -- Theme: our grey palette with the NewReality cyan accent.
