@@ -36,7 +36,7 @@
 --   card:list(options, get, set)                    -- inline searchable list
 --   card:stepper(text, min, max, step, get, set)
 --   card:status(text, get [, { lit = fn }])         -- read only row: a dot and the value
---   card:theme([{ preset = false, keys = {..}, reset = false }])  -- the whole palette editor
+--   card:theme([{ preset = false, keys = {..}, reset = false, search = false }])  -- palette editor
 --   card:section(text)                              -- small caption between groups of controls
 --   card:label(text)                                -- wraps to multiple lines
 --   card:divider()
@@ -116,7 +116,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.11"
+Interface.version = "2026.07.31.12"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -211,6 +211,86 @@ local THEMES = {
         icon = { 48, 48, 56 }, iconDim = { 128, 128, 140 },
         knob = { 255, 255, 255 }, accent = { 0, 132, 168 },
     },
+    -- The rest are spread over the wheel on purpose, because a list of fourteen is past the
+    -- point where two schemes a few degrees apart can be told apart in it. Where an accent
+    -- does land near an older one the surface carries the difference instead: Carbon is the
+    -- only near black, Nord the only desaturated accent, Crimson red on neutral grey against
+    -- Ember's orange on brown. Two of them are light, which the corrected accent and the bar
+    -- shading both already handle.
+    Amber = {
+        sidebar = { 23, 22, 20 }, background = { 30, 29, 26 },
+        card = { 38, 37, 33 }, cardTop = { 44, 42, 38 },
+        control = { 50, 48, 43 }, controlHover = { 61, 59, 53 },
+        track = { 61, 59, 53 }, stroke = { 63, 61, 55 },
+        text = { 250, 248, 243 }, subtext = { 162, 158, 148 },
+        icon = { 255, 255, 255 }, iconDim = { 162, 158, 148 },
+        knob = { 255, 255, 255 }, accent = { 250, 214, 60 },
+    },
+    Amethyst = {
+        sidebar = { 24, 20, 31 }, background = { 31, 26, 40 },
+        card = { 39, 33, 50 }, cardTop = { 45, 38, 57 },
+        control = { 51, 43, 64 }, controlHover = { 62, 53, 77 },
+        track = { 62, 53, 77 }, stroke = { 64, 55, 80 },
+        text = { 245, 240, 253 }, subtext = { 155, 145, 174 },
+        icon = { 255, 255, 255 }, iconDim = { 155, 145, 174 },
+        knob = { 255, 255, 255 }, accent = { 178, 132, 255 },
+    },
+    Carbon = {
+        sidebar = { 10, 10, 11 }, background = { 15, 15, 17 },
+        card = { 21, 21, 24 }, cardTop = { 26, 26, 29 },
+        control = { 31, 31, 35 }, controlHover = { 41, 41, 46 },
+        track = { 41, 41, 46 }, stroke = { 43, 43, 48 },
+        text = { 247, 247, 250 }, subtext = { 136, 136, 145 },
+        icon = { 255, 255, 255 }, iconDim = { 136, 136, 145 },
+        knob = { 255, 255, 255 }, accent = { 190, 255, 70 },
+    },
+    -- Red on a neutral charcoal rather than on a warm one. The first draft put it on Ember's
+    -- browns and the two came out as the same scheme with the accent swapped.
+    Crimson = {
+        sidebar = { 20, 20, 22 }, background = { 27, 27, 30 },
+        card = { 34, 34, 38 }, cardTop = { 40, 40, 44 },
+        control = { 46, 46, 51 }, controlHover = { 57, 57, 63 },
+        track = { 57, 57, 63 }, stroke = { 59, 59, 65 },
+        text = { 246, 244, 245 }, subtext = { 152, 150, 154 },
+        icon = { 255, 255, 255 }, iconDim = { 152, 150, 154 },
+        knob = { 255, 255, 255 }, accent = { 244, 63, 76 },
+    },
+    Frost = {
+        sidebar = { 226, 231, 240 }, background = { 240, 244, 250 },
+        card = { 255, 255, 255 }, cardTop = { 246, 249, 253 },
+        control = { 229, 235, 244 }, controlHover = { 216, 224, 237 },
+        track = { 212, 221, 235 }, stroke = { 201, 211, 227 },
+        text = { 24, 30, 42 }, subtext = { 102, 113, 133 },
+        icon = { 44, 52, 68 }, iconDim = { 124, 135, 155 },
+        knob = { 255, 255, 255 }, accent = { 78, 92, 214 },
+    },
+    Linen = {
+        sidebar = { 234, 228, 220 }, background = { 245, 241, 234 },
+        card = { 255, 253, 249 }, cardTop = { 249, 245, 238 },
+        control = { 236, 230, 221 }, controlHover = { 225, 217, 205 },
+        track = { 221, 213, 200 }, stroke = { 211, 202, 188 },
+        text = { 32, 28, 24 }, subtext = { 116, 108, 98 },
+        icon = { 54, 48, 42 }, iconDim = { 136, 127, 116 },
+        knob = { 255, 255, 255 }, accent = { 176, 106, 40 },
+    },
+    Nord = {
+        sidebar = { 38, 42, 52 }, background = { 46, 52, 64 },
+        card = { 55, 62, 76 }, cardTop = { 62, 70, 85 },
+        control = { 68, 77, 94 }, controlHover = { 80, 90, 110 },
+        track = { 80, 90, 110 }, stroke = { 82, 92, 112 },
+        text = { 236, 239, 244 }, subtext = { 154, 163, 179 },
+        icon = { 255, 255, 255 }, iconDim = { 154, 163, 179 },
+        knob = { 255, 255, 255 }, accent = { 136, 192, 208 },
+    },
+    Orchid = {
+        sidebar = { 29, 21, 28 }, background = { 37, 27, 36 },
+        card = { 46, 34, 45 }, cardTop = { 53, 39, 52 },
+        control = { 60, 45, 59 }, controlHover = { 72, 55, 71 },
+        track = { 72, 55, 71 }, stroke = { 74, 57, 73 },
+        text = { 253, 242, 251 }, subtext = { 176, 150, 172 },
+        icon = { 255, 255, 255 }, iconDim = { 176, 150, 172 },
+        knob = { 255, 255, 255 }, accent = { 240, 110, 200 },
+    },
 }
 Interface.themes = THEMES
 
@@ -222,7 +302,11 @@ Interface.themes = THEMES
 -- alternatives. So the default leads and the rest follow in alphabetical order, and a
 -- preset added later goes on the end, where a caller expects the one they just added
 -- to be rather than somewhere in the middle.
-local THEME_ORDER = { "NewReality", "Ember", "Graphite", "Midnight", "Moss", "Paper" }
+local THEME_ORDER = {
+    "NewReality",
+    "Amber", "Amethyst", "Carbon", "Crimson", "Ember", "Frost", "Graphite",
+    "Linen", "Midnight", "Moss", "Nord", "Orchid", "Paper",
+}
 
 -- What a palette key is called on a card. Kept here rather than in the caller so the
 -- built in theme card names its rows the same way everywhere and a translation covers
@@ -602,9 +686,14 @@ end
 -- the one being headed for, which means they follow the ease instead of snapping when it
 -- ends.
 --
--- Keyed by the instance with weak keys, so a control that has been destroyed drops out
--- without anything having to remember to remove it.
-local STATE_PAINTERS = setmetatable({}, { __mode = "k" })
+-- Keyed by the instance and held strongly, with a control that has been destroyed dropped
+-- on the way past in runStatePainters. Strongly, because a weak key is not a reference and
+-- Roblox may drop the wrapper for an instance that nothing is holding: the entry then
+-- leaves the table and the control silently stops following the palette. Every control on
+-- this list happens to be in THEME_REG as well, which is strong and is what has been
+-- keeping them alive, but a painter that does not need a registry entry would have gone.
+-- That is what happened to the bar ramps, which were the one thing held only weakly.
+local STATE_PAINTERS = {}
 
 local function addStatePainter(instance, fn)
     STATE_PAINTERS[instance] = fn
@@ -1784,9 +1873,24 @@ end
 -- The fill still follows the accent's opacity through the theme registry, it just does
 -- not follow its colour. See themed() and opts.paint.
 --
--- Weak keys: a ramp goes when the bar it shades does. The value is the fixed colour a
--- bar was given, or false when it follows the accent.
-local BAR_RAMPS = setmetatable({}, { __mode = "k" })
+-- Which ramps follow the accent, held the same way and for the same reason as the theme
+-- registry: strongly, and swept of dead entries when it is walked. The value is the fixed
+-- colour a bar was given, or false when it follows the accent.
+--
+-- This was a weak keyed table, and that was the bug behind "the accent does not change the
+-- bars". A ramp is a UIGradient that nothing in Lua refers to once barRamp has returned:
+-- the fill holds it in the tree, not in a table. So the only Lua reference to it was the
+-- key of this table, and a weak key is not a reference. Roblox is free to drop the wrapper
+-- for an instance nothing is holding, and when it does the entry leaves the table, and a
+-- ramp that has left the table is never rebuilt again. The bar keeps the accent it was
+-- built with for the rest of the session.
+--
+-- Nothing else in the kit was hit by this, which is why it looked like the bars were
+-- special: every other part that follows a colour is in THEME_REG, which is strong, and
+-- that reference is what was keeping the state painters alive too. A bar's fill is in
+-- there, so the fill kept following the accent's opacity. Only the gradient over it, the
+-- one thing that owns the bar's colour, was held weakly.
+local BAR_RAMPS = {}
 local RAMP_DARK = Color3.new(0, 0, 0)
 local RAMP_LIGHT = Color3.new(1, 1, 1)
 
@@ -1806,13 +1910,9 @@ local function rampColours(color)
 end
 
 local function refreshBarRamps(accent)
-    for ramp, fixed in pairs(BAR_RAMPS) do
-        if ramp.Parent then
-            ramp.Color = rampColours(typeof(fixed) == "Color3" and fixed or accent)
-        else
-            BAR_RAMPS[ramp] = nil
-        end
-    end
+    tagWalk(BAR_RAMPS, function(ramp, fixed)
+        ramp.Color = rampColours(typeof(fixed) == "Color3" and fixed or accent)
+    end)
 end
 
 -- barRamp(fill [, color]) takes over the fill's colour. Without a colour the bar
@@ -1824,8 +1924,10 @@ local function barRamp(fill, color)
     end
     local ramp = newInstance("UIGradient")
     ramp.Color = rampColours(color)
+    -- Parented before it is registered, so tagWalk knows it is a live part rather than one
+    -- the builder has not finished assembling.
     ramp.Parent = fill
-    BAR_RAMPS[ramp] = color or false
+    tagAdd(BAR_RAMPS, ramp, color or false)
     return ramp
 end
 
@@ -4379,17 +4481,23 @@ function Card:stepper(text, min, max, step, get, set) return self:_index(text, C
 -- opts.preset = false   drop the preset dropdown and keep the colour rows
 -- opts.keys = { .. }    which palette keys get a row, in that order
 -- opts.reset = false    drop the reset button
+-- opts.search = false   drop the search field from the preset dropdown
 function Card:theme(opts)
     opts = opts or {}
     local win = self._ctx
     if opts.preset ~= false then
         -- The list is passed as a function, so a preset registered by the script after
         -- the card was built still turns up in the dropdown.
+        --
+        -- Searched by default. The panel shows seven rows and scrolls past that, and the
+        -- kit ships fourteen presets before a script has added any of its own, so picking
+        -- one by name means scrolling a list to find a word you already know. Pass
+        -- opts.search = false on a build that has trimmed the list back down.
         self:dropdown("Preset", Interface.themeNames, function()
             return win:getTheme() or THEME_ORDER[1]
         end, function(name)
             win:applyTheme(name)
-        end, { search = opts.search == true })
+        end, { search = opts.search ~= false })
     end
     for _, key in ipairs(opts.keys or THEME_KEYS_SHOWN) do
         -- Only real keys, and never accentSoft: it is computed from the accent and the
