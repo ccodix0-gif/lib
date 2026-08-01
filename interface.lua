@@ -116,7 +116,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.8"
+Interface.version = "2026.07.31.9"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -596,6 +596,12 @@ local shownColor = function(key)
     return PALETTE[key]
 end
 
+-- Declared here and filled in with the logger further down, because the type and icon code
+-- above the logger needs to be able to report a refusal. Without the forward declaration this
+-- name resolves to a global, which is nil, so the one line that was meant to explain a
+-- failure would throw on top of it.
+local log
+
 -- faced(inst, role): pick a weight and follow the family.
 local function faced(instance, role)
     role = role or "regular"
@@ -614,10 +620,24 @@ end
 
 -- Swap the type family for the whole interface (a language the default family
 -- has no glyphs for). Existing labels are re-faced in place.
+--
+-- The face is built before anything is written, and a family the client will not make a Font
+-- from leaves the interface on the one it already had. Half re-faced is the worst outcome
+-- here, because the write goes to every label the kit owns and there is no way back from it.
+-- Returns whether it took, so a caller offering a list of families can put the control back
+-- on the one that is actually being drawn.
 function Interface.setFont(family)
-    if type(family) ~= "string" or family == "" then return end
+    if type(family) ~= "string" or family == "" then return false end
+    local ok = pcall(function()
+        return Font.new(family, Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+    end)
+    if not ok then
+        log("warn", "setFont: " .. family .. " is not a font family")
+        return false
+    end
     FONT_FAMILY = family
     refaceAll()
+    return true
 end
 
 local WEIGHT_NAMES = {
@@ -844,7 +864,7 @@ end
 --   UI.setLogger(function(level, message) print(level, message) end)
 -- level is "info" or "warn". Passing nil turns it back off.
 local logger = nil
-local function log(level, message)
+log = function(level, message)
     if not logger then return end
     pcall(logger, level, "[NewReality] " .. tostring(message))
 end
@@ -3762,9 +3782,12 @@ function Controls.colorpicker(parent, ctx, text, getRgb, setRgb, opts)
     swatch.Active = true
     pipette.MouseEnter:Connect(function() tintIcon(palImg, PALETTE.accent) end)
     pipette.MouseLeave:Connect(function() tintIcon(palImg, PALETTE.iconDim) end)
-    -- Keep the swatch and hex in sync when the value changes externally (theme reset).
-    if ctx and ctx._refresh then
-        table.insert(ctx._refresh, function()
+    -- Keep the swatch and hex in sync when the value changes from somewhere else: a preset
+    -- applied, a theme reset, a config loaded. On the repaint list rather than the refresh
+    -- list, so it costs a colour read and two writes per palette change instead of a
+    -- re-render.
+    if ctx and ctx._repaint then
+        table.insert(ctx._repaint, function()
             local c = colorOf(getRgb())
             swatchFill.BackgroundColor3 = c
             hexLabel.Text = hexOf(getRgb())
@@ -5095,6 +5118,12 @@ shownColor = function(key)
     return (state and state.shown) or PALETTE[key]
 end
 
+-- Set while a frame of the fade is walking several keys, so the state painters run once for
+-- the frame rather than once per key. A preset moves fourteen keys at a time, and every one of
+-- them used to drag the whole painter list behind it: fourteen sweeps a frame doing thirteen
+-- sweeps worth of nothing.
+local paintersHeld = false
+
 local function paintKey(key, color, alpha)
     local reg = THEME_REG[key]
     if not reg then return end
@@ -5109,12 +5138,14 @@ local function paintKey(key, color, alpha)
     -- start instead meant the bar's fill eased while its shading jumped.
     if key == "accent" then refreshBarRamps(color) end
     -- Last, because the pass above has just painted a few of these as though they had no
-    -- state of their own.
-    runStatePainters()
+    -- state of their own. Held back when the caller is walking several keys in one frame and
+    -- will run them itself once it is done.
+    if not paintersHeld then runStatePainters() end
 end
 
 local function driveThemeFade(dt)
     local running = false
+    paintersHeld = true
     for key, state in pairs(themeFade) do
         state.t = math.min(state.t + dt / THEME_FADE, 1)
         -- Cubic out: most of the distance early, the last of it gently, which is what
@@ -5129,6 +5160,8 @@ local function driveThemeFade(dt)
             running = true
         end
     end
+    paintersHeld = false
+    runStatePainters()
     if not running and themeFadeStop then
         themeFadeStop()
         themeFadeStop = nil
@@ -5173,8 +5206,26 @@ function Window:setColor(key, rgb)
         applyKey("accentSoft", legibleOn(PALETTE.accent, PALETTE.background), PALETTE_A.accent)
     end
 
-    if self._refresh then
-        for _, fn in ipairs(self._refresh) do pcall(fn) end
+    -- The repaint list, not the refresh list.
+    --
+    -- This used to run refresh: every control on the interface, re-read and re-rendered, on
+    -- every call. A colour is not a value, so none of those controls had anything to re-read,
+    -- and each one repainted itself with a tween anyway. Harmless for a button press and
+    -- ruinous for a drag, because a colour picker or an opacity slider calls setColor once per
+    -- frame for as long as the pointer is down: the cost was a tween per control per frame. On
+    -- a page of two hundred controls that is several hundred live tweens a second, climbing
+    -- for as long as the drag lasts. It raises no error, it takes the client down, and
+    -- dragging the opacity slider in the worked example was enough to do it.
+    --
+    -- What is left on this path is the handful of things that genuinely read a colour and
+    -- cannot be painted by key: a picker's swatch and its hex readout. Everything whose colour
+    -- depends on its own state is handled by the state painters, which already run at the end
+    -- of every palette pass and write straight, with no tween and no allocation.
+    --
+    -- The harness measures it: sixty frames of dragging a palette key has to stay under a few
+    -- hundred tweens. Before this it was two thousand on a window with thirty controls.
+    if self._repaint then
+        for _, fn in ipairs(self._repaint) do pcall(fn) end
     end
     self._dirty = true
 end
@@ -5332,6 +5383,8 @@ end
 -- config so toggles, sliders, dropdowns reflect the loaded state).
 function Window:refreshAll()
     for _, fn in ipairs(self._refresh) do pcall(fn) end
+    -- The colour readers too, because a loaded config brings a palette with it.
+    for _, fn in ipairs(self._repaint) do pcall(fn) end
     -- The page heading is not a control, so it is re-read here as well: a
     -- language change goes through this path too.
     if self.title and self._titlePhrase then self.title.Text = translate(self._titlePhrase) end
@@ -6739,7 +6792,17 @@ function Interface.new(opts)
     opts = opts or {}
     local self = setmetatable({
         tabs = {}, groups = {}, flags = {},
-        _refresh = {}, _binds = {},
+        -- Two lists, because they are called at very different rates.
+        --
+        -- _refresh re-reads a control's value and re-renders it, tweens included. That is
+        -- what a config load needs and it is called once, by refreshAll.
+        --
+        -- _repaint only re-reads a colour and writes it: no tween, no allocation. setColor
+        -- calls it, and setColor happens once per frame for as long as a colour picker or an
+        -- opacity slider is being dragged. Running the first list at that rate is what made
+        -- dragging one control start a tween on every other control on the page, sixty times
+        -- a second, until the client gave out.
+        _refresh = {}, _repaint = {}, _binds = {},
         -- Open floating panels (dropdowns, pickers, gear popovers), the shared
         -- listeners this window owns, the detached overlays by config name, the
         -- fade helper of each of them and the HUDs built through win:hud.
