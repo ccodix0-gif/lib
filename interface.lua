@@ -118,7 +118,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.16"
+Interface.version = "2026.07.31.17"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -3460,14 +3460,15 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
     -- stops growing at seven rows and starts scrolling instead.
     local ROW_STEP = 35
     local MAX_ROWS = 7
-    -- The search field is an option row's rectangle with the panel's inset above it, and it
-    -- is declared here rather than where it is built because the panel's first height is
-    -- worked out before the field exists. Two copies of the number is how the guess drifts
-    -- away from the real height, and a guess that is wrong is a panel that corrects itself
-    -- part way through opening.
-    local SEARCH_INSET = 6
-    local SEARCH_HEIGHT = 32
-    local SEARCH_BLOCK = SEARCH_INSET + SEARCH_HEIGHT
+    -- Height of the search header. Declared here rather than where it is built, because the
+    -- panel's first height is worked out before the field exists. Two copies of the number is
+    -- how the guess drifts away from the real height, and a guess that is wrong is a panel
+    -- that corrects itself part way through opening.
+    local SEARCH_BLOCK = 36
+    -- Passed to openPanel rather than left to its default, because the search header needs the
+    -- same number on the client where it has to round its own corners. One name instead of the
+    -- same literal in two places that must agree.
+    local PANEL_RADIUS = 10
     local opened = nil
 
     button.MouseButton1Click:Connect(function()
@@ -3492,6 +3493,7 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
             width = 210,
             height = guess,
             offsetX = -70,
+            radius = PANEL_RADIUS,
             onClose = function()
                 opened = nil
                 tween(arrow, 0.25, { Rotation = 0 })
@@ -3501,48 +3503,47 @@ function Controls.dropdown(parent, ctx, text, options, get, set, opts)
         tween(arrow, 0.25, { Rotation = 180 })
         listLayout(panel, 0)
 
-        -- Search sits at the top of the panel, in the same rectangle an option row gets.
+        -- Search fills the top of the panel: full width, flush with the top edge, no inset and
+        -- no rounding of its own.
         --
-        -- The same rectangle, exactly, and that is the whole point of the numbers below. The
-        -- field used to be its own shape: 30 tall against a row's 32, a radius of 6 against a
-        -- row's 8, and six pixels of inset at the sides but only three at the top, so it sat
-        -- pressed against the panel's edge with a nine pixel gap under it. Four small
-        -- differences, none of them worth anything, and together they made the one control
-        -- above the list look like it belonged to something else.
+        -- Its top corners are cut by the panel's own corner mask. The panel is a CanvasGroup,
+        -- so it rasterises its children and the UICorner masks the raster, which is the same
+        -- mechanism the chequer grid behind a colour swatch uses. That is what lets a square
+        -- header sit in a rounded panel and come out rounded at the top and straight at the
+        -- bottom, which no UICorner can do on its own.
         --
-        -- The vertical rhythm now reads 6, field, 6, first row, and the six under the field is
-        -- the body's own top padding rather than a second number written here. So the holder
-        -- is the inset plus the field and nothing more, and if the body's padding ever changes
-        -- the gap follows it instead of drifting away from it.
+        -- It was inset for a while, six pixels at the sides and three at the top, on the
+        -- theory that it should look like every other field in the kit. It should not. A field
+        -- inside a card is a control among controls and wants an inset; this one is the header
+        -- of the thing it sits on, and inset it read as a control that had been dropped into
+        -- the panel and left a strip of panel showing around it.
         --
-        -- The icon and the text sit where the inline list puts them, because that is the other
-        -- search field in the kit and two search fields that are nearly the same are worse
-        -- than two that are different on purpose.
+        -- The fallback matters here. newGroup hands back a plain Frame on a client with no
+        -- CanvasGroup, and a Frame does not mask anything, so a flush header there would show
+        -- square corners poking out of a rounded panel. On that client the header takes its own
+        -- rounding instead: both corners round rather than only the top two, which is a small
+        -- oddity on a degraded client and not a defect on every other one.
         local searchBox
         if opts.search then
-            local holder = newInstance("Frame")
-            holder.Name = randomName()
-            holder.Size = UDim2.new(1, 0, 0, SEARCH_BLOCK)
-            holder.BackgroundTransparency = 1
-            holder.LayoutOrder = 0
-            holder.Parent = panel
-
             local head = newInstance("Frame")
             head.Name = randomName()
-            head.Size = UDim2.new(1, -SEARCH_INSET * 2, 0, SEARCH_HEIGHT)
-            head.Position = UDim2.new(0, SEARCH_INSET, 0, SEARCH_INSET)
+            head.Size = UDim2.new(1, 0, 0, SEARCH_BLOCK)
+            head.Position = UDim2.new(0, 0, 0, 0)
             head.BorderSizePixel = 0
-            head.Parent = holder
+            head.LayoutOrder = 0
+            head.Parent = panel
             themed(head, "BackgroundColor3", "control")
-            corner(head, 8)
+            if panel.ClassName ~= "CanvasGroup" then
+                corner(head, PANEL_RADIUS)
+            end
 
             local sicon = makeIcon(head, "search", UDim2.new(0, 15, 0, 15), "iconDim")
             sicon.AnchorPoint = Vector2.new(0, 0.5)
-            sicon.Position = UDim2.new(0, 10, 0.5, 0)
+            sicon.Position = UDim2.new(0, 12, 0.5, 0)
             searchBox = newInstance("TextBox")
             searchBox.BackgroundTransparency = 1
-            searchBox.Position = UDim2.new(0, 32, 0, 0)
-            searchBox.Size = UDim2.new(1, -42, 1, 0)
+            searchBox.Position = UDim2.new(0, 34, 0, 0)
+            searchBox.Size = UDim2.new(1, -46, 1, 0)
             searchBox.TextSize = 14
             searchBox.Text = ""
             searchBox.ClearTextOnFocus = false
