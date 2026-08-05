@@ -129,7 +129,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.20"
+Interface.version = "2026.07.31.21"
 
 -- Five tables that hold what used to be a hundred and thirty separate locals ------------
 --
@@ -1148,22 +1148,52 @@ local function gateArmed()
     return gateCheck ~= nil
 end
 
--- Whether the gate is open right now, re-running the validator if the last answer is
--- older than the caller asked for. The staleness check is here rather than only on a
--- timer so that a window built an hour after the key was entered is a window that was
--- checked, not one that inherited a pass.
+-- Ask again whether the session is still allowed, part way through it.
+--
+-- This is a different question from the one the key answered, and it takes a different
+-- function, because the key is not kept: it went to the validator as an argument and it is
+-- gone. There is nothing here to send a second time.
+--
+-- It used to call the same validator with no key at all, and that is a trap rather than a
+-- feature. Every validator worth writing looks at its argument, so nearly all of them refuse
+-- a nil, and the refusal arrives as the interface unloading itself moments after a key was
+-- accepted. The worked example's own validator did exactly that. So a caller that wants a
+-- session re-checked says what to re-check it with, and a caller that does not gets one
+-- check at the start and a session that lasts.
+--
+-- Returns whether it can be asked at all, then the answer and the facts.
+local function gateRecheck()
+    local fn = gateOpts and gateOpts.revalidate
+    if type(fn) ~= "function" then return false end
+    local ok, result = pcall(fn)
+    gateLastRun = os.clock()
+    if not ok then return true, false, nil end
+    if result == false then return true, false, nil end
+    if type(result) == "table" then
+        if result.ok == false then return true, false, result end
+        return true, true, result
+    end
+    return true, true, nil
+end
+
+-- Whether the gate is open right now, asking again if the last answer is older than the
+-- caller allowed for. The staleness check is here rather than only on a timer so that a
+-- window built an hour after the key was entered is a window that was checked, not one that
+-- inherited a pass. With nothing to re-check against, the token stands for the session.
 local function gateOpen()
     if not gateCheck then return true end
     if not gateToken then return false end
     local period = (gateOpts and gateOpts.recheck) or 0
     if period > 0 and os.clock() - gateLastRun > period then
-        local passed, info = gateRun(nil)
-        if not passed then
-            gateToken = nil
-            gateInfo = nil
-            return false
+        local can, passed, info = gateRecheck()
+        if can then
+            if not passed then
+                gateToken = nil
+                gateInfo = nil
+                return false
+            end
+            if info then gateInfo = info end
         end
-        if info then gateInfo = info end
     end
     return gateToken ~= nil
 end
@@ -1190,7 +1220,12 @@ function Interface.licence(fn, period)
         return
     end
     gateCheck = fn
-    gateOpts = { recheck = (type(period) == "number" and period >= 10) and period or 60 }
+    -- The same function for both, because this form never took a key: it asks whether the
+    -- session is allowed, which is exactly what a re-check asks.
+    gateOpts = {
+        recheck = (type(period) == "number" and period >= 10) and period or 60,
+        revalidate = fn,
+    }
     local passed, info = gateRun(nil)
     gateToken = passed and mintToken() or nil
     gateInfo = passed and info or nil
@@ -1324,8 +1359,17 @@ local function dropTicker(entry)
     end
 end
 
-local function addTicker(interval, fn)
-    local entry = { interval = interval or 0, acc = interval or 0, fn = fn }
+-- acc starts at interval, so the callback runs on the very next frame and then every
+-- interval after it. That is what a live readout wants: a HUD row polling twice a second
+-- should show its value now rather than in half a second, and so should the clock on the
+-- status strip.
+--
+-- deferFirst turns it off, for a caller measuring a period rather than a refresh rate. The
+-- gate's re-check is the one, and it is not a small difference: armed the other way it ran
+-- the moment the window finished building, which is one frame after the key was accepted,
+-- so a validator that refused it took the window down again before anyone saw it.
+local function addTicker(interval, fn, deferFirst)
+    local entry = { interval = interval or 0, acc = deferFirst and 0 or (interval or 0), fn = fn }
     tickers[entry] = true
     tickerCount += 1
     if not tickerConn then
@@ -8116,16 +8160,24 @@ function Interface.new(opts)
         end
     end))
 
-    -- Keep checking while the window lives: a revoked session loses its interface instead
-    -- of running on with a stale pass. The validator is re-run rather than a remembered
-    -- answer being read, and a refusal drops the token as well as the window, so nothing
-    -- can be rebuilt afterwards without passing again.
-    if gateArmed() then
+    -- Keep asking while the window lives, so a revoked session loses its interface instead
+    -- of running on with a stale pass. A refusal drops the token as well as the window, so
+    -- nothing can be rebuilt afterwards without passing again.
+    --
+    -- Only when the build said what to ask with. See gateRecheck: the key is not kept, so
+    -- there is no second question to put unless the caller supplied one, and a timer that
+    -- invents one takes the interface down for no reason.
+    --
+    -- deferFirst, because this measures a period. Armed the other way it fired one frame
+    -- after the window was built, which is how a key that had just been accepted came back
+    -- as a refusal and an empty screen.
+    if gateArmed() and type(gateOpts and gateOpts.revalidate) == "function" then
         local period = (gateOpts and gateOpts.recheck) or 60
         if period > 0 then
             table.insert(self._conns, addTicker(period, function()
                 if self._dead then return end
-                local passed, info = gateRun(nil)
+                local can, passed, info = gateRecheck()
+                if not can then return end
                 if passed then
                     if info then gateInfo = info end
                     gateToken = mintToken()
@@ -8137,7 +8189,7 @@ function Interface.new(opts)
                     pcall(gateOpts.onLost, "revoked")
                 end
                 self:unload()
-            end))
+            end, true))
         end
     end
 
@@ -8207,7 +8259,11 @@ Interface.Card = Card
 --   check             the validator. Required. false or { ok = false } refuses.
 --   key               try this one first and never show the prompt if it passes. For a
 --                     build that already has a key in hand; it is not remembered here.
---   recheck = 300     seconds between re-checks while the session runs; 0 to never
+--   revalidate        asks whether the session is still allowed, part way through it. Takes
+--                     no arguments, because the key is not kept and there is nothing to send
+--                     again. Without it there is no re-checking at all, which is deliberate:
+--                     see gateRecheck.
+--   recheck = 300     seconds between those, while the session runs; 0 to never
 --   attempts = 0      wrong keys allowed before it gives up; 0 for no limit
 --   onLost            called when a re-check fails after a pass
 --   title / note / placeholder / getKeyUrl / discordUrl / brand
@@ -8226,6 +8282,26 @@ Interface.Card = Card
 function Interface.keyPrompt(opts)
     opts = opts or {}
 
+    -- The links, worked out before anything is drawn, because how many there are decides how
+    -- tall the card is. A link that was not given is absent rather than present and dead, and
+    -- a build with neither gets a shorter card instead of a strip of nothing under the button.
+    --
+    -- Discord is the mark on its own when it has something to sit beside. It is the one logo
+    -- every reader of this window already knows, so the word next to it said nothing the mark
+    -- did not. Alone it takes the whole row, and an eighteen pixel mark lost in the middle of
+    -- three hundred and forty is worse than a word, so alone it keeps its word.
+    local links = {}
+    if type(opts.getKeyUrl) == "string" and opts.getKeyUrl ~= "" then
+        links[#links + 1] = { label = "Get Key", icon = "ticket", url = opts.getKeyUrl }
+    end
+    if type(opts.discordUrl) == "string" and opts.discordUrl ~= "" then
+        links[#links + 1] = { icon = "brand-discord", url = opts.discordUrl, square = true }
+    end
+    if #links == 1 and links[1].square then
+        links[1].square = false
+        links[1].label = "Discord"
+    end
+
     local screen = newInstance("ScreenGui")
     screen.Name = randomName()
     screen.ResetOnSpawn = false
@@ -8235,7 +8311,11 @@ function Interface.keyPrompt(opts)
     screen.Parent = guiParent(screen)
 
     local view = viewport()
-    local W, H = 380, 246
+    -- Head 62, field at 74, status at 120, Check at 142, the links at 188 and 34 tall, then
+    -- the same 18 of air under them as there is either side.
+    local LINKS_Y = 188
+    local W = 380
+    local H = (#links > 0) and (LINKS_Y + 34 + 18) or (142 + 38 + 18)
     local root = newInstance("Frame")
     root.Name = randomName()
     root.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -8290,16 +8370,22 @@ function Interface.keyPrompt(opts)
     note.Parent = head
     faced(note, "regular")
     themed(note, "TextColor3", "subtext")
-    localized(note, "Text", opts.note or "Enter your key to continue")
+    localized(note, "Text", opts.note or "Paste your key to continue")
 
     -- The field, and the eye that reveals it.
+    --
+    -- A ring round it that lights up while it has focus, because a masked field has no other
+    -- feedback: a row of dots does not say whether the box is the thing taking what is being
+    -- typed, and a key pasted into a field that was not focused looks exactly like a key
+    -- pasted into one that was.
     local box = Instance.new("Frame")
     box.Position = UDim2.new(0, 20, 0, 74)
-    box.Size = UDim2.new(1, -40, 0, 36)
+    box.Size = UDim2.new(1, -40, 0, 38)
     box.BorderSizePixel = 0
     box.Parent = card
     themed(box, "BackgroundColor3", "control")
-    corner(box, 8)
+    corner(box, 9)
+    local ring = stateStroke(box, "accent", 1)
 
     local input = Instance.new("TextBox")
     input.BackgroundTransparency = 1
@@ -8313,7 +8399,7 @@ function Interface.keyPrompt(opts)
     faced(input, "regular")
     themed(input, "TextColor3", "text")
     themed(input, "PlaceholderColor3", "subtext")
-    localized(input, "PlaceholderText", opts.placeholder or "Paste your key")
+    localized(input, "PlaceholderText", opts.placeholder or "Paste your key here")
 
     local eye = Instance.new("TextButton")
     eye.AnchorPoint = Vector2.new(1, 0.5)
@@ -8386,7 +8472,7 @@ function Interface.keyPrompt(opts)
 
     local status = Instance.new("TextLabel")
     status.BackgroundTransparency = 1
-    status.Position = UDim2.new(0, 20, 0, 116)
+    status.Position = UDim2.new(0, 20, 0, 120)
     status.Size = UDim2.new(1, -40, 0, 16)
     status.TextSize = 13
     status.TextXAlignment = Enum.TextXAlignment.Left
@@ -8396,13 +8482,23 @@ function Interface.keyPrompt(opts)
     faced(status, "medium")
     themed(status, "TextColor3", "subtext")
 
-    local function say(text, bad)
+    -- Three tones and not two. A refusal and an acceptance are both worth saying loudly and
+    -- they are not the same news, so a pass takes the accent, a refusal takes the accent
+    -- lifted off the surface until it can be read, and everything else stays quiet.
+    local function say(text, tone)
         status.Text = text and translate(text) or ""
-        status.TextColor3 = bad and PALETTE.accentSoft or PALETTE.subtext
+        if tone == "good" then
+            status.TextColor3 = legibleOn(PALETTE.accent, PALETTE.background)
+        elseif tone == "bad" then
+            status.TextColor3 = PALETTE.accentSoft
+        else
+            status.TextColor3 = PALETTE.subtext
+        end
     end
 
-    -- Buttons. Check is the wide one, the two links share the row under it, and a link
-    -- that was not given is simply absent rather than present and dead.
+    -- Buttons. Check Key is the primary one and it is filled with the accent, because it is
+    -- the only thing on the card anybody came here to press: three identical grey rectangles
+    -- made the reader pick it out by reading all three.
     local function flatButton(label, position, size)
         local btn = Instance.new("TextButton")
         btn.Position = position
@@ -8414,28 +8510,74 @@ function Interface.keyPrompt(opts)
         faced(btn, "medium")
         themed(btn, "BackgroundColor3", "control")
         themed(btn, "TextColor3", "text")
-        corner(btn, 8)
-        localized(btn, "Text", label)
+        corner(btn, 9)
+        if label then localized(btn, "Text", label) else btn.Text = "" end
         hoverSurface(btn)
         return btn
     end
 
-    local checkBtn = flatButton("Check Key", UDim2.new(0, 20, 0, 140), UDim2.new(1, -40, 0, 36))
-    local links = {}
-    if type(opts.getKeyUrl) == "string" and opts.getKeyUrl ~= "" then
-        links[#links + 1] = { label = "Get Key", url = opts.getKeyUrl }
-    end
-    if type(opts.discordUrl) == "string" and opts.discordUrl ~= "" then
-        links[#links + 1] = { label = "Discord", url = opts.discordUrl }
-    end
+    local checkBtn = Instance.new("TextButton")
+    checkBtn.Position = UDim2.new(0, 20, 0, 142)
+    checkBtn.Size = UDim2.new(1, -40, 0, 38)
+    checkBtn.BorderSizePixel = 0
+    checkBtn.AutoButtonColor = false
+    checkBtn.TextSize = 14
+    checkBtn.Parent = card
+    faced(checkBtn, "bold")
+    corner(checkBtn, 9)
+    localized(checkBtn, "Text", "Check Key")
+    -- A state painter rather than two themed() calls, because the text colour is derived
+    -- from the fill: pick a pale accent and white letters on it are not letters. It follows a
+    -- live accent change the same way the rest of the kit does.
+    local checkHot = false
+    addStatePainter(checkBtn, function()
+        local accent = shownColor("accent")
+        checkBtn.BackgroundColor3 = checkHot and accent:Lerp(Color3.new(1, 1, 1), 0.12) or accent
+        checkBtn.TextColor3 = contrastOn(accent)
+    end)
+    checkBtn.MouseEnter:Connect(function()
+        checkHot = true
+        runStatePainters()
+    end)
+    checkBtn.MouseLeave:Connect(function()
+        checkHot = false
+        runStatePainters()
+    end)
+
+    -- The links under it, laid out from the list built at the top.
     do
-        local n = #links
-        for i, entry in ipairs(links) do
-            local gap = 8
-            local total = W - 40 - gap * (n - 1)
-            local w = math.floor(total / n)
-            local x = 20 + (i - 1) * (w + gap)
-            local btn = flatButton(entry.label, UDim2.new(0, x, 0, 186), UDim2.new(0, w, 0, 32))
+        local gap = 8
+        -- The squares take a fixed 38, the rest is shared by whatever is left. One link on
+        -- its own fills the row whichever kind it is.
+        local squares, wide = 0, 0
+        for _, entry in ipairs(links) do
+            if entry.square then squares += 1 else wide += 1 end
+        end
+        local room = W - 40 - gap * math.max(#links - 1, 0)
+        local squareW = (wide > 0) and 38 or math.floor(room / math.max(squares, 1))
+        local wideW = (wide > 0) and math.floor((room - squareW * squares) / wide) or 0
+        local x = 20
+        for _, entry in ipairs(links) do
+            local w = entry.square and squareW or wideW
+            local btn = flatButton(entry.label, UDim2.new(0, x, 0, LINKS_Y), UDim2.new(0, w, 0, 34))
+            x += w + gap
+            if entry.icon then
+                local img = makeIcon(btn, entry.icon, UDim2.new(0, 18, 0, 18), "icon")
+                img.Active = false
+                if entry.square then
+                    img.AnchorPoint = Vector2.new(0.5, 0.5)
+                    img.Position = UDim2.new(0.5, 0, 0.5, 0)
+                else
+                    img.AnchorPoint = Vector2.new(0, 0.5)
+                    img.Position = UDim2.new(0, 12, 0.5, 0)
+                    -- Room for the icon, taken off the left so the words stay centred in
+                    -- what is left rather than sitting under the mark.
+                    btn.TextXAlignment = Enum.TextXAlignment.Center
+                    local pad = Instance.new("UIPadding")
+                    pad.PaddingLeft = UDim.new(0, 26)
+                    pad.Parent = btn
+                end
+            end
             btn.MouseButton1Click:Connect(function()
                 -- The clipboard, and the link itself on screen when there is no clipboard
                 -- to put it on. Opening a browser is not attempted: it is an executor
@@ -8448,7 +8590,7 @@ function Interface.keyPrompt(opts)
                         copied = true
                     end
                 end)
-                say(copied and "Link copied" or entry.url, false)
+                say(copied and "Link copied" or entry.url, nil)
             end)
         end
     end
@@ -8471,25 +8613,78 @@ function Interface.keyPrompt(opts)
     local tries = 0
     local limit = (type(opts.attempts) == "number" and opts.attempts > 0) and opts.attempts or 0
     local busy = false
+    local leaving = false
+    local resting = root.Position
+    -- The entrance writes root.Position every frame, and so do the two animations below it.
+    -- A key submitted inside the first three tenths of a second would otherwise have two
+    -- tickers arguing over the same property. Whoever moves next stops the entrance first.
+    local stopEnter = nil
 
-    local function finish(result)
-        if answer ~= nil then return end
+    -- Out, and it takes its time about it on a pass.
+    --
+    -- It used to be a sixteen hundredths fade and nothing else, fired the instant the
+    -- validator came back, so "Key accepted" was drawn and painted over in the same breath:
+    -- the card blinked out and whether it had accepted anything was a guess. hold keeps it on
+    -- screen long enough to read, and then it leaves upwards and accelerating, which is the
+    -- opposite curve to the one it arrived on. The window it was gating builds behind it in
+    -- that time, so the two cross rather than the screen going empty in between.
+    local function finish(result, hold)
+        if leaving then return end
+        leaving = true
         answer = result
+        if stopEnter then stopEnter() stopEnter = nil end
         -- The key goes before the window does, and it goes whether the answer was yes or
         -- no. There is no path out of here that leaves it in the field.
         secret = ""
         writing = true
         input.Text = ""
         writing = false
+        -- Let the field go, so a keyboard is not left captured by a window that is leaving.
+        pcall(function() input:ReleaseFocus() end)
+        local wait = hold or 0
         local stop
         local elapsed = 0
         stop = addTicker(0, function(dt)
             elapsed += dt
-            local t = math.min(elapsed / 0.16, 1)
-            setAlpha(1 - t)
+            if elapsed < wait then return end
+            local t = math.min((elapsed - wait) / 0.2, 1)
+            -- Accelerating away: t^2 rather than the softened curve it came in on.
+            local eased = t * t
+            setAlpha(1 - eased)
+            root.Position = UDim2.new(
+                resting.X.Scale, resting.X.Offset,
+                resting.Y.Scale, math.floor(resting.Y.Offset - 14 * eased + 0.5)
+            )
             if t >= 1 then
                 if stop then stop() end
                 screen:Destroy()
+            end
+        end)
+    end
+
+    -- A refused key nudges the card sideways and settles back.
+    --
+    -- Whole pixels, and the card is moved rather than scaled: the kit does not scale anything
+    -- carrying text, and a CanvasGroup resampled at a fractional offset softens every glyph
+    -- under it for as long as the animation lasts. Three cycles over a fifth of a second,
+    -- which is enough to read as a refusal without being a toy.
+    local function refuse()
+        if leaving then return end
+        if stopEnter then stopEnter() stopEnter = nil end
+        setAlpha(1)
+        local stop
+        local elapsed = 0
+        stop = addTicker(0, function(dt)
+            elapsed += dt
+            local t = math.min(elapsed / 0.22, 1)
+            local offset = math.floor(math.sin(t * math.pi * 6) * 7 * (1 - t) + 0.5)
+            root.Position = UDim2.new(
+                resting.X.Scale, resting.X.Offset + offset,
+                resting.Y.Scale, resting.Y.Offset
+            )
+            if t >= 1 then
+                root.Position = resting
+                if stop then stop() end
             end
         end)
     end
@@ -8499,23 +8694,26 @@ function Interface.keyPrompt(opts)
         local passed, info = gateRun(key)
         key = nil
         busy = false
-        if answer ~= nil then return end
+        if leaving then return end
         if passed then
             gateToken = mintToken()
             gateInfo = info
-            say("Key accepted", false)
-            finish(true)
+            say("Key accepted", "good")
+            tween(ring, 0.12, { Transparency = 0.1 }, EASE_SOFT)
+            finish(true, 0.24)
             return
         end
         gateToken = nil
         gateInfo = nil
         tries += 1
         if limit > 0 and tries >= limit then
-            say("Too many attempts", true)
-            finish(false)
+            say("Too many attempts", "bad")
+            refuse()
+            finish(false, 0.5)
             return
         end
-        say(limit > 0 and ("Invalid key, " .. (limit - tries) .. " left") or "Invalid key", true)
+        say(limit > 0 and ("Invalid key, " .. (limit - tries) .. " left") or "Invalid key", "bad")
+        refuse()
     end
 
     -- inline for a caller that owns its own thread, spawned for a click.
@@ -8525,13 +8723,14 @@ function Interface.keyPrompt(opts)
     -- already on a thread of their own and would rather have the answer than a promise, and
     -- it is the only way in that a harness with no scheduler can use.
     local function attempt(inline)
-        if busy or answer ~= nil then return end
+        if busy or leaving then return end
         if secret == "" then
-            say("Enter a key first", true)
+            say("Enter your key first", "bad")
+            refuse()
             return
         end
         busy = true
-        say("Checking..", false)
+        say("Checking..", nil)
         if inline then
             run()
         else
@@ -8540,16 +8739,22 @@ function Interface.keyPrompt(opts)
     end
 
     checkBtn.MouseButton1Click:Connect(function() attempt(false) end)
-    input.FocusLost:Connect(function(enter) if enter then attempt(false) end end)
+    input.Focused:Connect(function()
+        if leaving then return end
+        tween(ring, 0.14, { Transparency = 0.25 }, EASE_SOFT)
+    end)
+    input.FocusLost:Connect(function(enter)
+        if not leaving then tween(ring, 0.2, { Transparency = 1 }, EASE_SOFT) end
+        if enter then attempt(false) end
+    end)
     closeBtn.MouseButton1Click:Connect(function() finish(false) end)
 
     -- In, on the same curve the window uses.
     do
-        local stop
         local elapsed = 0
-        local from = root.Position
+        local from = resting
         root.Position = UDim2.new(from.X.Scale, from.X.Offset, from.Y.Scale, from.Y.Offset + 24)
-        stop = addTicker(0, function(dt)
+        stopEnter = addTicker(0, function(dt)
             elapsed += dt
             local t = math.min(elapsed / 0.28, 1)
             local eased = 1 - (1 - t) ^ 5
@@ -8558,7 +8763,10 @@ function Interface.keyPrompt(opts)
                 from.X.Scale, from.X.Offset,
                 from.Y.Scale, math.floor(from.Y.Offset + 24 * (1 - eased) + 0.5)
             )
-            if t >= 1 then if stop then stop() end end
+            if t >= 1 and stopEnter then
+                stopEnter()
+                stopEnter = nil
+            end
         end)
     end
 
@@ -8592,6 +8800,10 @@ function Interface.keySystem(opts)
     gateOpts = {
         recheck = (type(opts.recheck) == "number" and opts.recheck >= 0) and opts.recheck or 300,
         onLost = type(opts.onLost) == "function" and opts.onLost or nil,
+        -- Without this there is no re-checking, and that is the right default: the key is not
+        -- kept, so the only thing a timer could send is nothing at all, and a validator asked
+        -- to verify nothing says no. See gateRecheck.
+        revalidate = type(opts.revalidate) == "function" and opts.revalidate or nil,
     }
     gateToken = nil
     gateInfo = nil
