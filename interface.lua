@@ -129,7 +129,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.23"
+Interface.version = "2026.07.31.24"
 
 -- Five tables that hold what used to be a hundred and thirty separate locals ------------
 --
@@ -1477,6 +1477,28 @@ end
 -- names start truncating, above 240 it is just empty space.
 local function sidebarFit(windowWidth)
     return math.clamp(evenDown(windowWidth * 0.255), 176, 240)
+end
+
+-- The same idea for the window, which is anchored on its middle rather than its corner, so its
+-- position is a centre and the arithmetic is not the same.
+--
+-- Enough of the title strip stays on screen to grab: a config written on a wide monitor and
+-- loaded on a narrow one would otherwise put the window somewhere with no pixels, and a window
+-- whose title bar cannot be reached cannot be dragged back.
+LAYOUT.windowGrab = 140
+local function clampWindow(position, width, height, view)
+    local half = width / 2
+    local left = math.clamp(
+        position.X.Offset - half,
+        math.min(-(width - LAYOUT.windowGrab), 0),
+        math.max(view.X - LAYOUT.windowGrab, 0)
+    )
+    -- Never above the top edge: the title strip is the only handle, and it is at the top.
+    local top = math.clamp(position.Y.Offset - height / 2, 0, math.max(view.Y - 40, 0))
+    return UDim2.new(
+        position.X.Scale, math.floor(left + half + 0.5),
+        position.Y.Scale, math.floor(top + height / 2 + 0.5)
+    )
 end
 
 -- Keep a detached panel on screen. A config written on a large monitor puts panels
@@ -5254,7 +5276,14 @@ function Tab:sub(name)
     }
     local sub = {
         name = name, btn = btn, page = page, columns = columns, tab = self, order = order,
-        enter = function() enterColumns(risers) end,
+        -- Not while the first opening is in flight. That animation brings the cards in one at a
+        -- time, and this one lifts both columns as a block: run together they are two animations
+        -- writing to the same page and the result reads as a stutter. Activating the first tab is
+        -- what used to trigger it, which happens inside the debut every single time.
+        enter = function()
+            if self._ctx._debutting then return end
+            enterColumns(risers)
+        end,
     }
     table.insert(self._subs, sub)
 
@@ -5866,6 +5895,7 @@ function Window:_debut()
     if stripFade then self:_dropFade(stripFade) end
 
     self._open = true
+    self._debutting = true
     window.Visible = true
     window.Position = from
     self:_setAlpha(0)
@@ -5891,13 +5921,17 @@ function Window:_debut()
         add(self._sidebar, -(self._sidebar and self._sidebar.Size.X.Offset or 0), 0,
             MOTION.debutSidebar[1], MOTION.debutSidebar[2])
 
-        -- The sidebar rows, one after another. They are laid out by a list, so what travels is
-        -- each row's own holder: see Window:tab, where every row is given one for this.
+        -- The sidebar rows, one after another.
+        --
+        -- The button, not the holder. The holder is what the sidebar's list manages, and moving
+        -- something a UIListLayout owns is a fight: the list writes the position back on its next
+        -- reflow, so the row jitters between the two of them for the length of the animation.
+        -- That is what the holder exists for, and it is the same arrangement the cards use.
         do
             local step = 0
             for _, tabObj in ipairs(self.tabs) do
-                if tabObj.slide then
-                    add(tabObj.slide, -LAYOUT.debutSlide, 0,
+                if tabObj.btn then
+                    add(tabObj.btn, -LAYOUT.debutSlide, 0,
                         MOTION.debutRows[1] + step * MOTION.debutRowStep, MOTION.debutRows[2])
                     step += 1
                 end
@@ -5991,6 +6025,7 @@ function Window:_debut()
     -- session, which is a card nobody can reach.
     self._debutSnap = function()
         self._debutSnap = nil
+        self._debutting = false
         self._debutDone = true
         for _, mover in ipairs(movers) do mover.frame.Position = mover.home end
         if stripFade then
@@ -6675,6 +6710,20 @@ function Window:snapshot()
         textScale = Interface.getTextScale(),
         recent = recent,
         overlays = overlays,
+        -- Where the window itself was left, and only when somebody moved it.
+        --
+        -- It used to be left out on purpose, so the window always opened centred. That is the
+        -- right default and it is still what an untouched window does, but it is the wrong answer
+        -- for a window that was deliberately dragged out of the way: the config remembers where
+        -- every panel was put and then forgets the one thing the user moved first. The resting
+        -- place is written rather than the live position, so a snapshot taken mid animation does
+        -- not persist a window halfway through opening.
+        window = self._moved and self._resting and {
+            self._resting.X.Scale,
+            self._resting.X.Offset,
+            self._resting.Y.Scale,
+            self._resting.Y.Offset,
+        } or nil,
     }
 end
 
@@ -6751,6 +6800,24 @@ function Window:restore(data)
             end
         end
     end
+    -- Where the window was left, if it was ever moved. Clamped on the way in for the same reason
+    -- the panels are: a config written on a wide monitor must not put it somewhere this screen
+    -- has no pixels. _moved is set as well, so the refit timer leaves it where the config put it
+    -- instead of re-centring it on the next viewport change.
+    if type(data.window) == "table" and #data.window >= 4 then
+        pcall(function()
+            local at = clampWindow(
+                UDim2.new(data.window[1], data.window[2], data.window[3], data.window[4]),
+                self.window.Size.X.Offset,
+                self.window.Size.Y.Offset,
+                viewport()
+            )
+            self._resting = at
+            self._moved = true
+            if self._open then self.window.Position = at end
+        end)
+    end
+
     -- Restore the saved positions of detached parts. Kept for later too, so an
     -- overlay created after this load still picks its spot up.
     if type(data.overlays) == "table" then
@@ -8207,17 +8274,24 @@ end
 
 -- A ring that fills round, with the number inside it and the label under it.
 --
--- Drawn as a dial of ticks rather than as an arc. Roblox has no arc: the usual way round it is
--- two half circle images rotated against each other behind a mask, which needs an image drawn
--- for the job, resamples it at every size and ends up soft at the ends of the sweep. A ring of
--- straight ticks is exact at any diameter, needs no artwork at all, and filling it lights each
--- tick in turn, which is a better answer to "it fills round" than a sliding edge.
+-- Built out of segments rather than as an arc, because Roblox has no arc. The usual way round
+-- that is two half circle images rotated against each other behind a pair of nested clips, which
+-- needs artwork drawn for the job, resamples it at every diameter and comes out soft at both
+-- ends of the sweep. Segments are exact at any size and need no artwork at all.
+--
+-- What matters is that they touch. The first build used a fixed three pixel width and forty four
+-- of them, which at a ninety pixel diameter left more than two pixels of gap between each pair:
+-- a dashed circle, and it read as a broken ring rather than as a ring filling up. The width now
+-- comes from the geometry instead of from a constant, so the segments meet whatever the diameter
+-- and however many there are, and the band is a solid ring with a fine radial grain in it.
 --
 -- opts: label, value, size, ticks, position, id, interval, color, text, visible, bare
 LAYOUT.gaugeSize = 96
-LAYOUT.gaugeTicks = 44
-LAYOUT.gaugeTickLength = 9
-LAYOUT.gaugeTickWidth = 3
+-- One segment per this many pixels of circumference, within reason. Denser than about four
+-- pixels is more frames for a grain nobody can see, and sparser than about ten is a dial.
+LAYOUT.gaugeSegmentPitch = 6
+LAYOUT.gaugeSegmentsMin = 24
+LAYOUT.gaugeSegmentsMax = 96
 function Window:gauge(opts)
     opts = opts or {}
     local diameter = opts.size or LAYOUT.gaugeSize
@@ -8229,7 +8303,8 @@ function Window:gauge(opts)
         0, diameter + pad * 2 + labelH
     ))
 
-    -- The dial. Its own square, so the ticks can be placed from its centre whatever is under it.
+    -- The dial. Its own square, so the segments can be placed from its centre whatever is under
+    -- it, and so the value in the middle is centred on the ring rather than on the card.
     local dial = newInstance("Frame")
     dial.Position = UDim2.new(0, pad, 0, pad)
     dial.Size = UDim2.new(0, diameter, 0, diameter)
@@ -8238,35 +8313,55 @@ function Window:gauge(opts)
     dial.ZIndex = OVERLAY_Z
     dial.Parent = frame
 
-    local count = math.max(math.floor(opts.ticks or LAYOUT.gaugeTicks), 8)
-    local radius = diameter / 2 - LAYOUT.gaugeTickLength / 2 - 1
+    -- How thick the band is, and where its middle sits.
+    local band = math.max(math.floor(diameter * 0.13 + 0.5), 5)
+    local radius = diameter / 2 - band / 2
+    -- Asked for, or worked out from the circumference. The clamp belongs to the worked out
+    -- number only: a caller naming a count means it, and the floor under that is the point where
+    -- segments stop reading as a ring at all.
+    local count
+    if opts.ticks then
+        count = math.max(math.floor(opts.ticks), 8)
+    else
+        count = math.clamp(
+            math.floor(2 * math.pi * radius / LAYOUT.gaugeSegmentPitch),
+            LAYOUT.gaugeSegmentsMin,
+            LAYOUT.gaugeSegmentsMax
+        )
+    end
+    -- The chord one segment has to span, rounded up, plus one so neighbours overlap rather than
+    -- leaving a hairline where the rounding fell short.
+    local width = math.ceil(2 * math.pi * radius / count) + 1
+
     local ticks = {}
     for i = 1, count do
-        -- Twelve o'clock first and clockwise from there, which is the direction anything
-        -- filling round is read in.
-        local turn = (i - 1) / count
-        local angle = turn * math.pi * 2 - math.pi / 2
+        -- Twelve o'clock first and clockwise from there, which is the direction anything filling
+        -- round is read in.
+        local angle = (i - 1) / count * math.pi * 2 - math.pi / 2
         local tick = newInstance("Frame")
         tick.AnchorPoint = Vector2.new(0.5, 0.5)
         tick.Position = UDim2.new(
             0.5, math.floor(math.cos(angle) * radius + 0.5),
             0.5, math.floor(math.sin(angle) * radius + 0.5)
         )
-        tick.Size = UDim2.new(0, LAYOUT.gaugeTickWidth, 0, LAYOUT.gaugeTickLength)
+        tick.Size = UDim2.new(0, width, 0, band)
+        -- Turned to face out of the centre, so the segment lies along the band rather than
+        -- across it. Without this the ring is a circle of upright dashes.
         tick.Rotation = math.deg(angle) + 90
         tick.BorderSizePixel = 0
         tick.ZIndex = OVERLAY_Z
         tick.Parent = dial
-        corner(tick, LAYOUT.gaugeTickWidth // 2)
         ticks[i] = tick
     end
 
     local valueText = newInstance("TextLabel")
     valueText.AnchorPoint = Vector2.new(0.5, 0.5)
     valueText.Position = UDim2.new(0.5, 0, 0.5, 0)
-    valueText.Size = UDim2.new(1, -LAYOUT.gaugeTickLength * 2 - 8, 0, 22)
+    -- Inside the band, with a little air: what is left of the diameter once both sides of the
+    -- ring are taken off it.
+    valueText.Size = UDim2.new(1, -(band * 2 + 10), 0, 24)
     valueText.BackgroundTransparency = 1
-    valueText.TextSize = math.max(math.floor(diameter * 0.2), 12)
+    valueText.TextSize = math.max(math.floor(diameter * 0.22), 12)
     valueText.Text = ""
     valueText.ZIndex = OVERLAY_Z
     valueText.Parent = dial
@@ -8382,28 +8477,20 @@ LAYOUT.statusGap = 8
 LAYOUT.pagesTop = 56
 LAYOUT.pagesInset = 72
 
--- How long a key has left, as the two largest units that mean anything, and no seconds.
+-- How long a key has left, as one unit.
 --
--- It used to be a clock: "2d 23:59:50", counting down beside the clock that is already on the
--- strip two fields to the left. Two things ticking a second apart in one line of text is a
--- line that is always moving and never worth watching, and nobody makes a decision on the
--- second digit of a three day key. Days and hours change slowly enough to be read.
+-- It began as a clock, "2d 23:59:50", counting down beside the clock that is already on the
+-- strip two fields to the left, then became "2d 23h". Both were too much. The strip answers one
+-- question here, roughly how long is left, and the answer to it is a single number: three days,
+-- five hours, twelve minutes. A second unit beside it is precision nobody asked for on a line
+-- that is meant to be read at a glance and not studied.
 local function untilText(seconds)
     seconds = math.max(math.floor(seconds), 0)
-    local days = seconds // 86400
-    local hours = (seconds % 86400) // 3600
-    local mins = (seconds % 3600) // 60
-    if days > 0 then
-        if hours > 0 then return days .. "d " .. hours .. "h" end
-        return days .. "d"
-    end
-    if hours > 0 then
-        if mins > 0 then return hours .. "h " .. mins .. "m" end
-        return hours .. "h"
-    end
-    -- Under a minute still reads as a minute rather than as nothing: the field is there to
-    -- say the key is nearly out, and "0m" says less than "1m" does.
-    return math.max(mins, 1) .. "m"
+    if seconds >= 86400 then return (seconds // 86400) .. "d" end
+    if seconds >= 3600 then return (seconds // 3600) .. "h" end
+    -- Under a minute still reads as a minute rather than as nothing: the field is there to say
+    -- the key is nearly out, and "0m" says less than "1m" does.
+    return math.max(seconds // 60, 1) .. "m"
 end
 
 function Window:statusBar(opts)
@@ -9380,6 +9467,9 @@ function Interface.keyPrompt(opts)
     local limit = (type(opts.attempts) == "number" and opts.attempts > 0) and opts.attempts or 0
     local busy = false
     local leaving = false
+    -- leaving is "on the way out", left is "off the screen". keySystem waits for the second one
+    -- before it hands control back, so the window it was gating does not open behind the card.
+    local left = false
     local resting = root.Position
     -- The entrance writes root.Position every frame, and so do the two animations below it.
     -- A key submitted inside the first three tenths of a second would otherwise have two
@@ -9424,6 +9514,7 @@ function Interface.keyPrompt(opts)
             if t >= 1 then
                 if stop then stop() end
                 screen:Destroy()
+                left = true
             end
         end)
     end
@@ -9543,6 +9634,9 @@ function Interface.keyPrompt(opts)
         close = function() finish(false) end,
         settled = function() return answer ~= nil end,
         passed = function() return answer == true end,
+        -- Settled and off the screen, which is not the same moment: the card holds its answer
+        -- long enough to read and then leaves.
+        gone = function() return left end,
     }
 end
 
@@ -9601,6 +9695,20 @@ function Interface.keySystem(opts)
             return false
         end
         task.wait(0.05)
+    end
+
+    -- And then until the card is actually gone, not just until the answer is known.
+    --
+    -- Returning on the answer let the caller start building its window while the prompt was still
+    -- leaving, and the two are separate ScreenGuis on the same DisplayOrder, so which one drew in
+    -- front was down to luck. What that looked like was the prompt sitting in the middle of the
+    -- screen behind the window that had just opened, fading out from underneath it. Waiting is
+    -- half a second at most and the sequence then reads the way it was designed: accepted, gone,
+    -- and the interface arrives into an empty screen.
+    local waited = os.clock()
+    while not prompt.gone() do
+        if os.clock() - waited > 2 then break end
+        task.wait(0.03)
     end
     return prompt.passed()
 end
