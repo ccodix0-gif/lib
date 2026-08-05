@@ -129,7 +129,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.22"
+Interface.version = "2026.07.31.23"
 
 -- Five tables that hold what used to be a hundred and thirty separate locals ------------
 --
@@ -1355,9 +1355,21 @@ end
 local tickers = {}
 local tickerCount = 0
 local tickerConn = nil
+-- Timers created by a timer, waiting to join.
+--
+-- Lua forbids adding a key to a table that is being traversed with pairs, and a callback on this
+-- driver adding a timer is not unusual: a HUD row reading a value that starts an animation does
+-- it, and so does a gauge whose polled value moved and now has a dial to fill. Done straight it
+-- is an "invalid key to next" out of the middle of the frame, which takes every timer with it.
+-- So they queue here and are folded in at the top of the next frame.
+local tickerNew = {}
+local tickerBusy = false
 
 local function dropTicker(entry)
-    if not tickers[entry] then return end
+    -- Marked rather than looked up, because an entry can be dropped while it is still queued to
+    -- join, and then there is nothing in tickers to find.
+    if entry.dead then return end
+    entry.dead = true
     tickers[entry] = nil
     tickerCount -= 1
     if tickerCount <= 0 and tickerConn then
@@ -1377,24 +1389,38 @@ end
 -- so a validator that refused it took the window down again before anyone saw it.
 local function addTicker(interval, fn, deferFirst)
     local entry = { interval = interval or 0, acc = deferFirst and 0 or (interval or 0), fn = fn }
-    tickers[entry] = true
+    if tickerBusy then
+        tickerNew[#tickerNew + 1] = entry
+    else
+        tickers[entry] = true
+    end
     tickerCount += 1
     if not tickerConn then
         tickerConn = RunService.RenderStepped:Connect(function(dt)
+            -- Whatever last frame's callbacks created joins here, before the traversal starts.
+            for i = #tickerNew, 1, -1 do
+                local waiting = tickerNew[i]
+                tickerNew[i] = nil
+                if not waiting.dead then tickers[waiting] = true end
+            end
+            tickerBusy = true
             for e in pairs(tickers) do
-                e.acc += dt
-                if e.acc >= e.interval then
-                    local step = e.acc
-                    e.acc = 0
-                    -- One bad callback (a HUD value that reads a missing
-                    -- object) must not take the whole driver down with it.
-                    local ok, err = pcall(e.fn, step)
-                    if not ok then
-                        dropTicker(e)
-                        log("warn", "timer stopped: " .. tostring(err))
+                if not e.dead then
+                    e.acc += dt
+                    if e.acc >= e.interval then
+                        local step = e.acc
+                        e.acc = 0
+                        -- One bad callback (a HUD value that reads a missing
+                        -- object) must not take the whole driver down with it.
+                        local ok, err = pcall(e.fn, step)
+                        if not ok then
+                            dropTicker(e)
+                            log("warn", "timer stopped: " .. tostring(err))
+                        end
                     end
                 end
             end
+            tickerBusy = false
         end)
     end
     return function() dropTicker(entry) end
@@ -5065,12 +5091,28 @@ function Sub:card(title, column)
     end
     local col = (cfg.column == "right") and self.right or self.left
 
+    -- A slot the column's layout owns, with the card inside it.
+    --
+    -- A UIListLayout writes Position on every child it manages, so a card parented straight
+    -- into the column cannot be moved: the next reflow puts it back where the list says it
+    -- goes. The slot takes the card's place in the list and the card sits inside it at nothing,
+    -- which leaves the card's own Position free for an animation to use.
+    --
+    -- That is what lets the first opening bring the cards in one at a time rather than sliding
+    -- both columns as a block. It costs one frame per card and it paints nothing.
+    local slot = Instance.new("Frame")
+    slot.Size = UDim2.new(1, 0, 0, 0)
+    slot.AutomaticSize = Enum.AutomaticSize.Y
+    slot.BackgroundTransparency = 1
+    slot.BorderSizePixel = 0
+    slot.LayoutOrder = nextOrder(col)
+    slot.Parent = col
+
     local cardFrame = Instance.new("Frame")
     cardFrame.Size = UDim2.new(1, 0, 0, 0)
     cardFrame.AutomaticSize = Enum.AutomaticSize.Y
     cardFrame.BorderSizePixel = 0
-    cardFrame.LayoutOrder = nextOrder(col)
-    cardFrame.Parent = col
+    cardFrame.Parent = slot
     themed(cardFrame, "BackgroundColor3", "card")
     corner(cardFrame, 12)
     stroke(cardFrame, "stroke", 1, 0.4)
@@ -5289,14 +5331,23 @@ function Window:tab(opts)
         self.groups[groupName] = true
     end
 
+    -- A holder the sidebar's list owns, with the row inside it. Same reason as the card slots
+    -- in Sub:card: the list writes Position on whatever it manages, so a row parented straight
+    -- into it cannot be moved, and the first opening brings the rows in one after another.
+    local slide = Instance.new("Frame")
+    slide.Size = UDim2.new(1, 0, 0, 38)
+    slide.BackgroundTransparency = 1
+    slide.BorderSizePixel = 0
+    slide.LayoutOrder = nextOrder(self.sidebarList)
+    slide.Parent = self.sidebarList
+
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 0, 38)
+    btn.Size = UDim2.new(1, 0, 1, 0)
     btn.BackgroundTransparency = 1
     btn.AutoButtonColor = false
     btn.Text = ""
     btn.BorderSizePixel = 0
-    btn.LayoutOrder = nextOrder(self.sidebarList)
-    btn.Parent = self.sidebarList
+    btn.Parent = slide
     corner(btn, 8)
 
     -- The active tab is marked by the fill alone. The old build also drew a short
@@ -5381,6 +5432,8 @@ function Window:tab(opts)
         _ctx = self, _subBar = subBar, _subPages = subPages, _subs = {},
         _placeUnderline = placeUnderline,
         name = opts.name, btn = btn, icon = icon, label = label, page = tabPage,
+        -- The holder the row travels in. Only the first opening uses it.
+        slide = slide, subBarHolder = subBarHolder,
     }, Tab)
     table.insert(self.tabs, tabObj)
 
@@ -5760,36 +5813,56 @@ end
 -- everything else that writes one. Whole pixels only, because the body is a render target and
 -- a fractional offset softens every word on it.
 --
--- So what is staggered is where each part comes from, not how solid it is: the sidebar out of
--- the left edge, the heading down from the top, the card columns up from the bottom, and the
--- strip under the window last of all. The body group clips the first three, so they appear out
--- of the window's own edges rather than sliding across the screen. One alpha still carries the
--- whole body, so there is no frame on which half the interface is painted and half is not.
-LAYOUT.debutSlide = 22
--- start, length. Read in the order they are listed and that is the order they arrive in.
-MOTION.debutFrame = { 0, 0.36 }
-MOTION.debutSidebar = { 0.05, 0.34 }
-MOTION.debutHeading = { 0.15, 0.30 }
-MOTION.debutColumns = 0.24
-MOTION.debutStrip = { 0.34, 0.28 }
+-- So what is staggered is where each part comes from, not how solid it is. Every part travels
+-- out of an edge that clips it, so it appears from inside the interface rather than sliding
+-- across the screen: the sidebar and the tab rows out of the left, the heading down from the
+-- top, each card up out of the bottom of the page, and the strip under the window last. One
+-- alpha still carries the whole body, so there is no frame on which half of it is painted and
+-- half is not.
+--
+-- The parts are gathered on the first frame, not when this is called. A script builds its tabs
+-- and cards after UI.new has returned, so at the moment the debut starts there is nothing on
+-- the page to bring in; one frame later there is all of it.
+LAYOUT.debutSlide = 24
+LAYOUT.debutCardRise = 46
+-- start, length, in seconds. Listed in the order they arrive in.
+MOTION.debutFrame = { 0, 0.34 }
+MOTION.debutSidebar = { 0.04, 0.34 }
+MOTION.debutRows = { 0.12, 0.26 }
+-- Between one sidebar row and the next, and between one card and the next.
+MOTION.debutRowStep = 0.035
+MOTION.debutHeading = { 0.16, 0.28 }
+MOTION.debutCards = { 0.24, 0.42 }
+MOTION.debutCardStep = 0.07
+MOTION.debutStrip = { 0.5, 0.3 }
+
+-- One thing that travels, from an offset to where it belongs, over its own slice of time.
+local function debutMover(frame, dx, dy, start, length)
+    local home = frame.Position
+    return {
+        frame = frame,
+        home = home,
+        dx = dx,
+        dy = dy,
+        start = start,
+        length = length,
+        put = function(eased)
+            frame.Position = UDim2.new(
+                home.X.Scale, math.floor(home.X.Offset + dx * (1 - eased) + 0.5),
+                home.Y.Scale, math.floor(home.Y.Offset + dy * (1 - eased) + 0.5)
+            )
+        end,
+    }
+end
 
 function Window:_debut()
     local window = self.window
     local resting = self._resting or window.Position
     local from = WINDOW_LIFT(resting)
-    local sidebar = self._sidebar
-    local title, subtitle = self.title, self.subtitle
-    local strip, stripFade = self._status, self._statusFade
-
-    -- Resting places captured before anything moves, so an interrupted debut has somewhere
-    -- to put every part back rather than reading a value out of its own animation.
-    local sideHome = sidebar and sidebar.Position
-    local titleHome = title and title.Position
-    local subHome = subtitle and subtitle.Position
-    local stripHome = strip and strip.Position
+    local stripFade = self._statusFade
 
     -- The strip comes off the shared alpha for the length of this, because it is the one part
-    -- that is outside the body and therefore the one part that can carry its own fade.
+    -- outside the body and therefore the one part that can carry a fade of its own.
     if stripFade then self:_dropFade(stripFade) end
 
     self._open = true
@@ -5799,43 +5872,127 @@ function Window:_debut()
     if stripFade then stripFade(0) end
     if self._shadow then
         self._shadow.ImageTransparency = 1
-        tween(self._shadow, 0.42, { ImageTransparency = 0.55 }, EASE_SOFT)
+        tween(self._shadow, 0.45, { ImageTransparency = 0.55 }, EASE_SOFT)
     end
 
-    local function slot(spec, elapsed)
-        local t = (elapsed - spec[1]) / spec[2]
-        if t <= 0 then return 0 end
-        if t >= 1 then return 1 end
-        -- Arriving settles: the same curve the window uses when it opens normally.
-        return 1 - (1 - t) ^ 4
-    end
-    local function shifted(home, dx, dy)
-        return UDim2.new(
-            home.X.Scale, math.floor(home.X.Offset + dx + 0.5),
-            home.Y.Scale, math.floor(home.Y.Offset + dy + 0.5)
-        )
+    local movers = {}
+    local gathered = false
+    local elapsed = 0
+
+    local function add(frame, dx, dy, start, length)
+        if not frame then return end
+        movers[#movers + 1] = debutMover(frame, dx, dy, start, length)
     end
 
-    -- Put every part at its start, so the first frame drawn is the first frame of the
-    -- animation rather than the finished interface for one frame and then the animation.
-    if sidebar and sideHome then
-        sidebar.Position = shifted(sideHome, -(sidebar.Size.X.Offset), 0)
-    end
-    if title and titleHome then title.Position = shifted(titleHome, 0, -LAYOUT.debutSlide) end
-    if subtitle and subHome then subtitle.Position = shifted(subHome, 0, -LAYOUT.debutSlide) end
-    if strip and stripHome then strip.Position = shifted(stripHome, 0, 10) end
+    -- Everything on the page, in the order it is read in.
+    local function gather()
+        gathered = true
 
-    -- What to do if something interrupts this. Pressing the show and hide key half a second
-    -- into the debut is a thing people do, and toggle only knows about the window's own
-    -- travel and the shared alpha: without this the sidebar would be left parked off its own
-    -- left edge for the rest of the session.
+        add(self._sidebar, -(self._sidebar and self._sidebar.Size.X.Offset or 0), 0,
+            MOTION.debutSidebar[1], MOTION.debutSidebar[2])
+
+        -- The sidebar rows, one after another. They are laid out by a list, so what travels is
+        -- each row's own holder: see Window:tab, where every row is given one for this.
+        do
+            local step = 0
+            for _, tabObj in ipairs(self.tabs) do
+                if tabObj.slide then
+                    add(tabObj.slide, -LAYOUT.debutSlide, 0,
+                        MOTION.debutRows[1] + step * MOTION.debutRowStep, MOTION.debutRows[2])
+                    step += 1
+                end
+            end
+        end
+
+        add(self.title, 0, -LAYOUT.debutSlide, MOTION.debutHeading[1], MOTION.debutHeading[2])
+        -- A beat behind the title, so the heading reads as two lines arriving rather than as
+        -- one block of text moving.
+        add(self.subtitle, 0, -LAYOUT.debutSlide,
+            MOTION.debutHeading[1] + 0.05, MOTION.debutHeading[2])
+
+        -- The cards of whatever page is open, one at a time, left column first and then right,
+        -- interleaved so the two columns fill together rather than one and then the other.
+        --
+        -- Each card is inside a slot the column's layout owns, so moving the card itself is
+        -- free: the list keeps the slot where it belongs and never writes to the card. See
+        -- Sub:card. The page clips at the bottom, so a card starting below the fold appears out
+        -- of the page's own edge.
+        do
+            local order = {}
+            for _, tabObj in ipairs(self.tabs) do
+                if tabObj.page and tabObj.page.Visible then
+                    -- The sub-tab bar with the heading, because it reads as part of it.
+                    add(tabObj.subBarHolder, 0, -LAYOUT.debutSlide,
+                        MOTION.debutHeading[1] + 0.04, MOTION.debutHeading[2])
+                    for _, entry in ipairs(tabObj._subs) do
+                        if entry.page.Visible then
+                            local cols = {}
+                            for _, column in ipairs(entry.columns:GetChildren()) do
+                                if column:IsA("ScrollingFrame") then cols[#cols + 1] = column end
+                            end
+                            -- Left before right at the same height, which is the order the
+                            -- page is read in.
+                            table.sort(cols, function(a, b)
+                                return a.Position.X.Scale < b.Position.X.Scale
+                            end)
+                            local rows = {}
+                            for index, column in ipairs(cols) do
+                                local slots = {}
+                                for _, node in ipairs(column:GetChildren()) do
+                                    if node:IsA("Frame") then slots[#slots + 1] = node end
+                                end
+                                table.sort(slots, function(a, b)
+                                    return a.LayoutOrder < b.LayoutOrder
+                                end)
+                                for depth, holder in ipairs(slots) do
+                                    -- One child, and it is the card. Walked rather than asked
+                                    -- for by name, because the slot paints nothing and holds
+                                    -- nothing else.
+                                    local card = nil
+                                    for _, node in ipairs(holder:GetChildren()) do
+                                        if node:IsA("Frame") then
+                                            card = node
+                                            break
+                                        end
+                                    end
+                                    if card then
+                                        rows[#rows + 1] = {
+                                            card = card,
+                                            -- Depth first, then column, so the top of both
+                                            -- columns arrives before the second row of either.
+                                            rank = depth * 10 + index,
+                                        }
+                                    end
+                                end
+                            end
+                            table.sort(rows, function(a, b) return a.rank < b.rank end)
+                            for _, row in ipairs(rows) do order[#order + 1] = row.card end
+                        end
+                    end
+                end
+            end
+            for index, card in ipairs(order) do
+                add(card, 0, LAYOUT.debutCardRise,
+                    MOTION.debutCards[1] + (index - 1) * MOTION.debutCardStep,
+                    MOTION.debutCards[2])
+            end
+        end
+
+        add(self._status, 0, 12, MOTION.debutStrip[1], MOTION.debutStrip[2])
+
+        -- Every part is put at its start here rather than when the debut began, because until
+        -- this frame most of them did not exist.
+        for _, mover in ipairs(movers) do mover.put(0) end
+    end
+
+    -- What to do if something interrupts this. Pressing the show and hide key half a second in
+    -- is a thing people do, and toggle only knows about the window's own travel and the shared
+    -- alpha: without this a card would be left parked below the fold for the rest of the
+    -- session, which is a card nobody can reach.
     self._debutSnap = function()
         self._debutSnap = nil
         self._debutDone = true
-        if sidebar and sideHome then sidebar.Position = sideHome end
-        if title and titleHome then title.Position = titleHome end
-        if subtitle and subHome then subtitle.Position = subHome end
-        if strip and stripHome then strip.Position = stripHome end
+        for _, mover in ipairs(movers) do mover.frame.Position = mover.home end
         if stripFade then
             stripFade(self._alphaNow or 1)
             self:_addFade(stripFade)
@@ -5846,56 +6003,39 @@ function Window:_debut()
         self._fadeStop()
         self._fadeStop = nil
     end
-    local elapsed = 0
-    local columnsFired = false
     self._fadeStop = addTicker(0, function(dt)
+        if not gathered then
+            gather()
+            -- Nothing is advanced on the frame the parts were placed, so the first thing drawn
+            -- is the first frame of the animation and not the finished interface for a moment.
+            return
+        end
         elapsed += dt
 
-        local f = slot(MOTION.debutFrame, elapsed)
-        self:_setAlpha(f)
+        local f = math.min(elapsed / MOTION.debutFrame[2], 1)
+        local frameEase = 1 - (1 - f) ^ 4
+        self:_setAlpha(frameEase)
         window.Position = UDim2.new(
             from.X.Scale,
-            math.floor(from.X.Offset + (resting.X.Offset - from.X.Offset) * f + 0.5),
+            math.floor(from.X.Offset + (resting.X.Offset - from.X.Offset) * frameEase + 0.5),
             from.Y.Scale,
-            math.floor(from.Y.Offset + (resting.Y.Offset - from.Y.Offset) * f + 0.5)
+            math.floor(from.Y.Offset + (resting.Y.Offset - from.Y.Offset) * frameEase + 0.5)
         )
 
-        if sidebar and sideHome then
-            local s = slot(MOTION.debutSidebar, elapsed)
-            sidebar.Position = shifted(sideHome, -(sidebar.Size.X.Offset) * (1 - s), 0)
+        local settled = f >= 1
+        for _, mover in ipairs(movers) do
+            local t = (elapsed - mover.start) / mover.length
+            if t < 1 then settled = false end
+            t = math.clamp(t, 0, 1)
+            mover.put(1 - (1 - t) ^ 4)
         end
 
-        local h = slot(MOTION.debutHeading, elapsed)
-        if title and titleHome then
-            title.Position = shifted(titleHome, 0, -LAYOUT.debutSlide * (1 - h))
-        end
-        if subtitle and subHome then
-            -- A beat behind the title, so the heading reads as two lines arriving rather
-            -- than as one block of text moving.
-            local sh = slot({ MOTION.debutHeading[1] + 0.05, MOTION.debutHeading[2] }, elapsed)
-            subtitle.Position = shifted(subHome, 0, -LAYOUT.debutSlide * (1 - sh))
+        if stripFade then
+            local st = math.clamp((elapsed - MOTION.debutStrip[1]) / MOTION.debutStrip[2], 0, 1)
+            stripFade(1 - (1 - st) ^ 4)
         end
 
-        -- The cards, once, and looked up now rather than at the start: a script builds its
-        -- tabs after Interface.new returns, so at the moment this began there were none.
-        if not columnsFired and elapsed >= MOTION.debutColumns then
-            columnsFired = true
-            for _, tabObj in ipairs(self.tabs) do
-                if tabObj.page and tabObj.page.Visible then
-                    for _, entry in ipairs(tabObj._subs) do
-                        if entry.page.Visible and entry.enter then pcall(entry.enter) end
-                    end
-                end
-            end
-        end
-
-        if strip and stripHome then
-            local st = slot(MOTION.debutStrip, elapsed)
-            if stripFade then stripFade(st) end
-            strip.Position = shifted(stripHome, 0, 10 * (1 - st))
-        end
-
-        if f >= 1 and h >= 1 and columnsFired and (not strip or slot(MOTION.debutStrip, elapsed) >= 1) then
+        if settled then
             if self._fadeStop then self._fadeStop() self._fadeStop = nil end
             -- Everything back on the shared alpha and on its resting place, so the next hide
             -- takes the strip with it and nothing is left a rounding error off home.
@@ -7043,9 +7183,16 @@ local function overlayShell(self, name, opts)
     frame.BorderSizePixel = 0
     frame.ZIndex = OVERLAY_Z
     frame.Parent = self.screen
-    themed(frame, "BackgroundColor3", "card")
-    corner(frame, opts.radius or 8)
-    stroke(frame, "stroke", 1, 0.3)
+    -- bare drops the surface and keeps the shell: no fill, no outline, no corner, so what is
+    -- inside sits on the game world on its own. It is for the elements that are already a
+    -- shape, a bar or a ring, where a card behind them is a second rectangle saying nothing.
+    if opts.bare then
+        frame.BackgroundTransparency = 1
+    else
+        themed(frame, "BackgroundColor3", "card")
+        corner(frame, opts.radius or 8)
+        stroke(frame, "stroke", 1, 0.3)
+    end
     local setAlpha = groupFade(frame)
 
     -- A position saved in the config wins over the default one.
@@ -7193,7 +7340,11 @@ function Window:_panelRow(name)
     self._panelRows[name] = true
     local label = self._panelNames[name]
     if not label or label == "" then
-        label = string.upper(string.sub(name, 1, 1)) .. string.sub(name, 2)
+        -- The key, with anything up to a colon dropped: the prefixes are there so a HUD, a bar
+        -- and a ring called the same thing cannot collide in one config, and "Bar:health" is a
+        -- config key rather than something to read.
+        local plain = string.match(name, ":(.+)$") or name
+        label = string.upper(string.sub(plain, 1, 1)) .. string.sub(plain, 2)
     end
     card:toggle(label, function()
         local frame = self._overlays[name]
@@ -7916,6 +8067,292 @@ function Window:hud(opts)
     return hud
 end
 
+-- Detached readouts ------------------------------------------------------------
+-- A bar or a ring on its own, dragged, saved and toggled like any other panel, without a HUD
+-- around it.
+--
+-- A HUD is the right home for a column of related numbers. One value that wants to be seen at a
+-- glance is not that: putting a single bar in a titled panel to get it on screen is a panel
+-- built to hold one row, and the row is then the smallest thing on it. These are the same shell
+-- and the same shading with nothing else in the way, so a health bar is a health bar.
+--
+--   local hp = win:bar({ label = "Health", value = function() return health / maxHealth end })
+--   local cd = win:gauge({ label = "Cooldown", value = function() return left / total end })
+--   hp:set(0.5)          -- pushed instead of polled
+--
+-- Both return a handle with set, setLabel, setVisible, remove and a .frame field, and both take
+-- a place on the settings page's Panels card by their label.
+LAYOUT.barPad = 12
+LAYOUT.barTrack = 8
+MOTION.readoutFill = 0.24
+
+-- What every detached readout shares: the id it is saved under, the shell it lives in, and the
+-- timer that reads its value when the caller gave a function rather than a number.
+local function readoutShell(self, kind, opts, size)
+    -- Prefixed, so a bar and a HUD called the same thing cannot land on one another in the
+    -- config, and numbered when the caller named neither, so two unnamed bars are still two.
+    self._readouts = (self._readouts or 0) + 1
+    local id = kind .. ":" .. tostring(opts.id or opts.label or self._readouts)
+    local frame = overlayShell(self, id, {
+        position = opts.position or UDim2.new(0, 16, 0, 320),
+        size = size,
+        autoSize = Enum.AutomaticSize.None,
+        radius = opts.radius or 10,
+        visible = opts.visible,
+        bare = opts.bare,
+        label = opts.label,
+    })
+    return frame
+end
+
+-- Poll a value function on the shared timer, and stop when the thing it feeds is gone.
+local function readoutTicker(frame, interval, read)
+    local stop
+    stop = addTicker(interval or 0.1, function()
+        if not frame.Parent then
+            if stop then stop() end
+            return
+        end
+        if not frame.Visible then return end
+        read()
+    end)
+    frame.Destroying:Connect(function() if stop then stop() end end)
+    return stop
+end
+
+-- opts: label, value, width, height, position, id, interval, color, text, visible, bare
+function Window:bar(opts)
+    opts = opts or {}
+    local width = opts.width or 190
+    local hasLabel = opts.label ~= nil or opts.text ~= false
+    local height = opts.height or (hasLabel and 44 or (LAYOUT.barTrack + LAYOUT.barPad * 2))
+    local frame = readoutShell(self, "bar", opts, UDim2.new(0, width, 0, height))
+    padding(frame, LAYOUT.barPad, { top = 10, bottom = 10, left = LAYOUT.barPad, right = LAYOUT.barPad })
+
+    local labelText, valueText = nil, nil
+    local setLabelPhrase = nil
+    if hasLabel then
+        labelText = newInstance("TextLabel")
+        labelText.BackgroundTransparency = 1
+        labelText.Size = UDim2.new(1, -60, 0, 15)
+        labelText.TextSize = 13
+        labelText.TextXAlignment = Enum.TextXAlignment.Left
+        labelText.TextTruncate = Enum.TextTruncate.AtEnd
+        labelText.ZIndex = OVERLAY_Z
+        labelText.Parent = frame
+        faced(labelText, "medium")
+        themed(labelText, "TextColor3", "text")
+        setLabelPhrase = localized(labelText, "Text", opts.label or "")
+
+        valueText = newInstance("TextLabel")
+        valueText.AnchorPoint = Vector2.new(1, 0)
+        valueText.Position = UDim2.new(1, 0, 0, 0)
+        valueText.Size = UDim2.new(0, 58, 0, 15)
+        valueText.BackgroundTransparency = 1
+        valueText.TextSize = 13
+        valueText.TextXAlignment = Enum.TextXAlignment.Right
+        valueText.Text = ""
+        valueText.ZIndex = OVERLAY_Z
+        valueText.Parent = frame
+        faced(valueText, "regular")
+        themed(valueText, "TextColor3", "subtext")
+    end
+
+    local track = newInstance("Frame")
+    track.AnchorPoint = Vector2.new(0, 1)
+    track.Position = UDim2.new(0, 0, 1, 0)
+    track.Size = UDim2.new(1, 0, 0, LAYOUT.barTrack)
+    track.BorderSizePixel = 0
+    track.ZIndex = OVERLAY_Z
+    track.Parent = frame
+    themed(track, "BackgroundColor3", "track")
+    corner(track, LAYOUT.barTrack // 2)
+
+    local fill = newInstance("Frame")
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BorderSizePixel = 0
+    fill.ZIndex = OVERLAY_Z
+    fill.Parent = track
+    corner(fill, LAYOUT.barTrack // 2)
+    -- The same shading a slider fill and a HUD bar carry, so every bar in the kit reads as the
+    -- same object. One with a ramp beside one without looks like a mistake in one of them.
+    barRamp(fill, opts.color and colorOf(opts.color) or nil)
+
+    local last = nil
+    local function apply(ratio)
+        ratio = math.clamp(tonumber(ratio) or 0, 0, 1)
+        if last and math.abs(ratio - last) < 0.005 then return end
+        last = ratio
+        tween(fill, MOTION.readoutFill, { Size = UDim2.new(ratio, 0, 1, 0) }, EASE_SOFT)
+        if valueText then
+            valueText.Text = opts.text and tostring(opts.text(ratio))
+                or (math.floor(ratio * 100 + 0.5) .. "%")
+        end
+    end
+    apply(hudRead(opts.value) or 0)
+
+    if type(opts.value) == "function" then
+        readoutTicker(frame, opts.interval, function() apply(hudRead(opts.value) or 0) end)
+    end
+
+    return {
+        frame = frame,
+        set = function(_, v) apply(v) end,
+        get = function() return last or 0 end,
+        setLabel = function(_, v) if setLabelPhrase then setLabelPhrase(tostring(v or "")) end end,
+        setVisible = function(_, v) self:showOverlay(frame, v ~= false) end,
+        remove = function() frame:Destroy() end,
+    }
+end
+
+-- A ring that fills round, with the number inside it and the label under it.
+--
+-- Drawn as a dial of ticks rather than as an arc. Roblox has no arc: the usual way round it is
+-- two half circle images rotated against each other behind a mask, which needs an image drawn
+-- for the job, resamples it at every size and ends up soft at the ends of the sweep. A ring of
+-- straight ticks is exact at any diameter, needs no artwork at all, and filling it lights each
+-- tick in turn, which is a better answer to "it fills round" than a sliding edge.
+--
+-- opts: label, value, size, ticks, position, id, interval, color, text, visible, bare
+LAYOUT.gaugeSize = 96
+LAYOUT.gaugeTicks = 44
+LAYOUT.gaugeTickLength = 9
+LAYOUT.gaugeTickWidth = 3
+function Window:gauge(opts)
+    opts = opts or {}
+    local diameter = opts.size or LAYOUT.gaugeSize
+    local hasLabel = opts.label ~= nil
+    local pad = 6
+    local labelH = hasLabel and 18 or 0
+    local frame = readoutShell(self, "gauge", opts, UDim2.new(
+        0, diameter + pad * 2,
+        0, diameter + pad * 2 + labelH
+    ))
+
+    -- The dial. Its own square, so the ticks can be placed from its centre whatever is under it.
+    local dial = newInstance("Frame")
+    dial.Position = UDim2.new(0, pad, 0, pad)
+    dial.Size = UDim2.new(0, diameter, 0, diameter)
+    dial.BackgroundTransparency = 1
+    dial.BorderSizePixel = 0
+    dial.ZIndex = OVERLAY_Z
+    dial.Parent = frame
+
+    local count = math.max(math.floor(opts.ticks or LAYOUT.gaugeTicks), 8)
+    local radius = diameter / 2 - LAYOUT.gaugeTickLength / 2 - 1
+    local ticks = {}
+    for i = 1, count do
+        -- Twelve o'clock first and clockwise from there, which is the direction anything
+        -- filling round is read in.
+        local turn = (i - 1) / count
+        local angle = turn * math.pi * 2 - math.pi / 2
+        local tick = newInstance("Frame")
+        tick.AnchorPoint = Vector2.new(0.5, 0.5)
+        tick.Position = UDim2.new(
+            0.5, math.floor(math.cos(angle) * radius + 0.5),
+            0.5, math.floor(math.sin(angle) * radius + 0.5)
+        )
+        tick.Size = UDim2.new(0, LAYOUT.gaugeTickWidth, 0, LAYOUT.gaugeTickLength)
+        tick.Rotation = math.deg(angle) + 90
+        tick.BorderSizePixel = 0
+        tick.ZIndex = OVERLAY_Z
+        tick.Parent = dial
+        corner(tick, LAYOUT.gaugeTickWidth // 2)
+        ticks[i] = tick
+    end
+
+    local valueText = newInstance("TextLabel")
+    valueText.AnchorPoint = Vector2.new(0.5, 0.5)
+    valueText.Position = UDim2.new(0.5, 0, 0.5, 0)
+    valueText.Size = UDim2.new(1, -LAYOUT.gaugeTickLength * 2 - 8, 0, 22)
+    valueText.BackgroundTransparency = 1
+    valueText.TextSize = math.max(math.floor(diameter * 0.2), 12)
+    valueText.Text = ""
+    valueText.ZIndex = OVERLAY_Z
+    valueText.Parent = dial
+    faced(valueText, "bold")
+    themed(valueText, "TextColor3", "text")
+
+    local setLabelPhrase = nil
+    if hasLabel then
+        -- Outside the ring, under it. Inside, a label and a value are two lines of text in a
+        -- circle and neither of them has room.
+        local labelText = newInstance("TextLabel")
+        labelText.Position = UDim2.new(0, 0, 1, -labelH)
+        labelText.Size = UDim2.new(1, 0, 0, labelH)
+        labelText.BackgroundTransparency = 1
+        labelText.TextSize = 13
+        labelText.TextTruncate = Enum.TextTruncate.AtEnd
+        labelText.ZIndex = OVERLAY_Z
+        labelText.Parent = frame
+        faced(labelText, "medium")
+        themed(labelText, "TextColor3", "subtext")
+        setLabelPhrase = localized(labelText, "Text", opts.label or "")
+    end
+
+    -- Where the dial is now and where it is going. The shown value chases the target on the
+    -- shared driver, which is what makes it fill round rather than jump to a new arc.
+    local target = math.clamp(tonumber(hudRead(opts.value)) or 0, 0, 1)
+    local shown = target
+    local litNow = -1
+
+    -- A state painter, so a palette change repaints the dial without the value moving, the same
+    -- way every other coloured control in the kit follows the accent.
+    local function paint()
+        local lit = math.floor(shown * count + 0.0001)
+        local litColor = opts.color and colorOf(opts.color) or shownColor("accent")
+        local dimColor = shownColor("track")
+        for i = 1, count do
+            ticks[i].BackgroundColor3 = (i <= lit) and litColor or dimColor
+        end
+        litNow = lit
+        valueText.Text = opts.text and tostring(opts.text(shown))
+            or (math.floor(shown * 100 + 0.5) .. "%")
+    end
+    addStatePainter(dial, paint)
+
+    local chase = nil
+    local function drive()
+        if chase then return end
+        chase = addTicker(0, function(dt)
+            if not dial.Parent then
+                if chase then chase() chase = nil end
+                return
+            end
+            -- Exponential approach, so a value that keeps moving is followed without the dial
+            -- restarting a tween on every read.
+            local step = math.min(dt / MOTION.readoutFill, 1)
+            shown += (target - shown) * step
+            if math.abs(target - shown) < 0.002 then shown = target end
+            local lit = math.floor(shown * count + 0.0001)
+            if lit ~= litNow or shown == target then paint() end
+            if shown == target then
+                if chase then chase() chase = nil end
+            end
+        end)
+    end
+
+    local function apply(value)
+        local wanted = math.clamp(tonumber(value) or 0, 0, 1)
+        if math.abs(wanted - target) < 0.0005 then return end
+        target = wanted
+        drive()
+    end
+
+    if type(opts.value) == "function" then
+        readoutTicker(frame, opts.interval, function() apply(hudRead(opts.value) or 0) end)
+    end
+
+    return {
+        frame = frame,
+        set = function(_, v) apply(v) end,
+        get = function() return target end,
+        setLabel = function(_, v) if setLabelPhrase then setLabelPhrase(tostring(v or "")) end end,
+        setVisible = function(_, v) self:showOverlay(frame, v ~= false) end,
+        remove = function() frame:Destroy() end,
+    }
+end
+
 -- The status strip ------------------------------------------------------------
 -- A strip of its own under the window: the clock, the date, who the session belongs to,
 -- how long the key has left and how many times it has run.
@@ -7991,13 +8428,16 @@ function Window:statusBar(opts)
     -- with a refit without either of those knowing it exists.
     --
     -- Sized to its contents. A strip the full width of the window is five short fields and
-    -- eight hundred pixels of nothing, so it takes the width it needs and sits centred under
-    -- the window, which also means a build showing one field gets a small strip rather than
-    -- the same empty bar.
+    -- eight hundred pixels of nothing, so it takes the width it needs, which also means a
+    -- build showing one field gets a small strip rather than the same empty bar.
+    --
+    -- Left aligned with the window rather than centred under it. Centred, it is a floating
+    -- caption with no edge to belong to and it drifts as fields come and go; against the left
+    -- edge it lines up with the sidebar above it and stays put whatever it is showing.
     local bar = newGroup()
     bar.Name = randomName()
-    bar.AnchorPoint = Vector2.new(0.5, 0)
-    bar.Position = UDim2.new(0.5, 0, 1, LAYOUT.statusGap)
+    bar.AnchorPoint = Vector2.new(0, 0)
+    bar.Position = UDim2.new(0, 0, 1, LAYOUT.statusGap)
     bar.Size = UDim2.new(0, 0, 0, LAYOUT.statusH)
     bar.AutomaticSize = Enum.AutomaticSize.X
     bar.BorderSizePixel = 0
