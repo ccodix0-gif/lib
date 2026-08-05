@@ -129,7 +129,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.21"
+Interface.version = "2026.07.31.22"
 
 -- Five tables that hold what used to be a hundred and thirty separate locals ------------
 --
@@ -1120,6 +1120,13 @@ local gateOpts = nil
 local gateToken = nil
 local gateLastRun = 0
 local gateInfo = nil
+-- Whether a key has just been accepted and nothing has been built on it yet.
+--
+-- The first window built after a pass gets the debut animation; every window after it, and
+-- every window in a build with no gate, opens the ordinary way. Read once and cleared, because
+-- "the first one" is exactly what it means, and because a script that unloads and rebuilds its
+-- interface should not get the opening titles again.
+local gateFresh = false
 -- Rebuilt on every pass. Long enough that guessing it is not a shortcut, and it never
 -- leaves this file: nothing returns it and nothing writes it to a config.
 local function mintToken()
@@ -1422,11 +1429,21 @@ end
 -- Both dimensions come back even, and so does the sidebar, which keeps the width left
 -- for the cards even as well: page width is window minus sidebar minus a 48 margin,
 -- and even minus even minus even is even.
-local function windowFit(view)
+-- reserve is room kept below the window for something that travels with it, which is the
+-- status strip and nothing else. The pair is meant to read as one object, so the strip's
+-- height comes off the window rather than being added to it: a build that turns the strip
+-- on gets the same footprint on screen, not a window that hangs 32 pixels lower.
+local function windowFit(view, reserve)
+    reserve = reserve or 0
     local w = math.clamp(evenDown(view.X * 0.47), 600, 920)
-    local h = math.clamp(evenDown(view.Y * 0.54), 380, 600)
     w = math.min(w, math.max(320, evenDown(view.X - 32)))
-    h = math.min(h, math.max(260, evenDown(view.Y - 32)))
+    -- The height the window and anything travelling under it get between them, worked out
+    -- first and then divided, so a build with a strip has the same footprint as one without.
+    local total = math.clamp(evenDown(view.Y * 0.54), 380, 600)
+    total = math.min(total, math.max(260, evenDown(view.Y - 32)))
+    -- With a floor under it, so a tiny viewport gives up the symmetry rather than leaving a
+    -- window shorter than its own header and one card.
+    local h = math.max(evenDown(total - reserve), 260)
     return w, h
 end
 
@@ -5704,12 +5721,197 @@ end
 MOTION.windowIn = 0.32
 MOTION.windowOut = 0.18
 
+-- Everything the open and close animation fades, on one alpha.
+--
+-- The body group was the only one for a long time and the code read that way: one function in
+-- _bodyFade, called from one place. The status strip is outside the body, because it is beside
+-- the window rather than in it, and it still has to arrive and leave with the window. A list
+-- rather than a second field, because the first open drives the same set one part at a time
+-- and a third caller would otherwise be a third field and a third call site.
+function Window:_addFade(fn)
+    if type(fn) ~= "function" then return nil end
+    self._fades = self._fades or {}
+    self._fades[#self._fades + 1] = fn
+    return fn
+end
+
+function Window:_dropFade(fn)
+    if not self._fades then return end
+    for i = #self._fades, 1, -1 do
+        if self._fades[i] == fn then table.remove(self._fades, i) end
+    end
+end
+
+function Window:_setAlpha(alpha)
+    self._alphaNow = alpha
+    if not self._fades then return end
+    for _, fn in ipairs(self._fades) do pcall(fn, alpha) end
+end
+
+-- The first appearance, once, and only where a build asked for one.
+--
+-- Every other opening is Window:toggle: the whole window travels a little and fades on one
+-- number, which is what something that happens on every press of a key should do. This happens
+-- once a session, so it is allowed to be an event.
+--
+-- It is built out of the three things this kit will do and nothing it will not. No scaling,
+-- because a scale re-renders every glyph under it at a fractional size and shimmers. No
+-- transparency per part, because that is thousands of property writes a frame fighting
+-- everything else that writes one. Whole pixels only, because the body is a render target and
+-- a fractional offset softens every word on it.
+--
+-- So what is staggered is where each part comes from, not how solid it is: the sidebar out of
+-- the left edge, the heading down from the top, the card columns up from the bottom, and the
+-- strip under the window last of all. The body group clips the first three, so they appear out
+-- of the window's own edges rather than sliding across the screen. One alpha still carries the
+-- whole body, so there is no frame on which half the interface is painted and half is not.
+LAYOUT.debutSlide = 22
+-- start, length. Read in the order they are listed and that is the order they arrive in.
+MOTION.debutFrame = { 0, 0.36 }
+MOTION.debutSidebar = { 0.05, 0.34 }
+MOTION.debutHeading = { 0.15, 0.30 }
+MOTION.debutColumns = 0.24
+MOTION.debutStrip = { 0.34, 0.28 }
+
+function Window:_debut()
+    local window = self.window
+    local resting = self._resting or window.Position
+    local from = WINDOW_LIFT(resting)
+    local sidebar = self._sidebar
+    local title, subtitle = self.title, self.subtitle
+    local strip, stripFade = self._status, self._statusFade
+
+    -- Resting places captured before anything moves, so an interrupted debut has somewhere
+    -- to put every part back rather than reading a value out of its own animation.
+    local sideHome = sidebar and sidebar.Position
+    local titleHome = title and title.Position
+    local subHome = subtitle and subtitle.Position
+    local stripHome = strip and strip.Position
+
+    -- The strip comes off the shared alpha for the length of this, because it is the one part
+    -- that is outside the body and therefore the one part that can carry its own fade.
+    if stripFade then self:_dropFade(stripFade) end
+
+    self._open = true
+    window.Visible = true
+    window.Position = from
+    self:_setAlpha(0)
+    if stripFade then stripFade(0) end
+    if self._shadow then
+        self._shadow.ImageTransparency = 1
+        tween(self._shadow, 0.42, { ImageTransparency = 0.55 }, EASE_SOFT)
+    end
+
+    local function slot(spec, elapsed)
+        local t = (elapsed - spec[1]) / spec[2]
+        if t <= 0 then return 0 end
+        if t >= 1 then return 1 end
+        -- Arriving settles: the same curve the window uses when it opens normally.
+        return 1 - (1 - t) ^ 4
+    end
+    local function shifted(home, dx, dy)
+        return UDim2.new(
+            home.X.Scale, math.floor(home.X.Offset + dx + 0.5),
+            home.Y.Scale, math.floor(home.Y.Offset + dy + 0.5)
+        )
+    end
+
+    -- Put every part at its start, so the first frame drawn is the first frame of the
+    -- animation rather than the finished interface for one frame and then the animation.
+    if sidebar and sideHome then
+        sidebar.Position = shifted(sideHome, -(sidebar.Size.X.Offset), 0)
+    end
+    if title and titleHome then title.Position = shifted(titleHome, 0, -LAYOUT.debutSlide) end
+    if subtitle and subHome then subtitle.Position = shifted(subHome, 0, -LAYOUT.debutSlide) end
+    if strip and stripHome then strip.Position = shifted(stripHome, 0, 10) end
+
+    -- What to do if something interrupts this. Pressing the show and hide key half a second
+    -- into the debut is a thing people do, and toggle only knows about the window's own
+    -- travel and the shared alpha: without this the sidebar would be left parked off its own
+    -- left edge for the rest of the session.
+    self._debutSnap = function()
+        self._debutSnap = nil
+        self._debutDone = true
+        if sidebar and sideHome then sidebar.Position = sideHome end
+        if title and titleHome then title.Position = titleHome end
+        if subtitle and subHome then subtitle.Position = subHome end
+        if strip and stripHome then strip.Position = stripHome end
+        if stripFade then
+            stripFade(self._alphaNow or 1)
+            self:_addFade(stripFade)
+        end
+    end
+
+    if self._fadeStop then
+        self._fadeStop()
+        self._fadeStop = nil
+    end
+    local elapsed = 0
+    local columnsFired = false
+    self._fadeStop = addTicker(0, function(dt)
+        elapsed += dt
+
+        local f = slot(MOTION.debutFrame, elapsed)
+        self:_setAlpha(f)
+        window.Position = UDim2.new(
+            from.X.Scale,
+            math.floor(from.X.Offset + (resting.X.Offset - from.X.Offset) * f + 0.5),
+            from.Y.Scale,
+            math.floor(from.Y.Offset + (resting.Y.Offset - from.Y.Offset) * f + 0.5)
+        )
+
+        if sidebar and sideHome then
+            local s = slot(MOTION.debutSidebar, elapsed)
+            sidebar.Position = shifted(sideHome, -(sidebar.Size.X.Offset) * (1 - s), 0)
+        end
+
+        local h = slot(MOTION.debutHeading, elapsed)
+        if title and titleHome then
+            title.Position = shifted(titleHome, 0, -LAYOUT.debutSlide * (1 - h))
+        end
+        if subtitle and subHome then
+            -- A beat behind the title, so the heading reads as two lines arriving rather
+            -- than as one block of text moving.
+            local sh = slot({ MOTION.debutHeading[1] + 0.05, MOTION.debutHeading[2] }, elapsed)
+            subtitle.Position = shifted(subHome, 0, -LAYOUT.debutSlide * (1 - sh))
+        end
+
+        -- The cards, once, and looked up now rather than at the start: a script builds its
+        -- tabs after Interface.new returns, so at the moment this began there were none.
+        if not columnsFired and elapsed >= MOTION.debutColumns then
+            columnsFired = true
+            for _, tabObj in ipairs(self.tabs) do
+                if tabObj.page and tabObj.page.Visible then
+                    for _, entry in ipairs(tabObj._subs) do
+                        if entry.page.Visible and entry.enter then pcall(entry.enter) end
+                    end
+                end
+            end
+        end
+
+        if strip and stripHome then
+            local st = slot(MOTION.debutStrip, elapsed)
+            if stripFade then stripFade(st) end
+            strip.Position = shifted(stripHome, 0, 10 * (1 - st))
+        end
+
+        if f >= 1 and h >= 1 and columnsFired and (not strip or slot(MOTION.debutStrip, elapsed) >= 1) then
+            if self._fadeStop then self._fadeStop() self._fadeStop = nil end
+            -- Everything back on the shared alpha and on its resting place, so the next hide
+            -- takes the strip with it and nothing is left a rounding error off home.
+            if self._debutSnap then self._debutSnap() end
+        end
+    end)
+end
+
 function Window:toggle(show)
     local window = self.window
     if show == nil then show = not window.Visible end
     show = show and true or false
     if show == self._open then return end
     self._open = show
+    -- A debut in flight is put where it was going before this takes the properties over.
+    if self._debutSnap then self._debutSnap() end
     if self.closeOverlays then self.closeOverlays() end
 
     local shade = self._shadow
@@ -5723,7 +5925,6 @@ function Window:toggle(show)
         self._fadeStop()
         self._fadeStop = nil
     end
-    local setAlpha = self._bodyFade
     local from = self._alphaNow or (show and 0 or 1)
     local target = show and 1 or 0
     local liftFrom = show and WINDOW_LIFT(resting) or window.Position
@@ -5748,9 +5949,7 @@ function Window:toggle(show)
         -- Arriving settles, leaving accelerates away. A close that eases out reads as
         -- the window being dragged shut.
         local eased = show and (1 - (1 - t) ^ 4) or (t * t)
-        local alpha = from + (target - from) * eased
-        self._alphaNow = alpha
-        if setAlpha then setAlpha(alpha) end
+        self:_setAlpha(from + (target - from) * eased)
         -- Whole pixels on every frame of the travel. A group blitted between two pixel
         -- rows is the one thing that would soften the text inside it.
         window.Position = UDim2.new(
@@ -6231,7 +6430,9 @@ function Window:refit(force)
     if not force and known and known.X == view.X and known.Y == view.Y then return end
     self._view = view
 
-    local winW, winH = windowFit(view)
+    -- What the strip under the window takes, which is nothing when there is no strip.
+    local reserve = self._statusLift or 0
+    local winW, winH = windowFit(view, reserve)
     local sideW = sidebarFit(winW)
     self.window.Size = UDim2.new(0, winW, 0, winH)
     if self._sidebar then self._sidebar.Size = UDim2.new(0, sideW, 1, 0) end
@@ -6241,7 +6442,12 @@ function Window:refit(force)
     end
 
     if not self._moved then
-        local centred = UDim2.new(0, math.floor(view.X / 2), 0, math.floor(view.Y / 2))
+        -- Half the reserve off the centre, so the window and the strip under it are centred
+        -- as one object rather than the window being centred and the strip hanging below it.
+        local centred = UDim2.new(
+            0, math.floor(view.X / 2),
+            0, math.floor(view.Y / 2) - (reserve // 2)
+        )
         self._resting = centred
         if self._open then self.window.Position = centred end
     end
@@ -6543,6 +6749,78 @@ function Window:getAutoLoad()
         end
     end)
     return out
+end
+
+-- The saved look, before there is a window to put it on.
+--
+-- A config carries two kinds of thing. Most of it belongs to a window: the flags, the show and
+-- hide key, where each detached panel sits. The rest belongs to the session and to every window
+-- in it: the palette, the type family, the weights, the text size and the language. That second
+-- kind can be applied with nothing built yet, which is what this does.
+--
+-- What it fixes is the key prompt turning up in the factory colours. Somebody who spent a while
+-- on a palette got the default one on the first thing the script drew and their own the moment
+-- the window opened, and the two do not match, so it read as a fault in the product rather than
+-- as a prompt that had not read the config yet. The prompt is drawn before any window exists,
+-- so waiting for loadConfig cannot fix it: the session-wide half has to go on first.
+--
+-- The name defaults to whatever setAutoLoad marked, so the ordinary call takes no arguments.
+-- Nothing window shaped is touched, so this is safe to call at any point and safe to call
+-- twice. Returns the name it applied, or nil.
+function Interface.preloadConfig(name)
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return nil end
+    if name == nil then
+        pcall(function()
+            if isfile(autoLoadPath()) then
+                local marked = readfile(autoLoadPath())
+                if type(marked) == "string" and marked ~= "" then name = marked end
+            end
+        end)
+    end
+    if type(name) ~= "string" or name == "" then return nil end
+    local path = configPath(name)
+    local ok, data = pcall(function()
+        if not isfile(path) then return nil end
+        return HttpService:JSONDecode(readfile(path))
+    end)
+    if not ok or type(data) ~= "table" then return nil end
+
+    -- The language first, then the type, then the colours. The same order Window:restore uses
+    -- and for the same reason: the first two re-face every label there is, so doing them after
+    -- the colour pass would repaint work that is about to be thrown away.
+    if type(data.locale) == "string" and data.locale ~= "" then
+        Interface.setLocale(data.locale)
+    end
+    if type(data.font) == "string" and data.font ~= "" then
+        Interface.setFont(data.font)
+    end
+    if type(data.weights) == "table" then
+        for role, weight in pairs(data.weights) do
+            Interface.setRoleWeight(role, weight)
+        end
+    end
+    if type(data.textScale) == "number" then
+        Interface.setTextScale(data.textScale)
+    end
+    if type(data.theme) == "table" then
+        for key, rgb in pairs(data.theme) do
+            -- accentSoft is derived from two of the others, so it is recomputed below rather
+            -- than read out of the file.
+            if DEFAULTS[key] and type(rgb) == "table" and key ~= "accentSoft" then
+                applyKey(key, colorOf(rgb), rgb[4] or PALETTE_A[key] or 1)
+            end
+        end
+        applyKey("accentSoft", legibleOn(PALETTE.accent, PALETTE.background), PALETTE_A.accent)
+    end
+    if type(data.recent) == "table" then
+        table.clear(recentColors)
+        for _, hex in ipairs(data.recent) do
+            if type(hex) == "string" and #hex == 6 then
+                recentColors[#recentColors + 1] = hex
+            end
+        end
+    end
+    return name
 end
 
 -- Auto save: persists the named config a couple of seconds after any change, so
@@ -7639,8 +7917,15 @@ function Window:hud(opts)
 end
 
 -- The status strip ------------------------------------------------------------
--- A thin line along the bottom of the content area: the clock, the date, who the session
--- belongs to, how long the key has left and how many times it has run.
+-- A strip of its own under the window: the clock, the date, who the session belongs to,
+-- how long the key has left and how many times it has run.
+--
+-- Under the window and not inside it. It was a footnote along the bottom of the content
+-- area, which put session facts inside the frame that holds the script's controls and made
+-- the page shorter to fit them: two unrelated things in one box, and the one that matters
+-- gave up the room. Now it is a strip beside the window, travelling with it and fading with
+-- it, sized to what it has to say. What it costs in height comes off the window rather than
+-- being added underneath, so turning it on does not move the interface down the screen.
 --
 -- Off unless a build asks for it, because most of what it shows only means anything when
 -- there is a key system behind it, and a bar reading "user: Player1" on a local build is
@@ -7652,62 +7937,87 @@ end
 -- than zero. The run count is deliberately not counted here: a number the library kept
 -- would live on this machine, which makes it a number the user can edit, and a run count
 -- that can be edited is not a run count. It is the server's to report or nobody's.
-LAYOUT.statusH = 22
+LAYOUT.statusH = 24
 LAYOUT.statusGap = 8
--- What the page area gives up to the top of the content and to its own bottom margin.
--- Named because the status bar has to take the same numbers off the bottom and two copies
--- of a layout constant is how a bar ends up overlapping the cards.
+-- What the page area gives up to the top of the content and to its own bottom margin. The
+-- status strip does not appear here any more: it is outside the window and takes nothing off
+-- the page, which is the whole point of having moved it.
 LAYOUT.pagesTop = 56
 LAYOUT.pagesInset = 72
 
--- A duration as the largest useful units. Days appear only when there are any, so a key
--- with an hour left reads as an hour rather than as "0d 01:00:00".
+-- How long a key has left, as the two largest units that mean anything, and no seconds.
+--
+-- It used to be a clock: "2d 23:59:50", counting down beside the clock that is already on the
+-- strip two fields to the left. Two things ticking a second apart in one line of text is a
+-- line that is always moving and never worth watching, and nobody makes a decision on the
+-- second digit of a three day key. Days and hours change slowly enough to be read.
 local function untilText(seconds)
     seconds = math.max(math.floor(seconds), 0)
     local days = seconds // 86400
-    local rest = seconds % 86400
-    local body = string.format("%02d:%02d:%02d", rest // 3600, (rest % 3600) // 60, rest % 60)
-    if days > 0 then return days .. "d " .. body end
-    return body
+    local hours = (seconds % 86400) // 3600
+    local mins = (seconds % 3600) // 60
+    if days > 0 then
+        if hours > 0 then return days .. "d " .. hours .. "h" end
+        return days .. "d"
+    end
+    if hours > 0 then
+        if mins > 0 then return hours .. "h " .. mins .. "m" end
+        return hours .. "h"
+    end
+    -- Under a minute still reads as a minute rather than as nothing: the field is there to
+    -- say the key is nearly out, and "0m" says less than "1m" does.
+    return math.max(mins, 1) .. "m"
 end
 
 function Window:statusBar(opts)
     opts = opts or {}
     if self._status then
+        if self._statusFade then self:_dropFade(self._statusFade) end
+        self._statusFade = nil
         self._status:Destroy()
         self._status = nil
     end
     if opts.enabled == false then
-        if self.pages then self.pages.Size = UDim2.new(1, -48, 1, -LAYOUT.pagesInset) end
+        if self._statusLift and self._statusLift > 0 then
+            self._statusLift = 0
+            self:refit(true)
+        end
         return nil
     end
     local show = opts.show or {}
 
-    local bar = Instance.new("Frame")
+    -- A group, so it fades with the window on one number the way the body does, and a child
+    -- of the window frame rather than of the body, so it travels with a drag and re-centres
+    -- with a refit without either of those knowing it exists.
+    --
+    -- Sized to its contents. A strip the full width of the window is five short fields and
+    -- eight hundred pixels of nothing, so it takes the width it needs and sits centred under
+    -- the window, which also means a build showing one field gets a small strip rather than
+    -- the same empty bar.
+    local bar = newGroup()
     bar.Name = randomName()
-    bar.AnchorPoint = Vector2.new(0, 1)
-    bar.Position = UDim2.new(0, 24, 1, -10)
-    bar.Size = UDim2.new(1, -48, 0, LAYOUT.statusH)
-    bar.BackgroundTransparency = 1
+    bar.AnchorPoint = Vector2.new(0.5, 0)
+    bar.Position = UDim2.new(0.5, 0, 1, LAYOUT.statusGap)
+    bar.Size = UDim2.new(0, 0, 0, LAYOUT.statusH)
+    bar.AutomaticSize = Enum.AutomaticSize.X
     bar.BorderSizePixel = 0
-    bar.Parent = self._content
+    bar.Parent = self.window
+    themed(bar, "BackgroundColor3", "card")
+    corner(bar, 8)
+    stroke(bar, "stroke", 1, 0.3)
     self._status = bar
-
-    -- A rule above it rather than a surface under it. The bar is a footnote to the page,
-    -- and a filled strip along the bottom of a window reads as a second card.
-    local rule = Instance.new("Frame")
-    rule.Size = UDim2.new(1, 0, 0, 1)
-    rule.Position = UDim2.new(0, 0, 0, 0)
-    rule.BackgroundTransparency = 0.55
-    rule.BorderSizePixel = 0
-    rule.Parent = bar
-    themed(rule, "BackgroundColor3", "stroke")
+    self._statusFade = self:_addFade(groupFade(bar))
+    -- The strip only exists once it has been asked for, so the window is re-fitted to make
+    -- room for it here rather than the fit having to guess.
+    self._statusLift = LAYOUT.statusH + LAYOUT.statusGap
+    self:refit(true)
 
     local row = Instance.new("Frame")
-    row.Position = UDim2.new(0, 0, 0, 5)
-    row.Size = UDim2.new(1, 0, 1, -5)
+    row.Size = UDim2.new(0, 0, 1, 0)
+    row.AutomaticSize = Enum.AutomaticSize.X
     row.BackgroundTransparency = 1
     row.Parent = bar
+    padding(row, nil, { left = 12, right = 12 })
     local lay = listLayout(row, 8, Enum.FillDirection.Horizontal)
     lay.VerticalAlignment = Enum.VerticalAlignment.Center
 
@@ -7817,12 +8127,6 @@ function Window:statusBar(opts)
     end)
     bar.Destroying:Connect(function() if stop then stop() end end)
     table.insert(self._refresh, paint)
-
-    -- The page area gives up the bar's height plus the gap above it, so a card column
-    -- stops where the bar starts instead of scrolling under it.
-    if self.pages then
-        self.pages.Size = UDim2.new(1, -48, 1, -(LAYOUT.pagesInset + LAYOUT.statusH + LAYOUT.statusGap))
-    end
     return bar
 end
 
@@ -8059,7 +8363,7 @@ function Interface.new(opts)
     overlay.Parent = window
     self.overlay = overlay
 
-    self._bodyFade = groupFade(body)
+    self._bodyFade = self:_addFade(groupFade(body))
 
     -- Close the floating panels, newest first. With keepPopovers the gear
     -- settings popovers stay open, so a dropdown or a colour picker opened from
@@ -8193,20 +8497,35 @@ function Interface.new(opts)
         end
     end
 
-    -- The status strip, when the build asks for it. Built last, so it can take its height
-    -- off a page area that is already the right size.
+    -- The status strip, when the build asks for it. Built last, so it can re-fit the window
+    -- to make room for itself under it.
     if opts.statusBar ~= nil and opts.statusBar ~= false then
         self:statusBar(type(opts.statusBar) == "table" and opts.statusBar or nil)
     end
 
-    -- The first open goes through the same path as every one after it, so there is one
-    -- description of what opening the window looks like rather than two that drift.
     self._resting = window.Position
     self._shadow.ImageTransparency = 1
     self._alphaNow = 0
     self._open = false
     window.Visible = false
-    self:toggle(true)
+
+    -- How this window first appears.
+    --
+    -- Every open after this one is Window:toggle, and normally so is this one: one path, one
+    -- description of what opening looks like, no two of them to drift apart. The exception is
+    -- the debut, which is the interface assembling itself a part at a time and happens once.
+    --
+    -- opts.entrance = false never plays it, true always does, and left alone it plays for the
+    -- first window built after a key was accepted, which is the moment it is for: the script
+    -- has just been let in, and this is it arriving.
+    local debut = opts.entrance
+    if debut == nil then debut = gateFresh end
+    gateFresh = false
+    if debut then
+        self:_debut()
+    else
+        self:toggle(true)
+    end
 
     return self
 end
@@ -8282,6 +8601,14 @@ Interface.Card = Card
 function Interface.keyPrompt(opts)
     opts = opts or {}
 
+    -- The saved palette, type and language, before the first thing the script draws. Without
+    -- this the prompt comes up in the factory colours and the window that follows it comes up
+    -- in the user's, which reads as a fault rather than as a prompt drawn a moment too early.
+    -- opts.config = false skips it, and a string names a config other than the marked one.
+    if opts.config ~= false then
+        Interface.preloadConfig(type(opts.config) == "string" and opts.config or nil)
+    end
+
     -- The links, worked out before anything is drawn, because how many there are decides how
     -- tall the card is. A link that was not given is absent rather than present and dead, and
     -- a build with neither gets a shorter card instead of a strip of nothing under the button.
@@ -8292,7 +8619,10 @@ function Interface.keyPrompt(opts)
     -- three hundred and forty is worse than a word, so alone it keeps its word.
     local links = {}
     if type(opts.getKeyUrl) == "string" and opts.getKeyUrl ~= "" then
-        links[#links + 1] = { label = "Get Key", icon = "ticket", url = opts.getKeyUrl }
+        -- Words and no picture. There is no drawing of a key site, and the nearest thing in
+        -- the pack read as a domino sitting next to the label rather than as anything to do
+        -- with a key. Two words say it and take no explaining.
+        links[#links + 1] = { label = "Get Key", url = opts.getKeyUrl }
     end
     if type(opts.discordUrl) == "string" and opts.discordUrl ~= "" then
         links[#links + 1] = { icon = "brand-discord", url = opts.discordUrl, square = true }
@@ -8372,12 +8702,9 @@ function Interface.keyPrompt(opts)
     themed(note, "TextColor3", "subtext")
     localized(note, "Text", opts.note or "Paste your key to continue")
 
-    -- The field, and the eye that reveals it.
-    --
-    -- A ring round it that lights up while it has focus, because a masked field has no other
-    -- feedback: a row of dots does not say whether the box is the thing taking what is being
-    -- typed, and a key pasted into a field that was not focused looks exactly like a key
-    -- pasted into one that was.
+    -- The field, and the eye that reveals it. No outline round it, on focus or otherwise:
+    -- every other field in the kit is a plain filled shape and a ring here made this one look
+    -- like a different kind of control.
     local box = Instance.new("Frame")
     box.Position = UDim2.new(0, 20, 0, 74)
     box.Size = UDim2.new(1, -40, 0, 38)
@@ -8385,7 +8712,6 @@ function Interface.keyPrompt(opts)
     box.Parent = card
     themed(box, "BackgroundColor3", "control")
     corner(box, 9)
-    local ring = stateStroke(box, "accent", 1)
 
     local input = Instance.new("TextBox")
     input.BackgroundTransparency = 1
@@ -8698,8 +9024,8 @@ function Interface.keyPrompt(opts)
         if passed then
             gateToken = mintToken()
             gateInfo = info
+            gateFresh = true
             say("Key accepted", "good")
-            tween(ring, 0.12, { Transparency = 0.1 }, EASE_SOFT)
             finish(true, 0.24)
             return
         end
@@ -8739,14 +9065,7 @@ function Interface.keyPrompt(opts)
     end
 
     checkBtn.MouseButton1Click:Connect(function() attempt(false) end)
-    input.Focused:Connect(function()
-        if leaving then return end
-        tween(ring, 0.14, { Transparency = 0.25 }, EASE_SOFT)
-    end)
-    input.FocusLost:Connect(function(enter)
-        if not leaving then tween(ring, 0.2, { Transparency = 1 }, EASE_SOFT) end
-        if enter then attempt(false) end
-    end)
+    input.FocusLost:Connect(function(enter) if enter then attempt(false) end end)
     closeBtn.MouseButton1Click:Connect(function() finish(false) end)
 
     -- In, on the same curve the window uses.
@@ -8796,6 +9115,15 @@ function Interface.keySystem(opts)
         return true
     end
 
+    -- Before either path, not just the one that draws a prompt. A build that hands its key in
+    -- never sees the prompt but still goes straight into building a window, and that window's
+    -- first appearance should be in the user's colours rather than snapping into them a moment
+    -- after the debut has started. keyPrompt does it again for a caller that goes there
+    -- directly; it reads one file and it is idempotent.
+    if opts.config ~= false then
+        Interface.preloadConfig(type(opts.config) == "string" and opts.config or nil)
+    end
+
     gateCheck = opts.check
     gateOpts = {
         recheck = (type(opts.recheck) == "number" and opts.recheck >= 0) and opts.recheck or 300,
@@ -8816,6 +9144,7 @@ function Interface.keySystem(opts)
         if passed then
             gateToken = mintToken()
             gateInfo = info
+            gateFresh = true
             return true
         end
     end
