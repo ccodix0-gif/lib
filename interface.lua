@@ -129,7 +129,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.24"
+Interface.version = "2026.07.31.25"
 
 -- Five tables that hold what used to be a hundred and thirty separate locals ------------
 --
@@ -8274,24 +8274,28 @@ end
 
 -- A ring that fills round, with the number inside it and the label under it.
 --
--- Built out of segments rather than as an arc, because Roblox has no arc. The usual way round
--- that is two half circle images rotated against each other behind a pair of nested clips, which
--- needs artwork drawn for the job, resamples it at every diameter and comes out soft at both
--- ends of the sweep. Segments are exact at any size and need no artwork at all.
+-- A real ring and a real arc. Both earlier builds drew it out of little rectangles arranged in a
+-- circle, and no amount of tuning them was ever going to work: a rectangle has straight edges, so
+-- both sides of the band come out as a polygon and the end of the arc as a stair. Widening them
+-- closed the gaps and left a lumpy doughnut, which is the same fault one turn further on.
 --
--- What matters is that they touch. The first build used a fixed three pixel width and forty four
--- of them, which at a ninety pixel diameter left more than two pixels of gap between each pair:
--- a dashed circle, and it read as a broken ring rather than as a ring filling up. The width now
--- comes from the geometry instead of from a constant, so the segments meet whatever the diameter
--- and however many there are, and the band is a solid ring with a fine radial grain in it.
+-- The ring is a UIStroke on a circle. A square frame with a corner radius of half its size is a
+-- circle, the stroke follows that curve, and both are drawn by the engine with anti-aliasing, so
+-- the band is smooth at any diameter and needs no artwork. The frame itself is transparent, so
+-- the hole is a real hole rather than a disc painted the colour of whatever is behind it.
 --
--- opts: label, value, size, ticks, position, id, interval, color, text, visible, bare
+-- The arc is the two nested clip trick, which is how this is done in Roblox and the reason a
+-- rectangle was ever considered. A frame that clips can only ever show a half plane through the
+-- centre, and rotating it rotates which half. Two of them, one fixed and one turning, intersect
+-- in a wedge, and a wedge of the ring is an arc. It takes two pairs to get round the full circle:
+-- the first sweeps the right half from twelve o'clock, the second the left half from six.
+--
+-- What that buys, besides the look, is the animation. Segments could only light one at a time, so
+-- the fill moved in steps of one whole segment however smoothly the value moved. An arc is a
+-- rotation, so it is continuous.
+--
+-- opts: label, value, size, band, position, id, interval, color, text, visible, bare
 LAYOUT.gaugeSize = 96
--- One segment per this many pixels of circumference, within reason. Denser than about four
--- pixels is more frames for a grain nobody can see, and sparser than about ten is a dial.
-LAYOUT.gaugeSegmentPitch = 6
-LAYOUT.gaugeSegmentsMin = 24
-LAYOUT.gaugeSegmentsMax = 96
 function Window:gauge(opts)
     opts = opts or {}
     local diameter = opts.size or LAYOUT.gaugeSize
@@ -8303,8 +8307,8 @@ function Window:gauge(opts)
         0, diameter + pad * 2 + labelH
     ))
 
-    -- The dial. Its own square, so the segments can be placed from its centre whatever is under
-    -- it, and so the value in the middle is centred on the ring rather than on the card.
+    -- The dial. Its own square, so everything below can be placed from its centre whatever is
+    -- under it, and so the value in the middle is centred on the ring rather than on the card.
     local dial = newInstance("Frame")
     dial.Position = UDim2.new(0, pad, 0, pad)
     dial.Size = UDim2.new(0, diameter, 0, diameter)
@@ -8313,45 +8317,67 @@ function Window:gauge(opts)
     dial.ZIndex = OVERLAY_Z
     dial.Parent = frame
 
-    -- How thick the band is, and where its middle sits.
-    local band = math.max(math.floor(diameter * 0.13 + 0.5), 5)
-    local radius = diameter / 2 - band / 2
-    -- Asked for, or worked out from the circumference. The clamp belongs to the worked out
-    -- number only: a caller naming a count means it, and the floor under that is the point where
-    -- segments stop reading as a ring at all.
-    local count
-    if opts.ticks then
-        count = math.max(math.floor(opts.ticks), 8)
-    else
-        count = math.clamp(
-            math.floor(2 * math.pi * radius / LAYOUT.gaugeSegmentPitch),
-            LAYOUT.gaugeSegmentsMin,
-            LAYOUT.gaugeSegmentsMax
-        )
-    end
-    -- The chord one segment has to span, rounded up, plus one so neighbours overlap rather than
-    -- leaving a hairline where the rounding fell short.
-    local width = math.ceil(2 * math.pi * radius / count) + 1
+    -- How thick the band is. The stroke is drawn outside the circle it wraps, so the circle has to
+    -- be that much smaller at both ends for the outer edge to land on the diameter asked for.
+    local band = math.max(math.floor(opts.band or diameter * 0.11 + 0.5), 4)
+    local inner = diameter - band * 2
 
-    local ticks = {}
-    for i = 1, count do
-        -- Twelve o'clock first and clockwise from there, which is the direction anything filling
-        -- round is read in.
-        local angle = (i - 1) / count * math.pi * 2 - math.pi / 2
-        local tick = newInstance("Frame")
-        tick.AnchorPoint = Vector2.new(0.5, 0.5)
-        tick.Position = UDim2.new(
-            0.5, math.floor(math.cos(angle) * radius + 0.5),
-            0.5, math.floor(math.sin(angle) * radius + 0.5)
-        )
-        tick.Size = UDim2.new(0, width, 0, band)
-        -- Turned to face out of the centre, so the segment lies along the band rather than
-        -- across it. Without this the ring is a circle of upright dashes.
-        tick.Rotation = math.deg(angle) + 90
-        tick.BorderSizePixel = 0
-        tick.ZIndex = OVERLAY_Z
-        tick.Parent = dial
-        ticks[i] = tick
+    -- One circle wearing a stroke. Used for the track and for both halves of the arc, so the three
+    -- of them cannot come out different thicknesses or different sizes.
+    local function ringOf(parent, colorKey, at)
+        local ring = newInstance("Frame")
+        ring.AnchorPoint = Vector2.new(0.5, 0.5)
+        ring.Position = at
+        ring.Size = UDim2.new(0, inner, 0, inner)
+        -- Transparent, so what shows is the stroke and the middle is genuinely empty.
+        ring.BackgroundTransparency = 1
+        ring.BorderSizePixel = 0
+        ring.ZIndex = OVERLAY_Z
+        ring.Parent = parent
+        -- Half the size, which on a square is a circle.
+        local round = Instance.new("UICorner")
+        round.CornerRadius = UDim.new(0.5, 0)
+        round.Parent = ring
+        return ring, stroke(ring, colorKey, band, 0)
+    end
+
+    -- The track: the whole ring, dim, with the arc drawn over it.
+    ringOf(dial, "track", UDim2.new(0.5, 0, 0.5, 0))
+
+    -- The two halves of the arc.
+    --
+    -- Each is a fixed clip showing one half of the dial, and inside it a clip that turns. The
+    -- turning one covers the opposite half when it is at zero, so nothing shows through; turned a
+    -- half circle it covers the same half, so all of it shows. In between it is a wedge.
+    local arcs = {}
+    local arcStrokes = {}
+    for i = 1, 2 do
+        local right = i == 1
+        local clip = newInstance("Frame")
+        clip.Size = UDim2.new(0, diameter / 2, 0, diameter)
+        clip.Position = UDim2.new(0, right and diameter / 2 or 0, 0, 0)
+        clip.BackgroundTransparency = 1
+        clip.BorderSizePixel = 0
+        clip.ClipsDescendants = true
+        clip.ZIndex = OVERLAY_Z
+        clip.Parent = dial
+
+        -- Anchored on the edge that sits over the dial's centre, so it turns about that centre
+        -- rather than about a corner of its own.
+        local rotor = newInstance("Frame")
+        rotor.AnchorPoint = Vector2.new(right and 1 or 0, 0.5)
+        rotor.Position = UDim2.new(right and 0 or 1, 0, 0.5, 0)
+        rotor.Size = UDim2.new(0, diameter / 2, 0, diameter)
+        rotor.BackgroundTransparency = 1
+        rotor.BorderSizePixel = 0
+        rotor.ClipsDescendants = true
+        rotor.Rotation = 0
+        rotor.ZIndex = OVERLAY_Z
+        rotor.Parent = clip
+
+        local _, line = ringOf(rotor, "accent", UDim2.new(right and 1 or 0, 0, 0.5, 0))
+        arcs[i] = rotor
+        arcStrokes[i] = line
     end
 
     local valueText = newInstance("TextLabel")
@@ -8385,43 +8411,61 @@ function Window:gauge(opts)
         setLabelPhrase = localized(labelText, "Text", opts.label or "")
     end
 
-    -- Where the dial is now and where it is going. The shown value chases the target on the
-    -- shared driver, which is what makes it fill round rather than jump to a new arc.
+    -- Where the dial is now and where it is going. The shown value chases the target on the shared
+    -- driver, which is what makes it sweep round rather than cut to a new arc.
     local target = math.clamp(tonumber(hudRead(opts.value)) or 0, 0, 1)
     local shown = target
-    local litNow = -1
 
-    -- A state painter, so a palette change repaints the dial without the value moving, the same
-    -- way every other coloured control in the kit follows the accent.
-    local function paint()
-        local lit = math.floor(shown * count + 0.0001)
-        local litColor = opts.color and colorOf(opts.color) or shownColor("accent")
-        local dimColor = shownColor("track")
-        for i = 1, count do
-            ticks[i].BackgroundColor3 = (i <= lit) and litColor or dimColor
-        end
-        litNow = lit
+    -- Half a turn each, the first from twelve o'clock and the second from six. Fractions of a
+    -- degree are fine here and wanted: this is a rotation, not a position, so there is no pixel
+    -- grid to land on and rounding it would put the steps back.
+    local function sweep()
+        arcs[1].Rotation = math.clamp(shown, 0, 0.5) * 360
+        arcs[2].Rotation = math.clamp(shown - 0.5, 0, 0.5) * 360
         valueText.Text = opts.text and tostring(opts.text(shown))
             or (math.floor(shown * 100 + 0.5) .. "%")
     end
-    addStatePainter(dial, paint)
 
+    -- A state painter, so a palette change repaints the arc without the value moving, the same way
+    -- every other coloured control in the kit follows the accent. Only the colour: where the arc
+    -- has got to belongs to the sweep.
+    if opts.color then
+        local fixed = colorOf(opts.color)
+        for _, line in ipairs(arcStrokes) do line.Color = fixed end
+    else
+        addStatePainter(dial, function()
+            local accent = shownColor("accent")
+            for _, line in ipairs(arcStrokes) do line.Color = accent end
+        end)
+    end
+    sweep()
+
+    -- The sweep, over a fixed length of time from wherever it had got to.
+    --
+    -- The first version approached the target by a fraction of the remaining distance each frame,
+    -- which is the easy way to write it and the wrong shape: an exponential approach never
+    -- actually arrives, so the last few degrees crawled for the best part of a second and the ring
+    -- looked like it had stalled just short of the mark. Timing it instead means it lands, and
+    -- re-basing on the value it had when the target moved means a number that keeps changing is
+    -- followed without any jump.
     local chase = nil
+    local fromValue = shown
+    local elapsed = 0
     local function drive()
+        fromValue = shown
+        elapsed = 0
         if chase then return end
         chase = addTicker(0, function(dt)
             if not dial.Parent then
                 if chase then chase() chase = nil end
                 return
             end
-            -- Exponential approach, so a value that keeps moving is followed without the dial
-            -- restarting a tween on every read.
-            local step = math.min(dt / MOTION.readoutFill, 1)
-            shown += (target - shown) * step
-            if math.abs(target - shown) < 0.002 then shown = target end
-            local lit = math.floor(shown * count + 0.0001)
-            if lit ~= litNow or shown == target then paint() end
-            if shown == target then
+            elapsed += dt
+            local t = math.min(elapsed / MOTION.readoutFill, 1)
+            shown = fromValue + (target - fromValue) * (1 - (1 - t) ^ 3)
+            if t >= 1 then shown = target end
+            sweep()
+            if t >= 1 then
                 if chase then chase() chase = nil end
             end
         end)
