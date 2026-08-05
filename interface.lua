@@ -66,6 +66,11 @@
 --   weights, the toggle key, the language and the position and visibility of every
 --   detached panel.
 --
+-- STATUS STRIP (inside the window, along the bottom; off unless asked for):
+--   UI.new({ statusBar = true })   or   win:statusBar({ show = { .. }, text = fn })
+--   fields: time, date, user, expires, runs. The last three come from UI.session(), so on
+--   a build with no key system they are absent rather than empty.
+--
 -- OVERLAYS (detached, draggable, positions saved with the config):
 --   win:watermark{...}      -- logo, brand, fps, time strip
 --   win:keybindList{...}    -- every registered keybind with its live state
@@ -84,7 +89,11 @@
 --     language) and returns the tab and its page, so a script can add its own cards:
 --     local tab, page = win:settingsTab({ language = { { label = "English", code = "en" } } })
 --   win:exportConfig() / win:importConfig(text) move a config through the clipboard.
---   UI.licence(fn [, seconds]) gates window creation on your own check.
+--   UI.keySystem({ check = fn, getKeyUrl =, discordUrl =, .. }) asks for a key, checks it
+--     with your validator and gates every window on the answer. Returns true when it
+--     passed. UI.keyPrompt(opts) is the same window without the waiting, and UI.session()
+--     is what the validator last reported (user, expires, runs).
+--   UI.licence(fn [, seconds]) is the older, keyless form of the same gate.
 --   UI.setFont(family) swaps the type family for a language the default misses.
 --   UI.setWeight(w) puts one weight under all of the text, UI.setRoleWeight(role, w) under
 --     one kind of it; roles are regular, medium, semibold, bold and w is a name
@@ -118,7 +127,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.17"
+Interface.version = "2026.07.31.18"
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -1051,21 +1060,108 @@ local function randomName(length)
     return table.concat(out)
 end
 
--- Licence gate. A loader can hand the library a validator before it builds a
--- window: Interface.licence(function() return stillPaid end). While one is set
--- it runs on window creation and again on a timer, and a window whose check
--- stops passing unloads itself. Without a validator nothing is gated, so a
--- local build still runs.
-local licenceFn, licencePeriod = nil, 60
-local function licenceOk()
-    if not licenceFn then return true end
-    local ok, allowed = pcall(licenceFn)
-    return ok and allowed ~= false
+-- The gate ------------------------------------------------------------------
+-- What stands between a loaded library and a built window.
+--
+-- This was a dead letter before: there was a licence(fn) that stored a validator, an
+-- ok() that would have run it, a comment claiming both ran on window creation and on a
+-- timer, and not one call site for either. A gate nothing consults is worse than no
+-- gate, because the comment says the product is protected and it is not.
+--
+-- What it is now:
+--   * arm(check, opts) is handed a validator and nothing else. What the validator does
+--     is the caller's business: an HttpGet to a key site, Luarmor, a local compare.
+--   * a pass mints a token, and building a window requires the token rather than a
+--     boolean. There is no `passed = true` anywhere to flip.
+--   * the token is re-minted on every re-check and dropped on the first failure, and a
+--     failure takes every live window down with it.
+--   * the key itself is never held. It goes to the validator as an argument and the
+--     field it was typed into is cleared. It is not in the config, not in a file, and
+--     not on any table this library returns.
+--
+-- What it is not: unbreakable. The code runs in the reader's own process, so anyone
+-- willing to edit the file can delete the check. Everything here raises the cost of
+-- doing it casually and none of it survives a deliberate patch, which is what a
+-- bytecode obfuscator is for and this is not.
+local gateCheck = nil
+local gateOpts = nil
+local gateToken = nil
+local gateLastRun = 0
+local gateInfo = nil
+-- Rebuilt on every pass. Long enough that guessing it is not a shortcut, and it never
+-- leaves this file: nothing returns it and nothing writes it to a config.
+local function mintToken()
+    return randomName(24) .. tostring(math.floor(os.clock() * 1e6))
 end
 
+-- Run the validator once. Returns whether it passed, and the table it reported.
+--
+-- Anything other than an explicit false is a pass, so a validator that returns nothing
+-- does not lock a user out of a product they paid for over a typo. A table is read for
+-- the session facts the status bar shows; ok = false in the table is still a refusal.
+local function gateRun(key)
+    if not gateCheck then return true, nil end
+    local ok, result = pcall(gateCheck, key)
+    gateLastRun = os.clock()
+    if not ok then return false, nil end
+    if result == false then return false, nil end
+    if type(result) == "table" then
+        if result.ok == false then return false, result end
+        return true, result
+    end
+    return true, nil
+end
+
+local function gateArmed()
+    return gateCheck ~= nil
+end
+
+-- Whether the gate is open right now, re-running the validator if the last answer is
+-- older than the caller asked for. The staleness check is here rather than only on a
+-- timer so that a window built an hour after the key was entered is a window that was
+-- checked, not one that inherited a pass.
+local function gateOpen()
+    if not gateCheck then return true end
+    if not gateToken then return false end
+    local period = (gateOpts and gateOpts.recheck) or 0
+    if period > 0 and os.clock() - gateLastRun > period then
+        local passed, info = gateRun(nil)
+        if not passed then
+            gateToken = nil
+            gateInfo = nil
+            return false
+        end
+        if info then gateInfo = info end
+    end
+    return gateToken ~= nil
+end
+
+-- What the validator last reported: the user it belongs to, when it runs out, how many
+-- times it has been used. Read only, and a copy, so a caller cannot write into the
+-- gate's own record through the table it is handed.
+function Interface.session()
+    if not gateInfo then return nil end
+    local out = {}
+    for k, v in pairs(gateInfo) do
+        if k ~= "ok" then out[k] = v end
+    end
+    return out
+end
+
+-- The old name, kept because a script in the wild may call it. It arms the gate with a
+-- validator that takes no key, which is what it always meant.
 function Interface.licence(fn, period)
-    licenceFn = type(fn) == "function" and fn or nil
-    if type(period) == "number" and period >= 10 then licencePeriod = period end
+    if type(fn) ~= "function" then
+        gateCheck = nil
+        gateOpts = nil
+        gateToken = nil
+        return
+    end
+    gateCheck = fn
+    gateOpts = { recheck = (type(period) == "number" and period >= 10) and period or 60 }
+    local passed, info = gateRun(nil)
+    gateToken = passed and mintToken() or nil
+    gateInfo = passed and info or nil
 end
 
 -- Diagnostics ----------------------------------------------------------------
@@ -7332,9 +7428,201 @@ function Window:hud(opts)
     return hud
 end
 
+-- The status strip ------------------------------------------------------------
+-- A thin line along the bottom of the content area: the clock, the date, who the session
+-- belongs to, how long the key has left and how many times it has run.
+--
+-- Off unless a build asks for it, because most of what it shows only means anything when
+-- there is a key system behind it, and a bar reading "user: Player1" on a local build is
+-- chrome pretending to be information.
+--
+-- Every field is optional and every field hides itself when it has nothing to say, which
+-- matters for two of them in particular. The run count and the expiry come from whatever
+-- the validator reported, so on a build with no key system they are simply absent rather
+-- than zero. The run count is deliberately not counted here: a number the library kept
+-- would live on this machine, which makes it a number the user can edit, and a run count
+-- that can be edited is not a run count. It is the server's to report or nobody's.
+local STATUS_H = 22
+local STATUS_GAP = 8
+-- What the page area gives up to the top of the content and to its own bottom margin.
+-- Named because the status bar has to take the same numbers off the bottom and two copies
+-- of a layout constant is how a bar ends up overlapping the cards.
+local PAGES_TOP = 56
+local PAGES_INSET = 72
+
+-- A duration as the largest useful units. Days appear only when there are any, so a key
+-- with an hour left reads as an hour rather than as "0d 01:00:00".
+local function untilText(seconds)
+    seconds = math.max(math.floor(seconds), 0)
+    local days = seconds // 86400
+    local rest = seconds % 86400
+    local body = string.format("%02d:%02d:%02d", rest // 3600, (rest % 3600) // 60, rest % 60)
+    if days > 0 then return days .. "d " .. body end
+    return body
+end
+
+function Window:statusBar(opts)
+    opts = opts or {}
+    if self._status then
+        self._status:Destroy()
+        self._status = nil
+    end
+    if opts.enabled == false then
+        if self.pages then self.pages.Size = UDim2.new(1, -48, 1, -PAGES_INSET) end
+        return nil
+    end
+    local show = opts.show or {}
+
+    local bar = Instance.new("Frame")
+    bar.Name = randomName()
+    bar.AnchorPoint = Vector2.new(0, 1)
+    bar.Position = UDim2.new(0, 24, 1, -10)
+    bar.Size = UDim2.new(1, -48, 0, STATUS_H)
+    bar.BackgroundTransparency = 1
+    bar.BorderSizePixel = 0
+    bar.Parent = self._content
+    self._status = bar
+
+    -- A rule above it rather than a surface under it. The bar is a footnote to the page,
+    -- and a filled strip along the bottom of a window reads as a second card.
+    local rule = Instance.new("Frame")
+    rule.Size = UDim2.new(1, 0, 0, 1)
+    rule.Position = UDim2.new(0, 0, 0, 0)
+    rule.BackgroundTransparency = 0.55
+    rule.BorderSizePixel = 0
+    rule.Parent = bar
+    themed(rule, "BackgroundColor3", "stroke")
+
+    local row = Instance.new("Frame")
+    row.Position = UDim2.new(0, 0, 0, 5)
+    row.Size = UDim2.new(1, 0, 1, -5)
+    row.BackgroundTransparency = 1
+    row.Parent = bar
+    local lay = listLayout(row, 8, Enum.FillDirection.Horizontal)
+    lay.VerticalAlignment = Enum.VerticalAlignment.Center
+
+    local order = 0
+    local function nextO() order += 1 return order end
+    local function sep()
+        local f = Instance.new("Frame")
+        f.Size = UDim2.new(0, 1, 0, 10)
+        f.BackgroundTransparency = 0.4
+        f.BorderSizePixel = 0
+        f.LayoutOrder = nextO()
+        f.Parent = row
+        themed(f, "BackgroundColor3", "stroke")
+        return f
+    end
+    -- A field is a separator and a label that go together: hiding the label has to hide
+    -- the line beside it, or a field with nothing to say leaves a stray tick behind.
+    local fields = {}
+    local function field(read)
+        local line = (#fields > 0) and sep() or nil
+        local label = Instance.new("TextLabel")
+        label.AutomaticSize = Enum.AutomaticSize.X
+        label.Size = UDim2.new(0, 0, 1, 0)
+        label.BackgroundTransparency = 1
+        label.TextSize = 12
+        label.TextYAlignment = Enum.TextYAlignment.Center
+        label.Text = ""
+        label.LayoutOrder = nextO()
+        label.Parent = row
+        faced(label, "regular")
+        themed(label, "TextColor3", "subtext")
+        fields[#fields + 1] = { label = label, line = line, read = read }
+        return label
+    end
+
+    if show.time ~= false then
+        field(function() return os.date("%H:%M:%S") end)
+    end
+    if show.date ~= false then
+        field(function() return os.date("%d.%m.%Y") end)
+    end
+    if show.user ~= false then
+        field(function()
+            local info = Interface.session()
+            local named = info and info.user
+            if type(named) == "string" and named ~= "" then return named end
+            -- Only the key's owner, never the Roblox account as a stand-in. A bar that
+            -- prints the local player's name looks like it knows who the session belongs
+            -- to when all it knows is who is playing.
+            return nil
+        end)
+    end
+    if show.expires ~= false then
+        field(function()
+            local info = Interface.session()
+            local at = info and tonumber(info.expires)
+            if not at then return nil end
+            local left = at - os.time()
+            if left <= 0 then return translate("Expired") end
+            return untilText(left)
+        end)
+    end
+    if show.runs ~= false then
+        field(function()
+            local info = Interface.session()
+            local runs = info and tonumber(info.runs)
+            if not runs then return nil end
+            return translate("Runs") .. " " .. math.floor(runs)
+        end)
+    end
+    if type(opts.text) == "function" then
+        field(function()
+            local ok, value = pcall(opts.text)
+            if ok and value ~= nil and value ~= "" then return tostring(value) end
+            return nil
+        end)
+    end
+
+    local function paint()
+        local first = true
+        for _, entry in ipairs(fields) do
+            local ok, value = pcall(entry.read)
+            local text = (ok and value ~= nil) and tostring(value) or nil
+            entry.label.Visible = text ~= nil
+            if text then
+                if entry.label.Text ~= text then entry.label.Text = text end
+                -- The separator belongs to the field on its right, and the leftmost field
+                -- that is actually showing must not have one.
+                if entry.line then entry.line.Visible = not first end
+                first = false
+            elseif entry.line then
+                entry.line.Visible = false
+            end
+        end
+    end
+    paint()
+
+    -- Twice a second. The clock is the only thing here that moves on its own and it is
+    -- shown to the second, so anything faster is a write nobody can see.
+    local stop
+    stop = addTicker(0.5, function()
+        if not bar.Parent then
+            if stop then stop() end
+            return
+        end
+        if bar.Visible and self._open then paint() end
+    end)
+    bar.Destroying:Connect(function() if stop then stop() end end)
+    table.insert(self._refresh, paint)
+
+    -- The page area gives up the bar's height plus the gap above it, so a card column
+    -- stops where the bar starts instead of scrolling under it.
+    if self.pages then
+        self.pages.Size = UDim2.new(1, -48, 1, -(PAGES_INSET + STATUS_H + STATUS_GAP))
+    end
+    return bar
+end
+
 function Interface.new(opts)
-    if not licenceOk() then
-        error("[NewReality] this session is not licensed", 2)
+    -- The gate, on every window and not only on the first. gateOpen re-runs the validator
+    -- when its last answer is older than the caller asked for, so a window built long
+    -- after the key was entered is a window that was checked rather than one that
+    -- inherited a pass.
+    if not gateOpen() then
+        error("[NewReality] this session is not authorised", 2)
     end
     opts = opts or {}
     local self = setmetatable({
@@ -7534,8 +7822,8 @@ function Interface.new(opts)
     self.subtitle = subtitle
 
     local pages = Instance.new("Frame")
-    pages.Position = UDim2.new(0, 24, 0, 56)
-    pages.Size = UDim2.new(1, -48, 1, -72)
+    pages.Position = UDim2.new(0, 24, 0, PAGES_TOP)
+    pages.Size = UDim2.new(1, -48, 1, -PAGES_INSET)
     pages.BackgroundTransparency = 1
     -- Clipped, so a page changing travels in and out behind the edge of the content
     -- area instead of sliding across the window's margin. It is what turns the
@@ -7658,12 +7946,35 @@ function Interface.new(opts)
         end
     end))
 
-    -- Keep checking the licence while the window lives, a revoked session
-    -- loses its interface instead of running on with a stale check.
-    if licenceFn then
-        table.insert(self._conns, addTicker(licencePeriod, function()
-            if not licenceOk() then self:unload() end
-        end))
+    -- Keep checking while the window lives: a revoked session loses its interface instead
+    -- of running on with a stale pass. The validator is re-run rather than a remembered
+    -- answer being read, and a refusal drops the token as well as the window, so nothing
+    -- can be rebuilt afterwards without passing again.
+    if gateArmed() then
+        local period = (gateOpts and gateOpts.recheck) or 60
+        if period > 0 then
+            table.insert(self._conns, addTicker(period, function()
+                if self._dead then return end
+                local passed, info = gateRun(nil)
+                if passed then
+                    if info then gateInfo = info end
+                    gateToken = mintToken()
+                    return
+                end
+                gateToken = nil
+                gateInfo = nil
+                if gateOpts and type(gateOpts.onLost) == "function" then
+                    pcall(gateOpts.onLost, "revoked")
+                end
+                self:unload()
+            end))
+        end
+    end
+
+    -- The status strip, when the build asks for it. Built last, so it can take its height
+    -- off a page area that is already the right size.
+    if opts.statusBar ~= nil and opts.statusBar ~= false then
+        self:statusBar(type(opts.statusBar) == "table" and opts.statusBar or nil)
     end
 
     -- The first open goes through the same path as every one after it, so there is one
@@ -7697,6 +8008,451 @@ end
 
 Interface.Window = Window
 Interface.Card = Card
+
+-- The key system -------------------------------------------------------------
+-- A small window that takes a key, hands it to the caller's validator and opens the gate
+-- if the validator is happy. Everything about what a valid key is belongs to the caller:
+-- this owns the asking, the checking schedule and the refusing.
+--
+--   local ok = UI.keySystem({
+--       check = function(key)
+--           local reply = game:HttpGet("https://keys.example/verify?k=" .. key)
+--           if reply ~= "valid" then return false end
+--           -- Anything the bar should show comes back here. None of it is invented.
+--           return { ok = true, user = "ccodix", expires = os.time() + 86400, runs = 41 }
+--       end,
+--       getKeyUrl = "https://keys.example/get",
+--       discordUrl = "https://discord.gg/newreality",
+--   })
+--   if not ok then return end
+--   local win = UI.new({ statusBar = true })
+--
+-- keySystem yields until the question is settled, so the line after it runs with the
+-- answer already known. It returns true on a pass and false when the user closed the
+-- prompt or ran out of attempts, and the caller decides what that means: returning false
+-- rather than killing the thread keeps the decision where it belongs.
+--
+-- opts:
+--   enabled = false   skip the whole thing and return true, for a local build
+--   check             the validator. Required. false or { ok = false } refuses.
+--   key               try this one first and never show the prompt if it passes. For a
+--                     build that already has a key in hand; it is not remembered here.
+--   recheck = 300     seconds between re-checks while the session runs; 0 to never
+--   attempts = 0      wrong keys allowed before it gives up; 0 for no limit
+--   onLost            called when a re-check fails after a pass
+--   title / note / placeholder / getKeyUrl / discordUrl / brand
+--   hidden = false    start with the field revealed rather than masked
+--   timeout = 600     give up waiting after this long and refuse, so a broken scheduler
+--                     cannot leave the caller yielding for the rest of the session
+--
+-- The key is never held. It goes to the validator as an argument, the field it was typed
+-- into is cleared on the way out, and it is not in the config, not in a file and not on
+-- any table this library returns. The harness checks that last part by walking a config
+-- snapshot for the key it just used.
+--
+-- keyPrompt is the same window without the waiting: it returns a handle with done, pass,
+-- submit(key) and close(), so a caller that wants to drive it on its own thread can, and
+-- so the prompt is reachable from a test that cannot block.
+function Interface.keyPrompt(opts)
+    opts = opts or {}
+
+    local screen = newInstance("ScreenGui")
+    screen.Name = randomName()
+    screen.ResetOnSpawn = false
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screen.IgnoreGuiInset = true
+    pcall(function() screen.DisplayOrder = 100000 end)
+    screen.Parent = guiParent(screen)
+
+    local view = viewport()
+    local W, H = 380, 246
+    local root = newInstance("Frame")
+    root.Name = randomName()
+    root.AnchorPoint = Vector2.new(0.5, 0.5)
+    root.Size = UDim2.new(0, W, 0, H)
+    root.Position = UDim2.new(0, math.floor(view.X / 2), 0, math.floor(view.Y / 2))
+    root.BackgroundTransparency = 1
+    root.Parent = screen
+    shadow(root)
+
+    local card = newGroup()
+    card.Name = randomName()
+    card.Size = UDim2.new(1, 0, 1, 0)
+    card.BorderSizePixel = 0
+    card.Parent = root
+    themed(card, "BackgroundColor3", "background")
+    corner(card, 14)
+    stroke(card, "stroke", 1, 0.35)
+    local setAlpha = groupFade(card)
+    setAlpha(0)
+
+    local head = Instance.new("Frame")
+    head.Size = UDim2.new(1, 0, 0, 62)
+    head.BackgroundTransparency = 1
+    head.Parent = card
+    makeDraggable(root, head)
+
+    local mark, _, _, noMark = logoMark(head, UDim2.new(0, 30, 0, 30))
+    mark.AnchorPoint = Vector2.new(0, 0.5)
+    mark.Position = UDim2.new(0, 20, 0.5, 0)
+    if noMark then mark:Destroy() end
+    local textX = noMark and 20 or 60
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, textX, 0, 14)
+    title.Size = UDim2.new(1, -textX - 20, 0, 20)
+    title.TextSize = 18
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    title.Parent = head
+    faced(title, "bold")
+    themed(title, "TextColor3", "text")
+    localized(title, "Text", opts.title or (opts.brand or "NewReality"))
+
+    local note = Instance.new("TextLabel")
+    note.BackgroundTransparency = 1
+    note.Position = UDim2.new(0, textX, 0, 34)
+    note.Size = UDim2.new(1, -textX - 20, 0, 16)
+    note.TextSize = 13
+    note.TextXAlignment = Enum.TextXAlignment.Left
+    note.TextTruncate = Enum.TextTruncate.AtEnd
+    note.Parent = head
+    faced(note, "regular")
+    themed(note, "TextColor3", "subtext")
+    localized(note, "Text", opts.note or "Enter your key to continue")
+
+    -- The field, and the eye that reveals it.
+    local box = Instance.new("Frame")
+    box.Position = UDim2.new(0, 20, 0, 74)
+    box.Size = UDim2.new(1, -40, 0, 36)
+    box.BorderSizePixel = 0
+    box.Parent = card
+    themed(box, "BackgroundColor3", "control")
+    corner(box, 8)
+
+    local input = Instance.new("TextBox")
+    input.BackgroundTransparency = 1
+    input.Position = UDim2.new(0, 12, 0, 0)
+    input.Size = UDim2.new(1, -52, 1, 0)
+    input.TextSize = 14
+    input.Text = ""
+    input.ClearTextOnFocus = false
+    input.TextXAlignment = Enum.TextXAlignment.Left
+    input.Parent = box
+    faced(input, "regular")
+    themed(input, "TextColor3", "text")
+    themed(input, "PlaceholderColor3", "subtext")
+    localized(input, "PlaceholderText", opts.placeholder or "Paste your key")
+
+    local eye = Instance.new("TextButton")
+    eye.AnchorPoint = Vector2.new(1, 0.5)
+    eye.Position = UDim2.new(1, -8, 0.5, 0)
+    eye.Size = UDim2.new(0, 26, 0, 26)
+    eye.BackgroundTransparency = 1
+    eye.AutoButtonColor = false
+    eye.Text = ""
+    eye.Parent = box
+    -- One icon, not two. The pack has an eye and no crossed out eye, and a state shown by
+    -- swapping to an icon that is not there is a state shown by an empty square. Revealed
+    -- is the accent, hidden is the dim icon colour, which is the same language the rest of
+    -- the kit uses for on and off.
+    local eyeImg = makeIcon(eye, "eye", UDim2.new(1, 0, 1, 0), "iconDim")
+    eyeImg.Active = false
+
+    -- The real key lives here and nowhere else, and the field shows dots instead of it.
+    --
+    -- Roblox has no password field, so the mask is done by hand: the box holds one dot per
+    -- character and the change handler works out what was typed by taking the dots off the
+    -- front of whatever the box now says. That covers typing, pasting and backspacing,
+    -- which is all anyone does to a key. Editing in the middle of a masked string appends
+    -- at the end instead, and reveal is one click away for anyone who needs to.
+    local secret = ""
+    local masked = opts.hidden ~= false
+    local writing = false
+    local DOT = utf8 and utf8.char(8226) or "*"
+
+    local function render()
+        writing = true
+        input.Text = masked and string.rep(DOT, #secret) or secret
+        writing = false
+        tintIcon(eyeImg, masked and PALETTE.iconDim or PALETTE.accentSoft)
+    end
+
+    input:GetPropertyChangedSignal("Text"):Connect(function()
+        if writing then return end
+        local shown = input.Text
+        if not masked then
+            secret = shown
+            return
+        end
+        -- Masked, so what the box says is dots plus whatever was just typed. The dot is a
+        -- multi byte character, so everything here counts bytes and divides: the mask for a
+        -- key of n characters is n * #DOT bytes long.
+        local mask = string.rep(DOT, #secret)
+        if shown == "" then
+            secret = ""
+        elseif #shown < #mask then
+            -- Shorter than the mask: characters came off the end.
+            secret = string.sub(secret, 1, #shown // #DOT)
+        elseif string.sub(shown, 1, #mask) == mask then
+            -- The mask is intact at the front, so the rest of it is new input.
+            secret = secret .. string.sub(shown, #mask + 1)
+        else
+            -- The mask itself was edited. Everything that is not a dot is real input and it
+            -- goes on the end: reconstructing where it was typed is not worth the code when
+            -- revealing the field is one click away.
+            secret = (string.gsub(shown, DOT, ""))
+        end
+        render()
+    end)
+    eye.MouseButton1Click:Connect(function()
+        masked = not masked
+        render()
+    end)
+    eye.MouseEnter:Connect(function() tintIcon(eyeImg, PALETTE.icon) end)
+    eye.MouseLeave:Connect(function() render() end)
+    render()
+
+    local status = Instance.new("TextLabel")
+    status.BackgroundTransparency = 1
+    status.Position = UDim2.new(0, 20, 0, 116)
+    status.Size = UDim2.new(1, -40, 0, 16)
+    status.TextSize = 13
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.TextTruncate = Enum.TextTruncate.AtEnd
+    status.Text = ""
+    status.Parent = card
+    faced(status, "medium")
+    themed(status, "TextColor3", "subtext")
+
+    local function say(text, bad)
+        status.Text = text and translate(text) or ""
+        status.TextColor3 = bad and PALETTE.accentSoft or PALETTE.subtext
+    end
+
+    -- Buttons. Check is the wide one, the two links share the row under it, and a link
+    -- that was not given is simply absent rather than present and dead.
+    local function flatButton(label, position, size)
+        local btn = Instance.new("TextButton")
+        btn.Position = position
+        btn.Size = size
+        btn.BorderSizePixel = 0
+        btn.AutoButtonColor = false
+        btn.TextSize = 14
+        btn.Parent = card
+        faced(btn, "medium")
+        themed(btn, "BackgroundColor3", "control")
+        themed(btn, "TextColor3", "text")
+        corner(btn, 8)
+        localized(btn, "Text", label)
+        hoverSurface(btn)
+        return btn
+    end
+
+    local checkBtn = flatButton("Check Key", UDim2.new(0, 20, 0, 140), UDim2.new(1, -40, 0, 36))
+    local links = {}
+    if type(opts.getKeyUrl) == "string" and opts.getKeyUrl ~= "" then
+        links[#links + 1] = { label = "Get Key", url = opts.getKeyUrl }
+    end
+    if type(opts.discordUrl) == "string" and opts.discordUrl ~= "" then
+        links[#links + 1] = { label = "Discord", url = opts.discordUrl }
+    end
+    do
+        local n = #links
+        for i, entry in ipairs(links) do
+            local gap = 8
+            local total = W - 40 - gap * (n - 1)
+            local w = math.floor(total / n)
+            local x = 20 + (i - 1) * (w + gap)
+            local btn = flatButton(entry.label, UDim2.new(0, x, 0, 186), UDim2.new(0, w, 0, 32))
+            btn.MouseButton1Click:Connect(function()
+                -- The clipboard, and the link itself on screen when there is no clipboard
+                -- to put it on. Opening a browser is not attempted: it is an executor
+                -- function that plenty of them do not have, and a button that silently does
+                -- nothing is worse than one that hands you something to paste.
+                local copied = false
+                pcall(function()
+                    if type(setclipboard) == "function" then
+                        setclipboard(entry.url)
+                        copied = true
+                    end
+                end)
+                say(copied and "Link copied" or entry.url, false)
+            end)
+        end
+    end
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.AnchorPoint = Vector2.new(1, 0.5)
+    closeBtn.Position = UDim2.new(1, -16, 0, 31)
+    closeBtn.Size = UDim2.new(0, 22, 0, 22)
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.AutoButtonColor = false
+    closeBtn.Text = ""
+    closeBtn.Parent = head
+    local closeImg = makeIcon(closeBtn, "x", UDim2.new(1, 0, 1, 0), "iconDim")
+    closeImg.Active = false
+    closeBtn.MouseEnter:Connect(function() tintIcon(closeImg, PALETTE.icon) end)
+    closeBtn.MouseLeave:Connect(function() tintIcon(closeImg, PALETTE.iconDim) end)
+
+    -- Settled: true on a pass, false when the prompt was closed or the attempts ran out.
+    local answer = nil
+    local tries = 0
+    local limit = (type(opts.attempts) == "number" and opts.attempts > 0) and opts.attempts or 0
+    local busy = false
+
+    local function finish(result)
+        if answer ~= nil then return end
+        answer = result
+        -- The key goes before the window does, and it goes whether the answer was yes or
+        -- no. There is no path out of here that leaves it in the field.
+        secret = ""
+        writing = true
+        input.Text = ""
+        writing = false
+        local stop
+        local elapsed = 0
+        stop = addTicker(0, function(dt)
+            elapsed += dt
+            local t = math.min(elapsed / 0.16, 1)
+            setAlpha(1 - t)
+            if t >= 1 then
+                if stop then stop() end
+                screen:Destroy()
+            end
+        end)
+    end
+
+    local function run()
+        local key = secret
+        local passed, info = gateRun(key)
+        key = nil
+        busy = false
+        if answer ~= nil then return end
+        if passed then
+            gateToken = mintToken()
+            gateInfo = info
+            say("Key accepted", false)
+            finish(true)
+            return
+        end
+        gateToken = nil
+        gateInfo = nil
+        tries += 1
+        if limit > 0 and tries >= limit then
+            say("Too many attempts", true)
+            finish(false)
+            return
+        end
+        say(limit > 0 and ("Invalid key, " .. (limit - tries) .. " left") or "Invalid key", true)
+    end
+
+    -- inline for a caller that owns its own thread, spawned for a click.
+    --
+    -- A validator that talks to a key site blocks, and blocking a click handler freezes the
+    -- prompt it was clicked on, so the button spawns. submit does not: whoever called it is
+    -- already on a thread of their own and would rather have the answer than a promise, and
+    -- it is the only way in that a harness with no scheduler can use.
+    local function attempt(inline)
+        if busy or answer ~= nil then return end
+        if secret == "" then
+            say("Enter a key first", true)
+            return
+        end
+        busy = true
+        say("Checking..", false)
+        if inline then
+            run()
+        else
+            task.spawn(run)
+        end
+    end
+
+    checkBtn.MouseButton1Click:Connect(function() attempt(false) end)
+    input.FocusLost:Connect(function(enter) if enter then attempt(false) end end)
+    closeBtn.MouseButton1Click:Connect(function() finish(false) end)
+
+    -- In, on the same curve the window uses.
+    do
+        local stop
+        local elapsed = 0
+        local from = root.Position
+        root.Position = UDim2.new(from.X.Scale, from.X.Offset, from.Y.Scale, from.Y.Offset + 24)
+        stop = addTicker(0, function(dt)
+            elapsed += dt
+            local t = math.min(elapsed / 0.28, 1)
+            local eased = 1 - (1 - t) ^ 5
+            setAlpha(eased)
+            root.Position = UDim2.new(
+                from.X.Scale, from.X.Offset,
+                from.Y.Scale, math.floor(from.Y.Offset + 24 * (1 - eased) + 0.5)
+            )
+            if t >= 1 then if stop then stop() end end
+        end)
+    end
+
+    -- The handle. Nothing here hands out the key: submit takes one and forgets it, and
+    -- there is no getter for what was typed.
+    return {
+        frame = root,
+        submit = function(key)
+            if type(key) == "string" then
+                secret = key
+                render()
+            end
+            attempt(true)
+        end,
+        close = function() finish(false) end,
+        settled = function() return answer ~= nil end,
+        passed = function() return answer == true end,
+    }
+end
+
+-- Arm the gate and, unless a key was handed in that works, ask for one.
+function Interface.keySystem(opts)
+    opts = opts or {}
+    if opts.enabled == false then return true end
+    if type(opts.check) ~= "function" then
+        log("warn", "keySystem: no check function, so there is nothing to verify against")
+        return true
+    end
+
+    gateCheck = opts.check
+    gateOpts = {
+        recheck = (type(opts.recheck) == "number" and opts.recheck >= 0) and opts.recheck or 300,
+        onLost = type(opts.onLost) == "function" and opts.onLost or nil,
+    }
+    gateToken = nil
+    gateInfo = nil
+
+    -- A key handed in by the caller is tried before anything is drawn, so a build that
+    -- already has one does not make the user paste it again. It is not remembered here
+    -- either: it is an argument to the validator and then it is gone.
+    if type(opts.key) == "string" and opts.key ~= "" then
+        local passed, info = gateRun(opts.key)
+        if passed then
+            gateToken = mintToken()
+            gateInfo = info
+            return true
+        end
+    end
+
+    local prompt = Interface.keyPrompt(opts)
+    -- Bounded. A scheduler that never yields would otherwise leave the caller spinning for
+    -- the rest of the session, and refusing after ten minutes is a better failure than a
+    -- frozen script with no window and no explanation.
+    local limit = (type(opts.timeout) == "number" and opts.timeout > 0) and opts.timeout or 600
+    local started = os.clock()
+    while not prompt.settled() do
+        if os.clock() - started > limit then
+            prompt.close()
+            return false
+        end
+        task.wait(0.05)
+    end
+    return prompt.passed()
+end
 
 -- Showcase: run the file directly to preview the design. A product script that
 -- embeds this kit sets _G.NewRealityShowcase = false before use to skip it.
