@@ -129,7 +129,7 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.25"
+Interface.version = "2026.07.31.26"
 
 -- Five tables that hold what used to be a hundred and thirty separate locals ------------
 --
@@ -1665,6 +1665,7 @@ Interface.icons = {}
 -- The block between the markers is generated, do not edit it by hand.
 local ICON_DATA = {
 --__ICON_DATA_START__
+    ["ring-half"] = "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",
     ["adjustments"] = "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",
     ["adjustments-horizontal"] = "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",
     ["affiliate"] = "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",
@@ -6829,7 +6830,17 @@ function Window:restore(data)
                     -- Clamped on the way in: a config written on a bigger monitor
                     -- puts panels where this screen has no pixels, and a panel that
                     -- cannot be reached cannot be dragged back.
-                    local at = clampToView(UDim2.new(t[1], t[2], t[3], t[4]), frame.AbsoluteSize, viewport())
+                    --
+                    -- Only when the size is known. A panel is auto sized, and a config loaded in
+                    -- the same frame the panel was built in reaches here before the engine has
+                    -- measured it, so its width reads as zero. The clamp then has no idea how wide
+                    -- the panel is and pulls anything left of sixty pixels in to sixty, which moves
+                    -- panels that were saved against the left edge.
+                    local measured = frame.AbsoluteSize
+                    local saved = UDim2.new(t[1], t[2], t[3], t[4])
+                    local at = (measured and measured.X > 0)
+                        and clampToView(saved, measured, viewport())
+                        or saved
                     self._overlayRest[key] = at
                     frame.Position = at
                     if t[5] ~= nil then self:showOverlay(frame, t[5] == 1, true) end
@@ -6945,6 +6956,18 @@ function Window:setAutoLoad(name)
             delfile(autoLoadPath())
         end
     end)
+    -- Auto save follows it, when auto save is running at all.
+    --
+    -- Writing to one config and reading another is not a state worth supporting: it is only ever a
+    -- mistake, and it is the mistake a real session falls into on its own. A script turns auto save
+    -- on at startup, before anybody has marked a config, so it writes to "default". Later the user
+    -- picks a config of their own on the settings page and marks it to load. From then on every
+    -- drag, every toggle and every colour goes into one file and the next launch reads the other,
+    -- so nothing they change is ever seen again. Both settings said they were on and both were
+    -- telling the truth, which is what made it invisible.
+    if type(name) == "string" and name ~= "" and self._autoSaveName then
+        self:setAutoSave(name)
+    end
     return ok
 end
 function Window:getAutoLoad()
@@ -8274,28 +8297,36 @@ end
 
 -- A ring that fills round, with the number inside it and the label under it.
 --
--- A real ring and a real arc. Both earlier builds drew it out of little rectangles arranged in a
--- circle, and no amount of tuning them was ever going to work: a rectangle has straight edges, so
--- both sides of the band come out as a polygon and the end of the arc as a stair. Widening them
--- closed the gaps and left a lumpy doughnut, which is the same fault one turn further on.
+-- Three builds to get here, so the reasoning is worth writing down.
 --
--- The ring is a UIStroke on a circle. A square frame with a corner radius of half its size is a
--- circle, the stroke follows that curve, and both are drawn by the engine with anti-aliasing, so
--- the band is smooth at any diameter and needs no artwork. The frame itself is transparent, so
--- the hole is a real hole rather than a disc painted the colour of whatever is behind it.
+-- The first two drew the band out of little rectangles arranged in a circle. That was never going
+-- to work: a rectangle has straight edges, so both sides of the band come out as a polygon and the
+-- end of the arc as a stair. Widening them closed the gaps and left a lumpy doughnut, which is the
+-- same fault one turn further on. It also capped the animation, because a segment can only be lit
+-- or not, so the fill moved a whole segment at a time however smoothly the value moved.
 --
--- The arc is the two nested clip trick, which is how this is done in Roblox and the reason a
--- rectangle was ever considered. A frame that clips can only ever show a half plane through the
--- centre, and rotating it rotates which half. Two of them, one fixed and one turning, intersect
--- in a wedge, and a wedge of the ring is an arc. It takes two pairs to get round the full circle:
--- the first sweeps the right half from twelve o'clock, the second the left half from six.
+-- The band itself is easy without artwork: a square frame with a corner radius of half its size is
+-- a circle, a UIStroke follows that curve, and the engine draws both with anti-aliasing. The frame
+-- stays transparent, so the hole is a real hole rather than a disc painted the colour of whatever
+-- is behind it. That is the track.
 --
--- What that buys, besides the look, is the animation. Segments could only light one at a time, so
--- the fill moved in steps of one whole segment however smoothly the value moved. An arc is a
--- rotation, so it is continuous.
+-- The arc is the hard half, because Roblox has no arc. It is made by intersecting two half planes:
+-- a frame that clips can only ever show a half of what is inside it, so a fixed clip and a turning
+-- one overlap in a wedge, and a wedge of the ring is an arc.
 --
--- opts: label, value, size, band, position, id, interval, color, text, visible, bare
+-- The third build turned the clip itself, which is where it went wrong: ClipsDescendants is ignored
+-- on a rotated object, so the turning half clipped nothing, each side showed a whole half ring, and
+-- the two of them crossed into a lens. So the thing that turns cannot be the thing that clips, and
+-- since there is no half ring primitive it has to be a drawing. There is one in the pack now, under
+-- "ring-half": the left half of the band, white, which the dial tints with the accent. Both halves
+-- of the sweep use the same drawing, the second starting a half turn round from the first.
+--
+-- opts: label, value, size, position, id, interval, color, text, visible, bare
 LAYOUT.gaugeSize = 96
+-- How much of the diameter the band takes. The drawing was made at this share, so the track's
+-- stroke is derived from the same number rather than chosen separately: pick them apart and the
+-- vector track and the raster arc no longer line up.
+LAYOUT.gaugeBandShare = 0.12
 function Window:gauge(opts)
     opts = opts or {}
     local diameter = opts.size or LAYOUT.gaugeSize
@@ -8319,38 +8350,39 @@ function Window:gauge(opts)
 
     -- How thick the band is. The stroke is drawn outside the circle it wraps, so the circle has to
     -- be that much smaller at both ends for the outer edge to land on the diameter asked for.
-    local band = math.max(math.floor(opts.band or diameter * 0.11 + 0.5), 4)
+    local band = math.max(math.floor(diameter * LAYOUT.gaugeBandShare + 0.5), 4)
     local inner = diameter - band * 2
 
-    -- One circle wearing a stroke. Used for the track and for both halves of the arc, so the three
-    -- of them cannot come out different thicknesses or different sizes.
-    local function ringOf(parent, colorKey, at)
-        local ring = newInstance("Frame")
-        ring.AnchorPoint = Vector2.new(0.5, 0.5)
-        ring.Position = at
-        ring.Size = UDim2.new(0, inner, 0, inner)
-        -- Transparent, so what shows is the stroke and the middle is genuinely empty.
-        ring.BackgroundTransparency = 1
-        ring.BorderSizePixel = 0
-        ring.ZIndex = OVERLAY_Z
-        ring.Parent = parent
+    -- The track: the whole band, dim, with the arc drawn over it. A stroke on a circle, so it is
+    -- vector sharp whatever the diameter.
+    local track = newInstance("Frame")
+    track.AnchorPoint = Vector2.new(0.5, 0.5)
+    track.Position = UDim2.new(0.5, 0, 0.5, 0)
+    track.Size = UDim2.new(0, inner, 0, inner)
+    -- Transparent, so what shows is the stroke and the middle is genuinely empty.
+    track.BackgroundTransparency = 1
+    track.BorderSizePixel = 0
+    track.ZIndex = OVERLAY_Z
+    track.Parent = dial
+    do
         -- Half the size, which on a square is a circle.
         local round = Instance.new("UICorner")
         round.CornerRadius = UDim.new(0.5, 0)
-        round.Parent = ring
-        return ring, stroke(ring, colorKey, band, 0)
+        round.Parent = track
     end
+    stroke(track, "track", band, 0)
 
-    -- The track: the whole ring, dim, with the arc drawn over it.
-    ringOf(dial, "track", UDim2.new(0.5, 0, 0.5, 0))
-
-    -- The two halves of the arc.
+    -- The two halves of the sweep.
     --
-    -- Each is a fixed clip showing one half of the dial, and inside it a clip that turns. The
-    -- turning one covers the opposite half when it is at zero, so nothing shows through; turned a
-    -- half circle it covers the same half, so all of it shows. In between it is a wedge.
+    -- The clip is fixed and shows one half of the dial. The drawing inside it turns, and it is the
+    -- opposite half of the band, so at rest it sits entirely outside the clip and nothing shows; a
+    -- half turn later it has swept all the way in. The second half of the circle is the same
+    -- drawing starting a half turn round.
+    --
+    -- Nothing that clips is ever rotated here, and that is the whole point rather than a detail:
+    -- ClipsDescendants is ignored on a rotated object, so a turning clip clips nothing.
     local arcs = {}
-    local arcStrokes = {}
+    local ringAsset = iconAsset("ring-half")
     for i = 1, 2 do
         local right = i == 1
         local clip = newInstance("Frame")
@@ -8359,25 +8391,25 @@ function Window:gauge(opts)
         clip.BackgroundTransparency = 1
         clip.BorderSizePixel = 0
         clip.ClipsDescendants = true
+        -- Written rather than left alone, so it is on the page that this must stay at zero.
+        clip.Rotation = 0
         clip.ZIndex = OVERLAY_Z
         clip.Parent = dial
 
-        -- Anchored on the edge that sits over the dial's centre, so it turns about that centre
-        -- rather than about a corner of its own.
-        local rotor = newInstance("Frame")
-        rotor.AnchorPoint = Vector2.new(right and 1 or 0, 0.5)
-        rotor.Position = UDim2.new(right and 0 or 1, 0, 0.5, 0)
-        rotor.Size = UDim2.new(0, diameter / 2, 0, diameter)
-        rotor.BackgroundTransparency = 1
-        rotor.BorderSizePixel = 0
-        rotor.ClipsDescendants = true
-        rotor.Rotation = 0
-        rotor.ZIndex = OVERLAY_Z
-        rotor.Parent = clip
-
-        local _, line = ringOf(rotor, "accent", UDim2.new(right and 1 or 0, 0, 0.5, 0))
-        arcs[i] = rotor
-        arcStrokes[i] = line
+        -- Centred on the dial's centre, which is the clip's inner edge, and the full dial across so
+        -- the drawing's outer edge lands on the diameter.
+        local arc = newInstance("ImageLabel")
+        arc.AnchorPoint = Vector2.new(0.5, 0.5)
+        arc.Position = UDim2.new(right and 0 or 1, 0, 0.5, 0)
+        arc.Size = UDim2.new(0, diameter, 0, diameter)
+        arc.BackgroundTransparency = 1
+        arc.BorderSizePixel = 0
+        arc.Image = ringAsset or ""
+        arc.ScaleType = Enum.ScaleType.Fit
+        arc.Rotation = right and 0 or 180
+        arc.ZIndex = OVERLAY_Z
+        arc.Parent = clip
+        arcs[i] = arc
     end
 
     local valueText = newInstance("TextLabel")
@@ -8416,12 +8448,14 @@ function Window:gauge(opts)
     local target = math.clamp(tonumber(hudRead(opts.value)) or 0, 0, 1)
     local shown = target
 
-    -- Half a turn each, the first from twelve o'clock and the second from six. Fractions of a
-    -- degree are fine here and wanted: this is a rotation, not a position, so there is no pixel
-    -- grid to land on and rounding it would put the steps back.
+    -- Half a turn each, the first from twelve o'clock and the second from six. The second starts a
+    -- half turn round, which is where its drawing sits outside its own clip.
+    --
+    -- Fractions of a degree are fine here and wanted: this is a rotation, not a position, so there
+    -- is no pixel grid to land on and rounding it would put the steps back.
     local function sweep()
         arcs[1].Rotation = math.clamp(shown, 0, 0.5) * 360
-        arcs[2].Rotation = math.clamp(shown - 0.5, 0, 0.5) * 360
+        arcs[2].Rotation = 180 + math.clamp(shown - 0.5, 0, 0.5) * 360
         valueText.Text = opts.text and tostring(opts.text(shown))
             or (math.floor(shown * 100 + 0.5) .. "%")
     end
@@ -8431,11 +8465,11 @@ function Window:gauge(opts)
     -- has got to belongs to the sweep.
     if opts.color then
         local fixed = colorOf(opts.color)
-        for _, line in ipairs(arcStrokes) do line.Color = fixed end
+        for _, img in ipairs(arcs) do img.ImageColor3 = fixed end
     else
         addStatePainter(dial, function()
             local accent = shownColor("accent")
-            for _, line in ipairs(arcStrokes) do line.Color = accent end
+            for _, img in ipairs(arcs) do img.ImageColor3 = accent end
         end)
     end
     sweep()
