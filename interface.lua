@@ -85,8 +85,10 @@
 --   (show/hide the window), win:unload() (remove everything the library made).
 --   win:refit() re-fits to the screen, and it already runs on a timer.
 --   win:applyTheme(name) / UI.themeNames() for the palette presets.
---   win:settingsTab(opts) builds the whole settings page (window key, theme, configs,
---     language) and returns the tab and its page, so a script can add its own cards:
+--   win:settingsTab(opts) builds the whole settings page (window key, theme, opacity,
+--     configs, panels, clipboard, language, and the type on a sub-page) and returns the tab
+--     and its page, so a script can add its own cards beside them. Every card drops with a
+--     flag of its own, and the panel toggles fill themselves whichever order they are in:
 --     local tab, page = win:settingsTab({ language = { { label = "English", code = "en" } } })
 --   win:exportConfig() / win:importConfig(text) move a config through the clipboard.
 --   UI.keySystem({ check = fn, getKeyUrl =, discordUrl =, .. }) asks for a key, checks it
@@ -127,7 +129,37 @@ local Interface = {}
 -- console, which catches a stale copy on the CDN. Loaders also search for this field by
 -- name to tell the library apart from the scripts that load it, so the assignment has to
 -- stay spelled exactly like this in the source text.
-Interface.version = "2026.07.31.18"
+Interface.version = "2026.07.31.20"
+
+-- Five tables that hold what used to be a hundred and thirty separate locals ------------
+--
+-- Not tidiness. Luau allows a function two hundred local registers, and the top level of a
+-- file is a function, so a library that declares everything up there is spending a budget it
+-- shares with nothing. This file reached two hundred and one and stopped compiling, on the
+-- executor rather than here: the bundled compiler in tools/harness is a later build that
+-- packs registers better and took the same file happily, which is the worst way to find out.
+-- The count is now around a hundred and seventy, and every constant added from here goes in
+-- one of these rather than into a local of its own.
+--
+-- Worth being clear about what this limit is not, because it reads like a size limit and it
+-- is not one. It is per function. A script that loads this library is its own chunk with its
+-- own two hundred, and nothing in here is deducted from it: the library's locals live in the
+-- library's chunk. A three thousand line product script has the same room as a ten line one.
+--
+--   LAYOUT      pixels: heights, insets, widths, counts
+--   MOTION      durations, in seconds
+--   TYPESET     the family, the weights per role and the size scale, with their defaults
+--   THEME_META  how the presets are ordered and what a palette key is called on a card
+--   ICONS       the icon cache: where it is, whether it is written, what is in it
+--
+-- The values are still written beside the comment that explains them rather than hoisted
+-- into one block here, because the explanation is the valuable part and moving a number away
+-- from its reason is how the reason gets lost.
+local LAYOUT = {}
+local MOTION = {}
+local TYPESET = {}
+local THEME_META = {}
+local ICONS = {}
 
 -- Theme: our grey palette with the NewReality cyan accent.
 local PALETTE = {
@@ -313,7 +345,7 @@ Interface.themes = THEMES
 -- alternatives. So the default leads and the rest follow in alphabetical order, and a
 -- preset added later goes on the end, where a caller expects the one they just added
 -- to be rather than somewhere in the middle.
-local THEME_ORDER = {
+THEME_META.order = {
     "NewReality",
     "Amber", "Amethyst", "Carbon", "Crimson", "Ember", "Frost", "Graphite",
     "Linen", "Midnight", "Moss", "Nord", "Orchid", "Paper",
@@ -322,7 +354,7 @@ local THEME_ORDER = {
 -- What a palette key is called on a card. Kept here rather than in the caller so the
 -- built in theme card names its rows the same way everywhere and a translation covers
 -- them once, instead of every script inventing its own wording for the same key.
-local THEME_KEY_LABEL = {
+THEME_META.label = {
     accent = "Accent",
     background = "Background",
     sidebar = "Sidebar",
@@ -341,7 +373,7 @@ local THEME_KEY_LABEL = {
 
 -- The six a user actually reaches for. The rest are still there through opts.keys, but
 -- a card that lists all fourteen is a wall of swatches nobody reads.
-local THEME_KEYS_SHOWN = { "accent", "background", "sidebar", "card", "control", "track" }
+THEME_META.shown = { "accent", "background", "sidebar", "card", "control", "track" }
 
 -- The weights the type card offers, and what each role is called on it.
 --
@@ -356,11 +388,11 @@ local THEME_KEYS_SHOWN = { "accent", "background", "sidebar", "card", "control",
 --
 -- setRoleWeight still takes all nine. This is what the card puts on screen, and every
 -- weight the kit ships as a default is in here.
-local TYPE_WEIGHTS = { "Light", "Regular", "Medium", "Bold" }
+TYPESET.weights = { "Light", "Regular", "Medium", "Bold" }
 
 -- Named by what the text is rather than by the role, because "semibold" is the weight it
 -- happens to wear today and "Captions" is what it is for.
-local TYPE_ROLES = {
+TYPESET.roles = {
     { key = "regular", label = "Body" },
     { key = "medium", label = "Labels" },
     { key = "semibold", label = "Captions" },
@@ -370,21 +402,21 @@ local TYPE_ROLES = {
 -- Families the client ships. A name that is not one of these makes a Font the client cannot
 -- resolve, and that Font would then be written to every label the kit owns, so the list is
 -- kept here rather than left to each caller to get right.
-local FONT_FAMILIES = {
+TYPESET.families = {
     "Arial", "Arimo", "BuilderSans", "GothamSSm", "Merriweather", "Montserrat", "Nunito",
     "Roboto", "RobotoCondensed", "RobotoMono", "SourceSansPro", "TitilliumWeb", "Ubuntu",
 }
 
 function Interface.addTheme(name, keys)
     if type(name) ~= "string" or type(keys) ~= "table" then return end
-    if THEMES[name] == nil then THEME_ORDER[#THEME_ORDER + 1] = name end
+    if THEMES[name] == nil then THEME_META.order[#THEME_META.order + 1] = name end
     THEMES[name] = keys
 end
 
 function Interface.themeNames()
     local out = {}
     local listed = {}
-    for _, name in ipairs(THEME_ORDER) do
+    for _, name in ipairs(THEME_META.order) do
         if THEMES[name] and not listed[name] then
             listed[name] = true
             out[#out + 1] = name
@@ -454,12 +486,12 @@ local TRANS_OF = {
 -- above, but far less of it than Heavy: it is one step from Regular rather than two from
 -- Bold. It is there because control labels want to be a little heavier than their values
 -- and a real face for that does not exist.
-local FONT_FAMILY = "rbxasset://fonts/families/Arial.json"
-local ROLES = { "regular", "medium", "semibold", "bold" }
+TYPESET.family = "rbxasset://fonts/families/Arial.json"
+TYPESET.roleNames = { "regular", "medium", "semibold", "bold" }
 -- The weight each role wears. One entry per role rather than one weight for all of them,
 -- so a build can put the reading weight under the prose and keep the heavy one for the
 -- titles without touching a single call site.
-local ROLE_WEIGHT = {
+TYPESET.roleWeight = {
     regular = Enum.FontWeight.Regular,
     medium = Enum.FontWeight.Medium,
     semibold = Enum.FontWeight.Bold,
@@ -468,14 +500,14 @@ local ROLE_WEIGHT = {
 
 -- What the kit ships with, snapshotted before anything can change it, so a reset has
 -- somewhere to go back to. The palette keeps its own snapshot for the same reason.
-local DEFAULT_FONT_FAMILY = FONT_FAMILY
-local DEFAULT_ROLE_WEIGHT = {}
-for role, weight in pairs(ROLE_WEIGHT) do DEFAULT_ROLE_WEIGHT[role] = weight end
+TYPESET.familyDefault = TYPESET.family
+TYPESET.roleWeightDefault = {}
+for role, weight in pairs(TYPESET.roleWeight) do TYPESET.roleWeightDefault[role] = weight end
 
 local FACES = {}
 local function rebuildFaces()
-    for _, role in ipairs(ROLES) do
-        FACES[role] = Font.new(FONT_FAMILY, ROLE_WEIGHT[role], Enum.FontStyle.Normal)
+    for _, role in ipairs(TYPESET.roleNames) do
+        FACES[role] = Font.new(TYPESET.family, TYPESET.roleWeight[role], Enum.FontStyle.Normal)
     end
 end
 rebuildFaces()
@@ -510,7 +542,7 @@ Interface.contrastOn = contrastOn
 -- config. Theming an interface means going back and forth between a handful of
 -- colours, and typing a hex code again each time is the slow way round.
 -- Seven, not eight: the eighth slot in the row is the button that empties it.
-local RECENT_MAX = 7
+LAYOUT.recentMax = 7
 local recentColors = {}
 Interface.recentColors = recentColors
 
@@ -545,7 +577,7 @@ local function pushRecent(rgb)
         if recentColors[i] == hex then table.remove(recentColors, i) end
     end
     table.insert(recentColors, 1, hex)
-    while #recentColors > RECENT_MAX do table.remove(recentColors) end
+    while #recentColors > LAYOUT.recentMax do table.remove(recentColors) end
 end
 
 -- Empty the row. The table is cleared in place rather than replaced, because
@@ -573,10 +605,10 @@ end
 --
 -- Large filled areas keep the literal accent. Correcting those would be answering
 -- a colour the user chose with a colour the library preferred.
-local MIN_MARK_CONTRAST = 0.18
+LAYOUT.markContrast = 0.18
 local function legibleOn(color, surface)
     local gap = luminance(color) - luminance(surface)
-    if math.abs(gap) >= MIN_MARK_CONTRAST then return color end
+    if math.abs(gap) >= LAYOUT.markContrast then return color end
     local h, s, v = color:ToHSV()
     -- Away from the surface: lighter on a dark one, darker on a light one.
     local up = luminance(surface) < 0.5
@@ -584,7 +616,7 @@ local function legibleOn(color, surface)
         v = up and math.min(v + 0.08, 1) or math.max(v - 0.08, 0)
         if s > 0 and up and v >= 1 then s = math.max(s - 0.12, 0) end
         local tryColor = Color3.fromHSV(h, s, v)
-        if math.abs(luminance(tryColor) - luminance(surface)) >= MIN_MARK_CONTRAST then
+        if math.abs(luminance(tryColor) - luminance(surface)) >= LAYOUT.markContrast then
             return tryColor
         end
         if (up and v >= 1 and s <= 0) or (not up and v <= 0) then
@@ -760,9 +792,9 @@ local log
 -- The ceiling is 1.15 and not more because the boxes do not scale with the text. A card title
 -- at 17 sits in a 20 pixel row and a HUD row's label at 13 sits in 15, so past about a seventh
 -- over, the tallest text starts clipping the row it is in rather than growing.
-local DEFAULT_TEXT_SCALE = 1
-local TEXT_SCALE = DEFAULT_TEXT_SCALE
-local TEXT_SCALE_MIN, TEXT_SCALE_MAX = 0.85, 1.15
+TYPESET.scaleDefault = 1
+TYPESET.scale = TYPESET.scaleDefault
+TYPESET.scaleMin, TYPESET.scaleMax = 0.85, 1.15
 
 local function sizeFor(instance)
     local entry = FONT_REG[instance]
@@ -772,7 +804,7 @@ local function sizeFor(instance)
         if not ok or type(current) ~= "number" then return nil end
         entry.base = current
     end
-    return math.max(1, math.floor(entry.base * TEXT_SCALE + 0.5))
+    return math.max(1, math.floor(entry.base * TYPESET.scale + 0.5))
 end
 
 -- faced(inst, role): pick a weight and follow the family.
@@ -786,7 +818,7 @@ local function faced(instance, role)
     tagAdd(FONT_REG, instance, role)
     -- Only when there is a scale to apply, so at the default nothing is recorded and the
     -- first change reads every base off a finished interface.
-    if TEXT_SCALE ~= 1 then
+    if TYPESET.scale ~= 1 then
         local size = sizeFor(instance)
         if size then instance.TextSize = size end
     end
@@ -826,12 +858,12 @@ function Interface.setFont(family)
         log("warn", "setFont: " .. family .. " is not a font family")
         return false
     end
-    FONT_FAMILY = family
+    TYPESET.family = family
     refaceAll()
     return true
 end
 
-local WEIGHT_NAMES = {
+TYPESET.weightNames = {
     thin = Enum.FontWeight.Thin,
     extralight = Enum.FontWeight.ExtraLight,
     light = Enum.FontWeight.Light,
@@ -845,7 +877,7 @@ local WEIGHT_NAMES = {
 
 local function asWeight(weight)
     if type(weight) == "string" then
-        return WEIGHT_NAMES[string.lower(weight)]
+        return TYPESET.weightNames[string.lower(weight)]
     end
     return weight
 end
@@ -854,8 +886,8 @@ end
 function Interface.setWeight(weight)
     weight = asWeight(weight)
     if weight == nil then return end
-    for _, role in ipairs(ROLES) do
-        ROLE_WEIGHT[role] = weight
+    for _, role in ipairs(TYPESET.roleNames) do
+        TYPESET.roleWeight[role] = weight
     end
     refaceAll()
 end
@@ -865,10 +897,10 @@ end
 function Interface.setRoleWeight(role, weight)
     if type(role) ~= "string" then return end
     role = string.lower(role)
-    if ROLE_WEIGHT[role] == nil then return end
+    if TYPESET.roleWeight[role] == nil then return end
     weight = asWeight(weight)
     if weight == nil then return end
-    ROLE_WEIGHT[role] = weight
+    TYPESET.roleWeight[role] = weight
     refaceAll()
 end
 
@@ -878,20 +910,20 @@ end
 -- file holding "bold" can still be read by a build whose enum values have moved. It also
 -- means a script can read the weights back, offer them and write them again without
 -- knowing anything about Enum.FontWeight.
-local WEIGHT_OF = {}
-for name, weight in pairs(WEIGHT_NAMES) do WEIGHT_OF[weight] = name end
+TYPESET.weightName = {}
+for name, weight in pairs(TYPESET.weightNames) do TYPESET.weightName[weight] = name end
 
 function Interface.roleWeights()
     local out = {}
-    for _, role in ipairs(ROLES) do
-        out[role] = WEIGHT_OF[ROLE_WEIGHT[role]] or "regular"
+    for _, role in ipairs(TYPESET.roleNames) do
+        out[role] = TYPESET.weightName[TYPESET.roleWeight[role]] or "regular"
     end
     return out
 end
 
 -- The family the interface is drawing in, so a config can put it back.
 function Interface.getFont()
-    return FONT_FAMILY
+    return TYPESET.family
 end
 
 -- Scale every size the kit writes. Live, like setFont and setWeight.
@@ -907,22 +939,22 @@ function Interface.setTextScale(scale)
     scale = tonumber(scale)
     if not scale then return false end
     local wanted = math.floor(scale * 100 + 0.5) / 100
-    local clamped = math.clamp(wanted, TEXT_SCALE_MIN, TEXT_SCALE_MAX)
-    if clamped ~= TEXT_SCALE then
-        TEXT_SCALE = clamped
+    local clamped = math.clamp(wanted, TYPESET.scaleMin, TYPESET.scaleMax)
+    if clamped ~= TYPESET.scale then
+        TYPESET.scale = clamped
         resizeAll()
     end
     return wanted == clamped
 end
 
 function Interface.getTextScale()
-    return TEXT_SCALE
+    return TYPESET.scale
 end
 
 -- The range the control offers, so a caller building its own does not have to guess and
 -- cannot offer a value setTextScale will refuse.
 function Interface.textScaleRange()
-    return TEXT_SCALE_MIN, TEXT_SCALE_MAX
+    return TYPESET.scaleMin, TYPESET.scaleMax
 end
 
 -- Translations ----------------------------------------------------------------
@@ -1510,13 +1542,13 @@ end
 -- executor workspace. We probe several common folders so it is found wherever
 -- it was dropped, and you can force a folder with Interface.setIconFolder("..").
 -- You can also hand specific names a Roblox asset id via Interface.icons[name].
-local ICON_DIRS = {
+ICONS.dirs = {
     "NewReality/icons/", "newreality/icons/", "NewReality/", "newreality/",
     "icons/", "Icons/", "src/icons/", "assets/icons/", "NewReality icons/", "",
 }
-local iconCache = {}
-local iconFolder = nil
-local iconLogged = false
+ICONS.cache = {}
+ICONS.folder = nil
+ICONS.logged = false
 Interface.icons = {}
 
 -- Embedded icon pack: white PNGs stored as base64 keyed by lowercase name.
@@ -1699,39 +1731,39 @@ end
 -- A build stamp sits next to the cached PNGs: while it matches this build the
 -- files are reused as they are, so a session only decodes and writes an icon the
 -- first time that build sees it.
-local CACHE_DIR = "NewReality/iconcache/"
-local STAMP_PATH = CACHE_DIR .. "build.txt"
-local cacheReady = false
-local cacheFresh = false
+ICONS.cacheDir = "NewReality/iconcache/"
+ICONS.stampPath = ICONS.cacheDir .. "build.txt"
+ICONS.ready = false
+ICONS.fresh = false
 local function ensureCache()
-    if cacheReady then return cacheReady end
+    if ICONS.ready then return ICONS.ready end
     pcall(function()
         if folderMake and folderExists then
             if not folderExists("NewReality") then folderMake("NewReality") end
-            if not folderExists(CACHE_DIR) then folderMake(CACHE_DIR) end
+            if not folderExists(ICONS.cacheDir) then folderMake(ICONS.cacheDir) end
         end
-        if fileExists and fileRead and fileExists(STAMP_PATH) then
-            cacheFresh = fileRead(STAMP_PATH) == Interface.version
+        if fileExists and fileRead and fileExists(ICONS.stampPath) then
+            ICONS.fresh = fileRead(ICONS.stampPath) == Interface.version
         end
-        if not cacheFresh and fileWrite then
-            fileWrite(STAMP_PATH, Interface.version)
-            cacheFresh = true
+        if not ICONS.fresh and fileWrite then
+            fileWrite(ICONS.stampPath, Interface.version)
+            ICONS.fresh = true
         end
-        cacheReady = true
+        ICONS.ready = true
     end)
-    return cacheReady
+    return ICONS.ready
 end
 
 local function embeddedAsset(name)
     local b64 = ICON_DATA[name]
     if not b64 then return nil end
     if not (fileWrite and customAsset) then return nil end
-    local path = CACHE_DIR .. name .. ".png"
+    local path = ICONS.cacheDir .. name .. ".png"
     local ok, asset = pcall(function()
         ensureCache()
         -- Only decode when the cached file is missing or was written by an older
         -- build, so updated embedded data is never masked by a stale file.
-        local cached = cacheFresh and fileExists and fileExists(path)
+        local cached = ICONS.fresh and fileExists and fileExists(path)
         if not cached then
             fileWrite(path, base64Decode(b64))
         end
@@ -1742,20 +1774,20 @@ local function embeddedAsset(name)
 end
 
 local function probeIconFolder()
-    if iconFolder ~= nil then
-        return iconFolder
+    if ICONS.folder ~= nil then
+        return ICONS.folder
     end
-    iconFolder = false
+    ICONS.folder = false
     pcall(function()
         if not fileExists then return end
-        for _, dir in ipairs(ICON_DIRS) do
+        for _, dir in ipairs(ICONS.dirs) do
             if fileExists(dir .. "settings.png") then
-                iconFolder = dir
+                ICONS.folder = dir
                 return
             end
         end
     end)
-    return iconFolder
+    return ICONS.folder
 end
 
 local function iconAsset(name)
@@ -1773,8 +1805,8 @@ local function iconAsset(name)
         return name
     end
     name = string.lower(name)
-    if iconCache[name] ~= nil then
-        return iconCache[name] or nil
+    if ICONS.cache[name] ~= nil then
+        return ICONS.cache[name] or nil
     end
     local result = false
     -- Embedded pack first (self contained), then an optional workspace folder.
@@ -1793,8 +1825,8 @@ local function iconAsset(name)
             end
         end)
     end
-    if not iconLogged then
-        iconLogged = true
+    if not ICONS.logged then
+        ICONS.logged = true
         local count = 0
         for _ in pairs(ICON_DATA) do count += 1 end
         if count > 0 then
@@ -1803,16 +1835,16 @@ local function iconAsset(name)
             log("warn", "no embedded icons present")
         end
     end
-    iconCache[name] = result
+    ICONS.cache[name] = result
     return result or nil
 end
 Interface.iconAsset = iconAsset
 
 -- Force a specific icon folder (relative to the executor workspace).
 function Interface.setIconFolder(folder)
-    iconFolder = folder
-    iconCache = {}
-    iconLogged = false
+    ICONS.folder = folder
+    ICONS.cache = {}
+    ICONS.logged = false
 end
 
 -- Every name the pack answers to, sorted, so a script can browse what it has
@@ -2006,9 +2038,9 @@ end
 
 -- How far below its resting place the window starts and ends. Kept in one place so
 -- opening and closing cannot drift apart.
-local WINDOW_RISE = 34
+LAYOUT.windowRise = 34
 local function WINDOW_LIFT(resting)
-    return UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + WINDOW_RISE)
+    return UDim2.new(resting.X.Scale, resting.X.Offset, resting.Y.Scale, resting.Y.Offset + LAYOUT.windowRise)
 end
 
 -- A section change: the page that was open is hidden at once, and the content of the
@@ -2022,9 +2054,9 @@ end
 -- needs a completion callback, and a position tween reports completion the moment
 -- something else takes the property over. That is what left two pages drawn on top of
 -- each other: the sub-tab bar of the section you had left, over the one you had opened.
-local COLUMN_RISE = 14
-local COLUMN_LEAD = 0.26
-local COLUMN_TRAIL = 0.34
+LAYOUT.columnRise = 14
+MOTION.columnLead = 0.26
+MOTION.columnTrail = 0.34
 
 local function enterColumns(columns)
     for index, column in ipairs(columns) do
@@ -2032,9 +2064,9 @@ local function enterColumns(columns)
         local frame = column.frame
         frame.Position = UDim2.new(
             home.X.Scale, home.X.Offset,
-            home.Y.Scale, home.Y.Offset + COLUMN_RISE
+            home.Y.Scale, home.Y.Offset + LAYOUT.columnRise
         )
-        tween(frame, index == 1 and COLUMN_LEAD or COLUMN_TRAIL, { Position = home }, EASE)
+        tween(frame, index == 1 and MOTION.columnLead or MOTION.columnTrail, { Position = home }, EASE)
     end
 end
 
@@ -4828,17 +4860,17 @@ function Card:theme(opts)
         -- one by name means scrolling a list to find a word you already know. Pass
         -- opts.search = false on a build that has trimmed the list back down.
         self:dropdown("Preset", Interface.themeNames, function()
-            return win:getTheme() or THEME_ORDER[1]
+            return win:getTheme() or THEME_META.order[1]
         end, function(name)
             win:applyTheme(name)
         end, { search = opts.search ~= false })
     end
-    for _, key in ipairs(opts.keys or THEME_KEYS_SHOWN) do
+    for _, key in ipairs(opts.keys or THEME_META.shown) do
         -- Only real keys, and never accentSoft: it is computed from the accent and the
         -- background, so a row for it would offer a colour that is overwritten the next
         -- time either of those moves.
         if DEFAULTS[key] and key ~= "accentSoft" then
-            self:colorpicker(THEME_KEY_LABEL[key] or key, function()
+            self:colorpicker(THEME_META.label[key] or key, function()
                 return win:getColor(key)
             end, function(rgb)
                 win:setColor(key, rgb)
@@ -4882,10 +4914,10 @@ end
 function Card:typography(opts)
     opts = opts or {}
     local win = self._ctx
-    for _, role in ipairs(TYPE_ROLES) do
-        self:segmented(role.label, TYPE_WEIGHTS, function()
+    for _, role in ipairs(TYPESET.roles) do
+        self:segmented(role.label, TYPESET.weights, function()
             local current = Interface.roleWeights()[role.key] or "regular"
-            for _, name in ipairs(TYPE_WEIGHTS) do
+            for _, name in ipairs(TYPESET.weights) do
                 if string.lower(name) == current then return name end
             end
             -- A weight set through setRoleWeight that this list does not offer, so the
@@ -4897,8 +4929,8 @@ function Card:typography(opts)
         end, { fill = true })
     end
     if opts.family ~= false then
-        self:dropdown("Family", FONT_FAMILIES, function()
-            return string.match(Interface.getFont(), "families/(.-)%.json") or FONT_FAMILIES[1]
+        self:dropdown("Family", TYPESET.families, function()
+            return string.match(Interface.getFont(), "families/(.-)%.json") or TYPESET.families[1]
         end, function(family)
             Interface.setFont("rbxasset://fonts/families/" .. family .. ".json")
             win:markDirty()
@@ -4933,11 +4965,11 @@ function Card:typography(opts)
             win:refreshAll()
         end)
         self:button("Reset Type", function()
-            for _, role in ipairs(TYPE_ROLES) do
-                Interface.setRoleWeight(role.key, DEFAULT_ROLE_WEIGHT[role.key])
+            for _, role in ipairs(TYPESET.roles) do
+                Interface.setRoleWeight(role.key, TYPESET.roleWeightDefault[role.key])
             end
-            Interface.setFont(DEFAULT_FONT_FAMILY)
-            Interface.setTextScale(DEFAULT_TEXT_SCALE)
+            Interface.setFont(TYPESET.familyDefault)
+            Interface.setTextScale(TYPESET.scaleDefault)
             win:markDirty()
             win:refreshAll()
         end)
@@ -5367,7 +5399,7 @@ end
 --
 -- Labels are matched in both the language they were written in and the language they
 -- are drawn in, so a translated build is searchable either way.
-local SEARCH_RESULTS = 7
+LAYOUT.searchResults = 7
 
 -- Pull a row into view inside whichever column it belongs to.
 local function scrollTo(row)
@@ -5575,7 +5607,7 @@ function Window:_buildSearch(parent)
                     hit.MouseEnter:Connect(function() tween(hit, 0.12, { BackgroundTransparency = 0.45 }, EASE_SOFT) end)
                     hit.MouseLeave:Connect(function() tween(hit, 0.16, { BackgroundTransparency = 1 }, EASE_SOFT) end)
                     hit.MouseButton1Click:Connect(function() jump(entry) end)
-                    if hits >= SEARCH_RESULTS then break end
+                    if hits >= LAYOUT.searchResults then break end
                 end
             end
         end
@@ -5625,8 +5657,8 @@ end
 --
 -- The resting position is remembered rather than assumed, because the window is
 -- draggable and its resting place is wherever it was last left.
-local WINDOW_IN = 0.32
-local WINDOW_OUT = 0.18
+MOTION.windowIn = 0.32
+MOTION.windowOut = 0.18
 
 function Window:toggle(show)
     local window = self.window
@@ -5652,7 +5684,7 @@ function Window:toggle(show)
     local target = show and 1 or 0
     local liftFrom = show and WINDOW_LIFT(resting) or window.Position
     local liftTo = show and resting or WINDOW_LIFT(resting)
-    local duration = show and WINDOW_IN or WINDOW_OUT
+    local duration = show and MOTION.windowIn or MOTION.windowOut
 
     if show then
         window.Visible = true
@@ -5712,7 +5744,7 @@ end
 -- instead of stepping.
 -- Long enough to read as a colour moving rather than a colour being replaced. A tenth
 -- of a second is six frames, which is short enough that the eye takes it as a step.
-local THEME_FADE = 0.22
+MOTION.theme = 0.22
 local themeFade = {}
 local themeFadeStop = nil
 
@@ -5752,7 +5784,7 @@ local function driveThemeFade(dt)
     local running = false
     paintersHeld = true
     for key, state in pairs(themeFade) do
-        state.t = math.min(state.t + dt / THEME_FADE, 1)
+        state.t = math.min(state.t + dt / MOTION.theme, 1)
         -- Cubic out: most of the distance early, the last of it gently, which is what
         -- makes a colour change read as one movement.
         local a = 1 - (1 - state.t) ^ 3
@@ -5983,6 +6015,99 @@ function Window:settingsTab(opts)
                 if entry.label == label then self:setLocale(entry.code) return end
             end
         end, { search = false })
+    end
+
+    -- Opacity, and it is part of the palette rather than a separate idea: every key carries
+    -- it as a fourth value. These two drive the fourth number on the two keys that make the
+    -- window itself see through, which is the only pair anyone reaches for.
+    if opts.opacity ~= false then
+        local card = page:card({
+            title = "Opacity",
+            icon = "droplet",
+            subtitle = "See through the window",
+            column = "left",
+        })
+        local function write(value)
+            for _, key in ipairs({ "background", "card" }) do
+                local rgb = self:getColor(key)
+                self:setColor(key, { rgb[1], rgb[2], rgb[3], value })
+            end
+        end
+        -- Held here rather than read back off the palette. getColor would do, but the slider
+        -- writes two keys and reading one of them back to find out where the slider is makes
+        -- the control depend on which of the two it happened to write last.
+        local shown = 1
+        card:slider("Window", 40, 100, function()
+            return math.floor(shown * 100 + 0.5)
+        end, function(percent)
+            shown = percent / 100
+            write(shown)
+        end, 0, function(value) return value .. "%" end)
+        -- refreshAll, because this writes the value the slider above reads. Without it the
+        -- window goes opaque and the control that says how opaque it is keeps its old number.
+        card:button("Opaque", function()
+            shown = 1
+            write(1)
+            self:refreshAll()
+        end)
+        card:divider()
+        card:button("Clear Recent Colours", function()
+            Interface.clearRecentColors()
+            self:refreshAll()
+        end)
+    end
+
+    -- One toggle per detached panel, and the card fills itself.
+    --
+    -- Which panels exist is not known here, and it cannot be: a script calls settingsTab
+    -- wherever it likes, and the worked example calls it before it builds its watermark and
+    -- its HUDs. So the card takes the panels that already exist and then stays open, and
+    -- overlayShell adds a row to it for every panel built afterwards. Either order gives the
+    -- same card, and a script does not have to know which order it used.
+    if opts.panels ~= false then
+        local card = page:card({
+            title = "Panels",
+            icon = "layout-dashboard",
+            subtitle = "Drag any panel to move it",
+            column = "right",
+        })
+        self._panelsCard = card
+        for name in pairs(self._overlays) do
+            self:_panelRow(name)
+        end
+    end
+
+    -- The clipboard carries exactly what a file carries, and it is how a setup actually gets
+    -- shared: a screenshot of a config is no use to anybody and neither is a file path on
+    -- somebody else's machine.
+    if opts.share ~= false then
+        local card = page:card({
+            title = "Share",
+            icon = "copy",
+            subtitle = "Through the clipboard",
+            column = "right",
+        })
+        card:button("Copy Config", function()
+            if self:exportConfig() then
+                self:notify({ title = "Config", text = "Copied to the clipboard", icon = "copy" })
+            else
+                self:notify({ title = "Config", text = "Could not read the config", icon = "x" })
+            end
+        end)
+        local pasted = ""
+        card:input("Paste", "paste a config here", function() return pasted end, function(value)
+            pasted = value
+        end)
+        card:button("Load Pasted", function()
+            if pasted == "" then return end
+            if self:importConfig(pasted) then
+                pasted = ""
+                self:refreshAll()
+                self:notify({ title = "Config", text = "Loaded", icon = "check" })
+            else
+                self:notify({ title = "Config", text = "That is not a config", icon = "x" })
+            end
+        end)
     end
 
     -- The type on a sub-page of its own, as one card.
@@ -6408,9 +6533,9 @@ end
 -- Both axes live in one Position, so every animation writes the full value: the
 -- entry slide, the shift upward and the exit all target the same property and
 -- the newest tween simply wins.
-local TOAST_WIDTH = 286
-local TOAST_GAP = 8
-local TOAST_MAX = 6
+LAYOUT.toastWidth = 286
+LAYOUT.toastGap = 8
+LAYOUT.toastMax = 6
 
 function Window:notify(opts)
     if type(opts) == "string" then opts = { title = opts } end
@@ -6420,7 +6545,7 @@ function Window:notify(opts)
         holder.Name = randomName()
         holder.AnchorPoint = Vector2.new(1, 1)
         holder.Position = UDim2.new(1, -18, 1, -18)
-        holder.Size = UDim2.new(0, TOAST_WIDTH, 1, -36)
+        holder.Size = UDim2.new(0, LAYOUT.toastWidth, 1, -36)
         holder.BackgroundTransparency = 1
         holder.ZIndex = 200
         holder.Parent = self.screen
@@ -6431,12 +6556,12 @@ function Window:notify(opts)
     local stack = self._toastStack
     local hasText = opts.text ~= nil and opts.text ~= ""
     local height = hasText and 58 or 42
-    local offscreen = TOAST_WIDTH + 48
+    local offscreen = LAYOUT.toastWidth + 48
 
     local toast = newGroup()
     toast.Name = randomName()
     toast.AnchorPoint = Vector2.new(1, 1)
-    toast.Size = UDim2.new(0, TOAST_WIDTH, 0, height)
+    toast.Size = UDim2.new(0, LAYOUT.toastWidth, 0, height)
     toast.Position = UDim2.new(1, offscreen, 1, 0)
     toast.BorderSizePixel = 0
     toast.ZIndex = 200
@@ -6540,7 +6665,7 @@ function Window:notify(opts)
             elseif not animate then
                 item.frame.Position = target
             end
-            y += item.height + TOAST_GAP
+            y += item.height + LAYOUT.toastGap
         end
     end
 
@@ -6569,7 +6694,7 @@ function Window:notify(opts)
     hit.MouseButton1Click:Connect(dismiss)
 
     -- A run of toasts should not climb off the top of the screen.
-    while #stack > TOAST_MAX do
+    while #stack > LAYOUT.toastMax do
         local oldest = stack[#stack]
         if oldest and oldest.dismiss then oldest.dismiss() else break end
     end
@@ -6607,6 +6732,10 @@ local function overlayShell(self, name, opts)
         frame.Position = UDim2.new(saved[1], saved[2], saved[3], saved[4])
     end
     self._overlays[name] = frame
+    self._panelNames[name] = opts.label
+    -- A row on the settings page for it, if that page has already been built. See
+    -- Window:_panelRow for why this is pushed from here rather than pulled from there.
+    if self._panelsCard then self:_panelRow(name) end
 
     -- Where the panel belongs, held here rather than read back off the frame.
     --
@@ -6721,6 +6850,38 @@ local function overlayShell(self, name, opts)
     return frame
 end
 
+-- One row on the settings page's Panels card, for the panel registered under this name.
+--
+-- Called from two places and it has to be safe from both: once per existing panel when the
+-- card is built, and once per panel built after that. Nothing happens when there is no card,
+-- which is the case for a script that dropped the Panels card or never asked for a settings
+-- page at all.
+--
+-- The label comes from whoever built the panel, because the key it is saved under is not a
+-- label: a HUD is saved under "hud:session" so that a HUD and the watermark cannot collide in
+-- the config. A panel built by hand through a route that names no label falls back to its key
+-- with a capital on the front, which reads correctly for a one word key. Either way it goes
+-- through the phrase table like every other label, so a translation renames the row without
+-- the caller doing anything.
+function Window:_panelRow(name)
+    local card = self._panelsCard
+    if not card then return end
+    if self._panelRows and self._panelRows[name] then return end
+    self._panelRows = self._panelRows or {}
+    self._panelRows[name] = true
+    local label = self._panelNames[name]
+    if not label or label == "" then
+        label = string.upper(string.sub(name, 1, 1)) .. string.sub(name, 2)
+    end
+    card:toggle(label, function()
+        local frame = self._overlays[name]
+        return frame ~= nil and frame.Parent ~= nil and frame.Visible
+    end, function(value)
+        local frame = self._overlays[name]
+        if frame then self:showOverlay(frame, value) end
+    end)
+end
+
 -- Show or hide any detached panel with the shell's own fade. Frames the library
 -- did not build fall back to a plain visibility flip.
 function Window:showOverlay(frame, visible, instant)
@@ -6796,6 +6957,7 @@ function Window:watermark(opts)
     local wm = overlayShell(self, "watermark", {
         position = opts.position or UDim2.new(0, 16, 0, 16),
         size = UDim2.new(0, 0, 0, 34),
+        label = "Watermark",
     })
     padding(wm, nil, { left = 12, right = 12 })
     local lay = listLayout(wm, 9, Enum.FillDirection.Horizontal)
@@ -6886,6 +7048,7 @@ function Window:keybindList(opts)
         position = opts.position or UDim2.new(0, 16, 0, 70),
         size = UDim2.new(0, width, 0, 0),
         autoSize = Enum.AutomaticSize.Y,
+        label = "Keybinds",
     })
     self._keybindPanel = panel
 
@@ -7377,6 +7540,9 @@ function Window:hud(opts)
         autoSize = Enum.AutomaticSize.Y,
         radius = opts.radius or 8,
         visible = opts.visible,
+        -- The title, because that is what the panel says on screen and a row that names it
+        -- something else is a row about a different panel as far as anyone reading it knows.
+        label = opts.title,
     })
 
     local body = newInstance("Frame")
@@ -7442,13 +7608,13 @@ end
 -- than zero. The run count is deliberately not counted here: a number the library kept
 -- would live on this machine, which makes it a number the user can edit, and a run count
 -- that can be edited is not a run count. It is the server's to report or nobody's.
-local STATUS_H = 22
-local STATUS_GAP = 8
+LAYOUT.statusH = 22
+LAYOUT.statusGap = 8
 -- What the page area gives up to the top of the content and to its own bottom margin.
 -- Named because the status bar has to take the same numbers off the bottom and two copies
 -- of a layout constant is how a bar ends up overlapping the cards.
-local PAGES_TOP = 56
-local PAGES_INSET = 72
+LAYOUT.pagesTop = 56
+LAYOUT.pagesInset = 72
 
 -- A duration as the largest useful units. Days appear only when there are any, so a key
 -- with an hour left reads as an hour rather than as "0d 01:00:00".
@@ -7468,7 +7634,7 @@ function Window:statusBar(opts)
         self._status = nil
     end
     if opts.enabled == false then
-        if self.pages then self.pages.Size = UDim2.new(1, -48, 1, -PAGES_INSET) end
+        if self.pages then self.pages.Size = UDim2.new(1, -48, 1, -LAYOUT.pagesInset) end
         return nil
     end
     local show = opts.show or {}
@@ -7477,7 +7643,7 @@ function Window:statusBar(opts)
     bar.Name = randomName()
     bar.AnchorPoint = Vector2.new(0, 1)
     bar.Position = UDim2.new(0, 24, 1, -10)
-    bar.Size = UDim2.new(1, -48, 0, STATUS_H)
+    bar.Size = UDim2.new(1, -48, 0, LAYOUT.statusH)
     bar.BackgroundTransparency = 1
     bar.BorderSizePixel = 0
     bar.Parent = self._content
@@ -7611,7 +7777,7 @@ function Window:statusBar(opts)
     -- The page area gives up the bar's height plus the gap above it, so a card column
     -- stops where the bar starts instead of scrolling under it.
     if self.pages then
-        self.pages.Size = UDim2.new(1, -48, 1, -(PAGES_INSET + STATUS_H + STATUS_GAP))
+        self.pages.Size = UDim2.new(1, -48, 1, -(LAYOUT.pagesInset + LAYOUT.statusH + LAYOUT.statusGap))
     end
     return bar
 end
@@ -7642,6 +7808,10 @@ function Interface.new(opts)
         -- listeners this window owns, the detached overlays by config name, the
         -- fade helper of each of them and the HUDs built through win:hud.
         _panels = {}, _conns = {}, _overlays = {}, _overlayFade = {}, _overlayRest = {}, _huds = {},
+        -- What to call each of those overlays on the settings page. The key it is saved
+        -- under is not it: a HUD is saved under "hud:session" so that two panels cannot
+        -- collide in the config, and "Hud:session" is not a row label.
+        _panelNames = {},
         -- Index of every named control, filled while the interface is built and read
         -- by the search field in the sidebar.
         _search = {},
@@ -7822,8 +7992,8 @@ function Interface.new(opts)
     self.subtitle = subtitle
 
     local pages = Instance.new("Frame")
-    pages.Position = UDim2.new(0, 24, 0, PAGES_TOP)
-    pages.Size = UDim2.new(1, -48, 1, -PAGES_INSET)
+    pages.Position = UDim2.new(0, 24, 0, LAYOUT.pagesTop)
+    pages.Size = UDim2.new(1, -48, 1, -LAYOUT.pagesInset)
     pages.BackgroundTransparency = 1
     -- Clipped, so a page changing travels in and out behind the edge of the content
     -- area instead of sliding across the window's margin. It is what turns the
