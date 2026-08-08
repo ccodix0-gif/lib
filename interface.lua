@@ -6974,7 +6974,10 @@ function Window:getAutoLoad()
     pcall(function()
         if type(isfile) == "function" and type(readfile) == "function" and isfile(autoLoadPath()) then
             local s = readfile(autoLoadPath())
-            if type(s) == "string" and s ~= "" then out = s end
+            if type(s) == "string" then
+                s = s:gsub("^%s+", ""):gsub("%s+$", "")
+                if s ~= "" then out = s end
+            end
         end
     end)
     return out
