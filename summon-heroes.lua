@@ -1951,6 +1951,68 @@ local function skipCutscenes()
     clickScreenSkip()
 end
 
+-- Gear machine: skip LobbyMap gauge anim (GearSummonNew no-ops if gauge missing).
+local gearSummonHooked = false
+local function hookFastGearSummon()
+    if gearSummonHooked then return true end
+    local Gui
+    local ok = pcall(function()
+        Gui = require(ReplicatedStorage.Systems.Gui)
+    end)
+    if not ok or type(Gui) ~= "table" or type(Gui.Get) ~= "function" then return false end
+    local seq = Gui:Get("GearSummonSequence")
+    if type(seq) ~= "table" or type(seq.Open) ~= "function" then return false end
+    gearSummonHooked = true
+    local oldOpen = seq.Open
+    seq.Open = function(self, items, rarity)
+        if F.fastGearSummon == false then
+            return oldOpen(self, items, rarity)
+        end
+        local gauge, gParent, gName
+        pcall(function()
+            local lobby = Workspace:FindFirstChild("LobbyMap")
+            gauge = lobby and lobby:FindFirstChild("GearSummonGauge")
+            if gauge then
+                gParent = gauge.Parent
+                gName = gauge.Name
+                gauge.Parent = nil
+            end
+        end)
+        local okOpen, a, b, c, d = pcall(oldOpen, self, items, rarity)
+        pcall(function()
+            if gauge and gParent then
+                gauge.Name = gName or "GearSummonGauge"
+                gauge.Parent = gParent
+            end
+        end)
+        if F.fastGearRewards == true then
+            task.defer(function()
+                pcall(function()
+                    local rew = Gui:Get("RewardsObtained")
+                    if not (rew and rew.IsOpen and rew:IsOpen()) then return end
+                    task.wait(0.12)
+                    if rew.IsOpen and rew:IsOpen() and rew.Close then
+                        rew:Close()
+                    end
+                end)
+            end)
+        end
+        if not okOpen then
+            warn("[SH] fast gear Open", a)
+            return
+        end
+        return a, b, c, d
+    end
+    return true
+end
+pcall(hookFastGearSummon)
+task.defer(function()
+    for _ = 1, 20 do
+        if hookFastGearSummon() then break end
+        task.wait(0.5)
+    end
+end)
+
 local function chestDisplayName(part)
     if not part then return "Chest" end
     local prompt = chestPrompt(part)
@@ -3166,55 +3228,110 @@ local function equipStrongestUnits()
     pcall(function() playerLv = p.Level.Value end)
     local Inv = getInventoryModule()
     local equipped = p:FindFirstChild("Equipped")
-    local inv = p:FindFirstChild("Inventory") and p.Inventory:FindFirstChild("Units")
-    if not equipped or not inv then
+    local invUnits = p:FindFirstChild("Inventory") and p.Inventory:FindFirstChild("Units")
+    if not equipped or not invUnits then
         notify("Loadout", "No inventory", "alert-triangle")
         return
     end
 
+    local function setEquipped(unit, on)
+        if not unit then return false end
+        local ok = false
+        if Inv and Inv.SetUnitEquipped then
+            ok = pcall(function() Inv:SetUnitEquipped(LP, unit, on) end)
+        end
+        if not ok then
+            ok = fire("SetUnitEquipped", unit, on) == true
+        end
+        return ok
+    end
+
+    -- Same pool as in-game Equip Best (inventory + equipped)
     local pool = {}
-    for _, u in ipairs(equipped:GetChildren()) do table.insert(pool, u) end
-    for _, u in ipairs(inv:GetChildren()) do table.insert(pool, u) end
+    for _, u in ipairs(invUnits:GetChildren()) do
+        if not u:GetAttribute("Busy") then
+            local lv = tonumber(u:GetAttribute("Level")) or 1
+            if lv <= playerLv then pool[#pool + 1] = u end
+        end
+    end
+    for _, u in ipairs(equipped:GetChildren()) do
+        if not u:GetAttribute("Busy") then
+            pool[#pool + 1] = u
+        end
+    end
 
     local scored = {}
     for _, u in ipairs(pool) do
-        if u:GetAttribute("Busy") then continue end
-        local lv = tonumber(u:GetAttribute("Level")) or 1
-        if lv > playerLv then continue end
         scored[#scored + 1] = { u = u, pow = ownedUnitPower(u) }
     end
     table.sort(scored, function(a, b) return a.pow > b.pow end)
 
-    -- Unequip current
-    for _, u in ipairs(equipped:GetChildren()) do
-        if Inv then
-            pcall(function() Inv:SetUnitEquipped(LP, u, false) end)
-        else
-            fire("SetUnitEquipped", u, false)
+    local maxEq = 3
+    pcall(function()
+        if Inv and Inv.GetMaxEquippedUnits then
+            maxEq = math.clamp(tonumber(Inv:GetMaxEquippedUnits()) or 3, 1, 3)
         end
-        task.wait(0.08)
-    end
+    end)
 
+    -- Want-set like EquipBestClicked (don't unequip-all first — Parent only updates after server)
+    local want = {}
     local names = {}
-    local n = 0
-    for _, e in ipairs(scored) do
-        if n >= 3 then break end
-        if e.u.Parent == equipped then
-            -- already equipped somehow
-        else
-            if Inv then
-                pcall(function() Inv:SetUnitEquipped(LP, e.u, true) end)
-            else
-                fire("SetUnitEquipped", e.u, true)
-            end
-            task.wait(0.12)
-        end
-        n = n + 1
+    for i = 1, math.min(maxEq, #scored) do
+        local e = scored[i]
+        want[e.u] = true
         local data = UNIT_DATA and UNIT_DATA[e.u.Name]
         local dn = data and data.DisplayName or e.u.Name
         names[#names + 1] = string.format("%s (%.0f)", dn, e.pow)
     end
-    notify("Loadout", n > 0 and ("Equipped: " .. table.concat(names, " · ")) or "No eligible units", "check")
+    if #names == 0 then
+        notify("Loadout", "No eligible units", "alert-triangle")
+        return
+    end
+
+    for _, u in ipairs(equipped:GetChildren()) do
+        if not want[u] then
+            setEquipped(u, false)
+            task.wait(0.05)
+        end
+    end
+    local deadline = tick() + 2
+    while tick() < deadline do
+        local blocking = 0
+        for _, u in ipairs(equipped:GetChildren()) do
+            if not want[u] then blocking += 1 end
+        end
+        if blocking == 0 then break end
+        task.wait(0.05)
+    end
+
+    for u in pairs(want) do
+        if u.Parent == invUnits then
+            setEquipped(u, true)
+            task.wait(0.08)
+        end
+    end
+
+    deadline = tick() + 2
+    while tick() < deadline do
+        local n = 0
+        for _, u in ipairs(equipped:GetChildren()) do
+            if want[u] then n += 1 end
+        end
+        if n >= #names then break end
+        for u in pairs(want) do
+            if u.Parent == invUnits then setEquipped(u, true) end
+        end
+        task.wait(0.1)
+    end
+
+    local got = {}
+    for _, u in ipairs(equipped:GetChildren()) do
+        if want[u] then
+            local data = UNIT_DATA and UNIT_DATA[u.Name]
+            got[#got + 1] = (data and data.DisplayName) or u.Name
+        end
+    end
+    notify("Loadout", #got > 0 and ("Equipped: " .. table.concat(got, " · ")) or ("Tried: " .. table.concat(names, " · ")), #got > 0 and "check" or "alert-triangle")
 end
 
 -- ============================================================ PVP: hop to weakest public servers
@@ -3228,6 +3345,43 @@ local function resolvePvpPlaceId()
     if id and id > 0 then return id end
     if PLACE_PVP[game.PlaceId] then return game.PlaceId end
     return PVP_PLACE_LIVE
+end
+
+local function findTeleportQueue(placeName)
+    local best, bestDist = nil, math.huge
+    local root = hrp()
+    local pos = root and root.Position
+    pcall(function()
+        for _, part in ipairs(CollectionService:GetTagged("TeleportQueue")) do
+            if part:IsDescendantOf(Workspace) and part:GetAttribute("PlaceName") == placeName then
+                if not pos then
+                    best = part
+                    return
+                end
+                local d = (part.Position - pos).Magnitude
+                if d < bestDist then
+                    best, bestDist = part, d
+                end
+            end
+        end
+    end)
+    return best
+end
+
+local function standOnTeleportQueue(placeName)
+    local pad = findTeleportQueue(placeName)
+    if not pad then return false, "No " .. tostring(placeName) .. " TeleportQueue in this place" end
+    local root = hrp()
+    if not root then return false, "No character" end
+    local h = hum()
+    if h then pcall(function() h.Sit = false end) end
+    local cf = pad.CFrame + Vector3.new(0, pad.Size.Y * 0.5 + 3, 0)
+    root.CFrame = cf
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    return true, pad
 end
 
 local function httpGetJson(url)
@@ -3262,7 +3416,7 @@ local function pickWeakestPvpServer(placeId, maxPlaying)
             local playing = tonumber(s.playing) or 99
             local maxP = tonumber(s.maxPlayers) or 8
             local job = s.id
-            if type(job) == "string" and playing < bestN and playing < maxP and playing <= maxPlaying then
+            if type(job) == "string" and job ~= game.JobId and playing < bestN and playing < maxP and playing <= maxPlaying then
                 best, bestN = job, playing
             end
         end
@@ -3272,44 +3426,87 @@ local function pickWeakestPvpServer(placeId, maxPlaying)
     return best, bestN
 end
 
+local function tryClientTeleport(placeId, jobId)
+    local ts = game:GetService("TeleportService")
+    local ok = pcall(function()
+        if jobId then
+            ts:TeleportToPlaceInstance(placeId, jobId, LP)
+        else
+            ts:Teleport(placeId, LP)
+        end
+    end)
+    if ok then return true end
+    return pcall(function()
+        if jobId then
+            local opt = Instance.new("TeleportOptions")
+            opt.ServerInstanceId = jobId
+            ts:TeleportAsync(placeId, { LP }, opt)
+        else
+            ts:TeleportAsync(placeId, { LP })
+        end
+    end)
+end
+
 local function hopWeakPvpServer()
     task.spawn(function()
-        pcall(armTeleportReload, true)
+        pcall(armTeleportReload)
         local placeId = resolvePvpPlaceId()
         local maxPlaying = tonumber(F.pvpWeakMaxPlayers) or 4
+
+        -- Client TeleportService is blocked ("no valid teleport token"). Enter PvP via game pad.
+        if not PLACE_PVP[game.PlaceId] then
+            local okPad, why = standOnTeleportQueue("PVP")
+            if not okPad then
+                notify("PvP", tostring(why), "alert-triangle")
+                return
+            end
+            notify("PvP", "On PVP pad — holding 6s for server countdown", "map-pin")
+            for _ = 1, 6 do
+                task.wait(1)
+                if PLACE_PVP[game.PlaceId] then return end
+                standOnTeleportQueue("PVP")
+            end
+            return
+        end
+
         notify("PvP Hop", "Scanning servers (≤" .. tostring(maxPlaying) .. " players)…", "user")
         local job, n = pickWeakestPvpServer(placeId, maxPlaying)
         if not job then
-            -- Widen search once
             job, n = pickWeakestPvpServer(placeId, math.max(maxPlaying, 8))
         end
         if not job then
-            notify("PvP Hop", "No open servers found — teleporting to PvP place", "alert-triangle")
-            pcall(armTeleportReload, true)
-            pcall(function()
-                game:GetService("TeleportService"):Teleport(placeId, LP)
-            end)
+            notify("PvP Hop", "No weaker public server found", "alert-triangle")
             return
         end
-        notify("PvP Hop", string.format("Joining %d-player server…", n), "check")
-        pcall(armTeleportReload, true)
-        local ok, err = pcall(function()
-            game:GetService("TeleportService"):TeleportToPlaceInstance(placeId, job, LP)
-        end)
-        if not ok then
-            notify("PvP Hop", "Teleport failed: " .. tostring(err), "alert-triangle")
+        notify("PvP Hop", string.format("Trying %d-player server…", n), "check")
+        if not tryClientTeleport(placeId, job) then
+            notify("PvP Hop", "Blocked: no valid teleport token (Roblox requires server teleport)", "alert-triangle")
         end
     end)
 end
 
 local function teleportToPvpLobby()
     task.spawn(function()
-        pcall(armTeleportReload, true)
-        local placeId = resolvePvpPlaceId()
-        notify("PvP", "Teleporting to arena place " .. tostring(placeId), "map-pin")
-        pcall(function()
-            game:GetService("TeleportService"):Teleport(placeId, LP)
-        end)
+        pcall(armTeleportReload)
+        if PLACE_PVP[game.PlaceId] then
+            notify("PvP", "Already in a PvP place", "map-pin")
+            return
+        end
+        local okPad, why = standOnTeleportQueue("PVP")
+        if not okPad then
+            local placeId = resolvePvpPlaceId()
+            notify("PvP", "No pad (" .. tostring(why) .. ") — trying client Teleport…", "alert-triangle")
+            if not tryClientTeleport(placeId, nil) then
+                notify("PvP", "Teleport blocked (no token). Use the PVP pad in lobby.", "alert-triangle")
+            end
+            return
+        end
+        notify("PvP", "On PVP pad — holding 6s for server countdown", "map-pin")
+        for _ = 1, 6 do
+            task.wait(1)
+            if PLACE_PVP[game.PlaceId] then return end
+            standOnTeleportQueue("PVP")
+        end
     end)
 end
 
@@ -4271,6 +4468,15 @@ end
 do -- Gear / Shop
 local tGear = win:tab({ name = "Gear", icon = "diamond", group = "Main", subtitle = "Gear sell + PvP shop" })
     local s = tGear:sub("Gear")
+    local gFast = s:card({ title = "Gear Machine", icon = "zap", column = "right" })
+    tog(gFast, "Fast open (skip gauge anim)", "fastGearSummon", true)
+    tog(gFast, "Auto-close rewards popup", "fastGearRewards", false)
+    gFast:label("Skips LobbyMap stick/gauge cinematic. Rewards still grant normally.")
+    gFast:button("Re-hook now", function()
+        gearSummonHooked = false
+        notify("Gear", hookFastGearSummon() and "Hooked" or "Gui not ready", "zap")
+    end)
+
     local g2 = s:card({ title = "Auto Gear Sell", icon = "trash", column = "left" })
     tog(g2, "Sync to game settings", "syncAutoGearSell", false)
     -- RarityNames: 1=Common 2=Uncommon 3=Rare 4=Epic — AutoGearSell uses 2/3/4
@@ -4573,13 +4779,13 @@ local tWorld = win:tab({ name = "World", icon = "map-pin", group = "Player", sub
     pc:label("Scans Roblox public servers for this PvP place, joins the emptiest ≤ max.")
     pc:button("Hop to weakest PvP server", LOAD.hopWeakPvpServer)
     pc:button("Teleport to PvP place", LOAD.teleportToPvpLobby)
-    pc:label("Arms teleport-reload before hop. Same PlaceId hops now re-exec the script.")
+    pc:label("Uses lobby PVP TeleportQueue (server TP). Client Teleport is token-blocked by Roblox.")
 
     local pl = sPvp:card({ title = "Loadout", icon = "user", column = "right" })
     pl:button("Equip strongest 3 units", function()
         task.spawn(LOAD.equipStrongestUnits)
     end)
-    pl:label("Uses live Units:GetUnitPower (lv/stars/trait/rune/gear). Also on Farm Stats.")
+    pl:label("Same flow as in-game Equip Best via SetUnitEquipped.")
 
     local sp = s:card({ title = "SpawnItem", icon = "alert-triangle", column = "right" })
     win:flag("spawnItemName", "Coin")
