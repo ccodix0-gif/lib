@@ -49,13 +49,82 @@ do
 end
 
 -- Prevent stacking a million copies (same-session re-exec / stacked queue_on_teleport)
+local function wipeShGuis()
+    local function wipeIn(parent)
+        if not parent then return end
+        for _, c in ipairs(parent:GetChildren()) do
+            if c:IsA("ScreenGui") then
+                local n = c.Name
+                local ours = n == "SH_ESP" or n == "SH_HUD" or n == "NewReality" or n == "NewRealityWindow"
+                    or c:GetAttribute("SH_UI") == true
+                if ours then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+        end
+    end
+    pcall(function()
+        local list = genv.SH_Screens
+        if type(list) == "table" then
+            for _, s in ipairs(list) do
+                pcall(function() if s then s:Destroy() end end)
+            end
+        end
+        genv.SH_Screens = {}
+    end)
+    pcall(function() wipeIn(game:GetService("CoreGui")) end)
+    pcall(function() if gethui then wipeIn(gethui()) end end)
+    pcall(function()
+        local lp = game:GetService("Players").LocalPlayer
+        if lp then wipeIn(lp:FindFirstChild("PlayerGui")) end
+    end)
+    pcall(function()
+        local units = workspace:FindFirstChild("Units")
+        if units then
+            for _, m in ipairs(units:GetDescendants()) do
+                if m:IsA("Highlight") and (m.Name == "SH_HL" or m.Name == "SH_ChestHL") then
+                    m:Destroy()
+                end
+            end
+        end
+    end)
+end
+
 do
+    local fromTp = genv.SH_FromTeleport == true
+    genv.SH_FromTeleport = nil
+
+    -- Already running / mid-boot on this place (stacked queue copies).
+    if fromTp and genv.SH_BootPlace == game.PlaceId then
+        if genv.SH_Alive == true or genv.SH_Booting == true then
+            return
+        end
+    end
+
     local token = tostring(os.clock()) .. "_" .. tostring(math.random(1, 1e9))
-    if genv.SH_Alive and genv.SH_Unload then
+    local now = os.clock()
+    genv.SH_BootClaim = token
+    genv.SH_Booting = true
+    genv.SH_LoadLock = now
+    genv.SH_BootPlace = game.PlaceId
+    task.wait(0.08)
+    if genv.SH_BootClaim ~= token then
+        return
+    end
+
+    -- Manual re-exec / hop: tear down leftovers so UIs never stack.
+    if genv.SH_Unload then
         pcall(genv.SH_Unload)
     end
+    wipeShGuis()
+
+    -- Queue was consumed by this hop — must re-arm at end of boot.
+    genv.SH_TeleportArmed = nil
+    genv.SH_ArmedUrl = nil
+
     genv.SH_Session = token
-    genv.SH_Alive = true
+    genv.SH_BootAt = os.clock()
+    genv.SH_Alive = false
 end
 
 -- The library has a file name of its own so this cannot accidentally download one of the
@@ -93,6 +162,9 @@ end
 
 local UI, loadErr = loadLibrary()
 if not UI then
+    genv.SH_LoadLock = nil
+    genv.SH_Booting = false
+    genv.SH_Alive = false
     warn("[SH] " .. tostring(loadErr))
     return
 end
@@ -127,31 +199,16 @@ local PLACE_PVP = {
 local ESP_FONT = Font.new("rbxasset://fonts/families/Arial.json", Enum.FontWeight.Heavy, Enum.FontStyle.Normal)
 
 -- Kill leftover GUIs / highlights from a previous stacked run
-pcall(function()
-    local parent = (gethui and gethui()) or game:GetService("CoreGui")
-    for _, name in ipairs({ "SH_ESP", "SH_HUD", "NewReality", "NewRealityWindow" }) do
-        local old = parent:FindFirstChild(name)
-        if old then old:Destroy() end
-    end
-    local pg = LP:FindFirstChild("PlayerGui")
-    if pg then
-        for _, name in ipairs({ "SH_ESP", "SH_HUD" }) do
-            local old = pg:FindFirstChild(name)
-            if old then old:Destroy() end
-        end
-    end
-    -- Remove legacy Highlights that were parented into Units (could break units)
-    local units = Workspace:FindFirstChild("Units")
-    if units then
-        for _, m in ipairs(units:GetDescendants()) do
-            if m:IsA("Highlight") and (m.Name == "SH_HL" or m.Name == "SH_ChestHL") then
-                m:Destroy()
-            end
-        end
-    end
-end)
+pcall(wipeShGuis)
 
 local win = UI.new({ icon = "logo", toggleKey = Enum.KeyCode.RightShift })
+pcall(function()
+    if win and win.screen then
+        win.screen:SetAttribute("SH_UI", true)
+        genv.SH_Screens = genv.SH_Screens or {}
+        table.insert(genv.SH_Screens, win.screen)
+    end
+end)
 local wm, kb
 local F = win.flags
 
@@ -159,6 +216,7 @@ local espGui = Instance.new("ScreenGui")
 espGui.Name = "SH_ESP"
 espGui.ResetOnSpawn = false
 espGui.IgnoreGuiInset = true
+pcall(function() espGui:SetAttribute("SH_UI", true) end)
 pcall(function() espGui.DisplayOrder = 20 end)
 pcall(function() espGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
 if not espGui.Parent then espGui.Parent = LP:WaitForChild("PlayerGui") end
@@ -168,6 +226,7 @@ hudGui.Name = "SH_HUD"
 hudGui.ResetOnSpawn = false
 hudGui.IgnoreGuiInset = true
 hudGui.Enabled = true
+pcall(function() hudGui:SetAttribute("SH_UI", true) end)
 pcall(function() hudGui.DisplayOrder = 1e9 end)
 pcall(function() hudGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
 -- PlayerGui first — most reliable for on-screen HUD
@@ -369,7 +428,13 @@ local function saveScriptUrl(url)
 end
 
 local function armTeleportReload(force)
-    if teleportArmed and not force then return true end
+    -- Most executors APPEND queue_on_teleport. Never enqueue the same URL twice.
+    local url = resolveScriptUrl()
+    if not url then return false end
+    if (teleportArmed or genv.SH_TeleportArmed == true) and genv.SH_ArmedUrl == url then
+        teleportArmed = true
+        return true
+    end
     local q
     pcall(function()
         q = queue_on_teleport
@@ -381,28 +446,19 @@ local function armTeleportReload(force)
     end)
     if type(q) ~= "function" then return false end
 
-    local url = resolveScriptUrl()
-    if not url then return false end
     saveScriptUrl(url)
 
-    -- Unique per arm so only true duplicate queue fires are skipped — NEVER block
-    -- a real hop because arm()/5s re-arm stamped SH_BootAt (that broke same-PlaceId teleports).
-    local queueGen = string.format("%s_%d", tostring(os.clock()), math.random(1, 1e9))
-
+    -- Minimal stub: main script owns wipe/lock. Early-out if already alive here.
     local body = string.format([[
 repeat task.wait() until game:IsLoaded()
 local Players = game:GetService("Players")
 repeat task.wait() until Players.LocalPlayer
 task.wait(1.25)
 local g = (getgenv and getgenv()) or _G
-local gen = %q
--- Only skip identical stacked queue payloads, not "armed recently"
-if g.SH_LastQueueGen == gen then return end
-g.SH_LastQueueGen = gen
-if g.SH_Unload then pcall(g.SH_Unload) end
-g.SH_BootPlace = game.PlaceId
-g.SH_BootAt = os.clock()
-g.SH_Alive = false
+if g.SH_BootPlace == game.PlaceId and (g.SH_Alive == true or g.SH_Booting == true) then
+    return
+end
+g.SH_FromTeleport = true
 local url = %q
 pcall(function()
     if type(readfile) == "function" and type(isfile) == "function"
@@ -445,54 +501,33 @@ for _ = 1, 6 do
 end
 if not src then
     warn("[SH] teleport reload: HttpGet failed for " .. tostring(url))
-    g.SH_BootPlace = nil
+    g.SH_FromTeleport = nil
     return
 end
 local chunk, err = loadstring(src)
 if not chunk then
     warn("[SH] teleport reload compile", err)
-    g.SH_BootPlace = nil
+    g.SH_FromTeleport = nil
     return
 end
 local ok2, err2 = pcall(chunk)
 if not ok2 then
     warn("[SH] teleport reload fail", err2)
-    g.SH_BootPlace = nil
+    g.SH_FromTeleport = nil
+    g.SH_Booting = false
+    g.SH_LoadLock = nil
 end
-]], queueGen, url)
+]], url)
     local okq = pcall(q, body)
     if okq then
         teleportArmed = true
         genv.SH_TeleportArmed = true
-        -- Do NOT stamp SH_BootAt here — that blocked same-PlaceId hops for 4s.
+        genv.SH_ArmedUrl = url
     end
     return okq == true
 end
 
--- Arm once at start; re-arm when a place teleport starts; keep queue fresh
-pcall(function()
-    LP.OnTeleport:Connect(function(state)
-        if state == Enum.TeleportState.Started
-            or state == Enum.TeleportState.RequestedFromServer
-            or state == Enum.TeleportState.WaitingForServer
-            or state == Enum.TeleportState.InProgress then
-            teleportArmed = false
-            pcall(armTeleportReload, true)
-        end
-    end)
-end)
-pcall(function()
-    local ts = game:GetService("TeleportService")
-    if ts.LocalPlayerArrivedFromTeleport then
-        ts.LocalPlayerArrivedFromTeleport:Connect(function()
-            -- Arrived on this place without queue? leave a hint for next hop
-            task.defer(function()
-                teleportArmed = false
-                pcall(armTeleportReload, true)
-            end)
-        end)
-    end
-end)
+-- Do NOT re-arm on every teleport state — that stacks queue copies.
 
 -- Farm stats: memory only (genv across teleport). No farm.json on disk.
 local lastFarmSaveAt = 0
@@ -535,13 +570,18 @@ genv.SH_Unload = function()
     genv.SH_Alive = false
     genv.SH_BootPlace = nil
     genv.SH_BootAt = nil
+    -- Keep SH_TeleportArmed / SH_ArmedUrl — queue already set for next hop
     pcall(flushFarmDisk)
-    -- Do not auto-save HUD layout on unload — only Settings → Save HUD positions.
     pcall(function()
-        if win and win.screen then win.screen:Destroy() end
+        if win and win.unload then
+            win:unload()
+        elseif win and win.screen then
+            win.screen:Destroy()
+        end
     end)
     pcall(function() if espGui then espGui:Destroy() end end)
     pcall(function() if hudGui then hudGui:Destroy() end end)
+    pcall(wipeShGuis)
     pcall(function() RunService:UnbindFromRenderStep("SH_Camera") end)
 end
 
@@ -2702,10 +2742,8 @@ end, 1.5)
 
 loop(function() return F.towerBot == true end, towerBotTick, 0.5)
 
--- Keep teleport queue armed (executors often consume it after one hop)
-loop(function() return resolveScriptUrl() ~= nil end, function()
-    pcall(armTeleportReload, true)
-end, 5)
+-- Keep teleport queue armed once (identical URL — never re-queue / never stack)
+-- (periodic re-arm removed: executors append queue_on_teleport)
 
 -- ============================================================ PVP SHOP AUTO-BUY (RotatingShops PvPShop)
 -- Never yield inside Heartbeat loop — that stacked overlapping buy passes and lagged the game.
@@ -4584,11 +4622,18 @@ do
         end
         win:markDirty()
     end)
-    reloadCard:label("URL → NewReality/SummonHeroes/loader-url.txt. Re-arms every 5s + before teleports.")
+    reloadCard:label("URL → NewReality/SummonHeroes/loader-url.txt. Arms once (no stack).")
     reloadCard:label("Teleport only — cold join needs Autoexec / manual run. Set URL → Arm once.")
     reloadCard:button("Arm Teleport Reload", function()
         if F.scriptUrl and #F.scriptUrl > 8 then
             saveScriptUrl(F.scriptUrl)
+        end
+        -- Allow re-queue only when URL changed (clears armed marker first)
+        local url = resolveScriptUrl()
+        if url and genv.SH_ArmedUrl ~= url then
+            teleportArmed = false
+            genv.SH_TeleportArmed = nil
+            genv.SH_ArmedUrl = nil
         end
         local ok2 = armTeleportReload(true)
         local why = "Set Loader URL first"
@@ -4953,6 +4998,10 @@ end -- __SH_UI__
 do
     local okUi, errUi = pcall(__SH_UI__)
     if not okUi then
+        genv.SH_Booting = false
+        genv.SH_LoadLock = nil
+        genv.SH_Alive = false
+        genv.SH_BootPlace = nil
         -- warn may be muted by game noise filter — always toast too
         pcall(function()
             warn("[SH] UI build failed: " .. tostring(errUi))
@@ -4967,8 +5016,14 @@ do
                 })
             end
         end)
+        return
     end
 end
 
+genv.SH_Alive = true
+genv.SH_BootPlace = game.PlaceId
+genv.SH_BootAt = os.clock()
+genv.SH_Booting = false
+genv.SH_LoadLock = nil
 end -- __SH_BOOT__
 __SH_BOOT__()
