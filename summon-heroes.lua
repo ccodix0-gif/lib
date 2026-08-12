@@ -1852,9 +1852,35 @@ local function isRoundEndGuiVisible()
 end
 
 local function isRoundEndOpen()
-    if ReplicatedStorage:GetAttribute("RoundEndTimer") ~= nil then return true end
-    if ReplicatedStorage:GetAttribute("RoundEndType") ~= nil then return true end
-    return isRoundEndGuiVisible()
+    -- GUI / active countdown only. RoundEndType alone can linger after a vote and
+    -- permanently block Ready (Endless Retry teleports slowly / can stall).
+    if isRoundEndGuiVisible() then return true end
+    local timer = ReplicatedStorage:GetAttribute("RoundEndTimer")
+    return type(timer) == "number" and timer > 0
+end
+
+local function endlessRetryAvailable()
+    -- In-game Endless end screen only shows Restart when entries remain.
+    local pg = LP:FindFirstChild("PlayerGui")
+    if pg then
+        for _, gui in ipairs(pg:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui.Enabled then
+                local n = gui.Name:lower()
+                local endlessUi = n:find("endless") or n:find("roundend")
+                local restart = gui:FindFirstChild("RestartButton", true)
+                if endlessUi and restart and isGuiTrulyVisible(restart) then
+                    return true
+                end
+            end
+        end
+    end
+    return getEndlessEntries() > 0
+end
+
+local function clearVoteState(reason)
+    pendingVote = nil
+    votedThisEnd = false
+    gameOverAt = 0
 end
 
 local function forceVote(kind)
@@ -2547,7 +2573,13 @@ local function pickVote()
         return F.afkVoteMode or "Lobby"
     end
     if F.autoQueueEndless then
-        return F.endlessVoteMode or "Retry"
+        local mode = F.endlessVoteMode or "Retry"
+        if mode == "None" then return nil end
+        -- 0 entries → Restart hidden; Retry votes do nothing and bot freezes on RoundEnd
+        if mode == "Retry" and not endlessRetryAvailable() then
+            return "Lobby"
+        end
+        return mode
     end
     if F.autoVoteRetry or F.autoVoteNext or F.autoVoteLobby then
         return F.voteMode or (F.autoVoteRetry and "Retry") or (F.autoVoteNext and "Next") or "Lobby"
@@ -2657,27 +2689,40 @@ do
             end
         end
     end)
-    -- New match: reset vote state (only when a new wave actually starts)
+    -- New match: reset vote state (WaveInfo + Endless + Tower)
     task.spawn(function()
+        local bound = {}
+        local function onMatchReset()
+            clearVoteState("match-reset")
+            lastVictory = nil
+            sawChestsThisMatch = false
+            chestsLootedThisMatch = 0
+            chestFarmPhase = F.chestRetryFarm and "collecting" or "idle"
+            rebaselineCurrency()
+        end
         local function bind(wi)
-            if not wi then return end
+            if not wi or bound[wi] then return end
+            bound[wi] = true
             wi:GetAttributeChangedSignal("Wave"):Connect(function()
                 local w = wi:GetAttribute("Wave")
                 if w == 1 and wi:GetAttribute("Intermission") == true then
-                    pendingVote = nil
-                    lastVictory = nil
-                    gameOverAt = 0
-                    votedThisEnd = false
-                    sawChestsThisMatch = false
-                    chestsLootedThisMatch = 0
-                    chestFarmPhase = F.chestRetryFarm and "collecting" or "idle"
-                    rebaselineCurrency()
+                    onMatchReset()
+                end
+            end)
+            wi:GetAttributeChangedSignal("Intermission"):Connect(function()
+                if wi:GetAttribute("Intermission") == true and not isRoundEndGuiVisible() then
+                    clearVoteState("intermission")
                 end
             end)
         end
-        bind(ReplicatedStorage:FindFirstChild("WaveInfo"))
+        for _, name in ipairs({ "WaveInfo", "EndlessWaveInfo", "TowerWaveInfo" }) do
+            bind(ReplicatedStorage:FindFirstChild(name))
+        end
         ReplicatedStorage.ChildAdded:Connect(function(ch)
-            if ch.Name == "WaveInfo" then bind(ch) end
+            if ch.Name == "WaveInfo" or ch.Name == "EndlessWaveInfo" or ch.Name == "TowerWaveInfo" then
+                bind(ch)
+                task.defer(onMatchReset)
+            end
         end)
     end)
     pcall(function()
@@ -2713,10 +2758,9 @@ loop(function() return F.autoReady or F.fullAfkStory or F.autoQueueStory or F.af
     if wi then
         local inter = wi:GetAttribute("Intermission")
         local timer = wi:GetAttribute("IntermissionTimer")
-        if inter ~= true and not (type(timer) == "number" and timer > 0) then
-            -- Still ready if no intermission attrs (Endless)
-            if wi.Name == "WaveInfo" then return end
-        end
+        local needReady = inter == true or (type(timer) == "number" and timer > 0)
+        -- Endless / Tower: Ready only during intermission. Story WaveInfo same.
+        if not needReady then return end
     end
     if tick() - lastReadyAt < (F.readyInterval or 1.0) then return end
     lastReadyAt = tick()
@@ -2725,12 +2769,16 @@ end, 0.35)
 
 loop(function() return F.autoVoteRetry or F.autoVoteNext or F.autoVoteLobby or F.fullAfkStory or F.autoQueueStory or F.afkWavesFarm or F.chestRetryFarm or F.towerBot or F.autoQueueTower or F.autoQueueEndless end, function()
     if isLobby() or isPvpWorld() then
-        pendingVote = nil
+        clearVoteState("lobby")
         return
     end
     if not pendingVote and (F.autoQueueStory or F.fullAfkStory or F.towerBot or F.autoQueueTower or F.autoQueueEndless) and isRoundEndOpen() then
         pendingVote = pickVote() or "Retry"
         if gameOverAt <= 0 then gameOverAt = tick() end
+    end
+    -- Endless: if we planned Retry but entries ran out mid-screen, switch to Lobby
+    if pendingVote == "Retry" and F.autoQueueEndless and isRoundEndOpen() and not endlessRetryAvailable() then
+        pendingVote = "Lobby"
     end
     if not pendingVote then return end
     if not F.chestRetryFarm then
@@ -2801,6 +2849,37 @@ loop(function() return F.autoQueueEndless end, function()
         notify("Endless", tostring(err or "failed"), "alert-triangle")
     end
 end, 1.5)
+
+-- Endless stall watchdog: stuck RoundEnd / ghost vote state / missed Ready
+loop(function() return F.autoQueueEndless == true end, function()
+    if isPvpWorld() then return end
+    if isLobby() then
+        -- After Lobby vote, keep trying to re-enter (entries permitting)
+        return
+    end
+    local wi = ReplicatedStorage:FindFirstChild("EndlessWaveInfo")
+    if wi and wi:GetAttribute("Intermission") == true and not isRoundEndGuiVisible() then
+        if pendingVote or gameOverAt > 0 then
+            clearVoteState("endless-intermission")
+        end
+        if LP:GetAttribute("Ready") ~= true then
+            doReady()
+        end
+        return
+    end
+    if not isRoundEndGuiVisible() then return end
+    if gameOverAt <= 0 then gameOverAt = tick() end
+    local want = pickVote()
+    if not want or want == "None" then return end
+    -- Stuck >12s on end screen → force correct vote (Lobby if no entries)
+    if tick() - gameOverAt >= 12 then
+        pendingVote = want
+        forceVote(want)
+    elseif not pendingVote then
+        pendingVote = want
+        beginEndVote(want, 0.5)
+    end
+end, 1.2)
 
 loop(function() return F.towerBot == true end, towerBotTick, 0.5)
 
@@ -4386,7 +4465,7 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     slider(en, "Queue interval", "endlessQueueInterval", 5, 30, 8, 0)
     local eg, es = win:flag("endlessVoteMode", "Retry")
     en:dropdown("After end vote", { "Retry", "Lobby", "None" }, eg, es)
-    en:label("Entries left shown in Session HUD.")
+    en:label("Retry only if entries left — else auto Lobby (avoids freeze).")
     en:button("Start Endless Now", function()
         local ok2, err = queueEndlessCircus()
         notify("Endless", ok2 and ("OK · entries " .. getEndlessEntries()) or tostring(err), ok2 and "check" or "alert-triangle")
