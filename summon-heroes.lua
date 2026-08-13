@@ -1247,12 +1247,15 @@ end
 
 local function firePrompt(prompt)
     if not prompt then return false end
+    -- Recruit/shop prompts are HoldDuration=1; fire without zeroing often does nothing.
+    pcall(function() prompt.HoldDuration = 0 end)
+    pcall(function() prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance or 0, 80) end)
     if fireproximityprompt then
         pcall(fireproximityprompt, prompt)
+        pcall(fireproximityprompt, prompt, 0)
         return true
     end
     pcall(function()
-        prompt.HoldDuration = 0
         prompt:InputHoldBegin()
         task.wait(0.05)
         prompt:InputHoldEnd()
@@ -1494,7 +1497,7 @@ local ROOM_ALIASES = {
     Boss = "Elite", Merchant = "Merchant", Skip = "Skip",
 }
 
-local DOOR_ORDER_KEYS = { "Elite", "Chest", "Healing", "Mystery", "Recruit", "Combat" }
+local DOOR_ORDER_KEYS = { "Elite", "Chest", "Healing", "Mystery", "Recruit", "Combat", "Merchant" }
 local DOOR_ORDER_LABEL = {
     Elite = "Elite / Boss",
     Chest = "Chest",
@@ -1502,6 +1505,7 @@ local DOOR_ORDER_LABEL = {
     Mystery = "Mystery (2x XP)",
     Recruit = "Recruit",
     Combat = "Combat",
+    Merchant = "Merchant shop",
 }
 local DOOR_LABEL_TO_KEY = {}
 for k, v in pairs(DOOR_ORDER_LABEL) do DOOR_LABEL_TO_KEY[v] = k end
@@ -1524,35 +1528,33 @@ local function normalizeRoomType(text, xpText)
     return text ~= "" and text or "Combat"
 end
 
+local function doorOrderValid(o, n)
+    if type(o) ~= "table" or #o ~= n then return false end
+    local seen = {}
+    for _, k in ipairs(o) do
+        if type(k) ~= "string" or not DOOR_ORDER_LABEL[k] or seen[k] then return false end
+        seen[k] = true
+    end
+    return true
+end
+
 local function getDoorOrder()
     local o = F.towerDoorOrder
-    if type(o) == "table" and #o == 6 then
-        local seen = {}
-        local ok = true
-        for _, k in ipairs(o) do
-            if type(k) ~= "string" or not DOOR_ORDER_LABEL[k] or seen[k] then
-                ok = false
+    if doorOrderValid(o, 7) then return o end
+    if doorOrderValid(o, 6) then
+        local new = table.clone(o)
+        local at = #new + 1
+        for i, k in ipairs(new) do
+            if k == "Chest" then
+                at = i + 1
                 break
             end
-            seen[k] = true
         end
-        if ok then return o end
+        table.insert(new, at, "Merchant")
+        F.towerDoorOrder = new
+        return new
     end
-    -- Migrate old per-type priority sliders → ordered list
-    local scored = {
-        { k = "Elite", p = tonumber(F.towerPriElite) or 1 },
-        { k = "Chest", p = tonumber(F.towerPriChest) or 2 },
-        { k = "Healing", p = tonumber(F.towerPriHeal) or 3 },
-        { k = "Mystery", p = tonumber(F.towerPriMystery) or 4 },
-        { k = "Recruit", p = tonumber(F.towerPriRecruit) or 5 },
-        { k = "Combat", p = tonumber(F.towerPriCombat) or 6 },
-    }
-    table.sort(scored, function(a, b)
-        if a.p == b.p then return a.k < b.k end
-        return a.p < b.p
-    end)
-    local order = {}
-    for i, row in ipairs(scored) do order[i] = row.k end
+    local order = { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" }
     F.towerDoorOrder = order
     return order
 end
@@ -1574,7 +1576,7 @@ local function setDoorOrderSlot(slot, key)
 end
 
 local function roomPriority(roomType)
-    if roomType == "Merchant" then return 999 end -- never
+    if roomType == "Merchant" and F.towerEnterMerchant == false then return 999 end
     if roomType == "Skip" then return 1.5 end -- level jump, keep strong
     local order = getDoorOrder()
     for i, k in ipairs(order) do
@@ -1583,40 +1585,66 @@ local function roomPriority(roomType)
     return 50
 end
 
--- Only lit ExitDoors during RoomChoice (Ring beams on). Closed / leftover portals skipped.
-local function isSelectableTowerDoor(model)
+-- Prefer lit ExitDoors (Ring beams). Later themes sometimes have no beams — then Screen+Touch is enough.
+local function isSelectableTowerDoor(model, relaxLit)
     if not (model and model:IsA("Model") and model.Name == "ExitDoor" and model.Parent) then
         return false
     end
     local touch = model:FindFirstChild("Touch")
     local screen = model:FindFirstChild("Screen")
+    if not (touch and touch:IsA("BasePart") and screen) then return false end
     local ring = model:FindFirstChild("Ring")
-    if not (touch and touch:IsA("BasePart") and screen and ring) then return false end
-    if ring:IsA("BasePart") and ring.Transparency >= 0.95 then return false end
-    local lit = false
-    for _, d in ipairs(ring:GetDescendants()) do
-        if (d:IsA("Beam") or d:IsA("ParticleEmitter")) and d.Enabled then
-            lit = true
-            break
-        end
+    if ring and ring:IsA("BasePart") and ring.Transparency >= 0.95 and not relaxLit then
+        return false
     end
-    if not lit then return false end
+    if ring and not relaxLit then
+        local lit = false
+        for _, d in ipairs(ring:GetDescendants()) do
+            if (d:IsA("Beam") or d:IsA("ParticleEmitter")) and d.Enabled then
+                lit = true
+                break
+            end
+        end
+        if not lit then return false end
+    end
     local gui = screen:FindFirstChildWhichIsA("SurfaceGui") or screen:FindFirstChild("SurfaceGui")
     local nameLabel = gui and (gui:FindFirstChild("RoomName") or gui:FindFirstChild("RoomName", true))
     return nameLabel and nameLabel:IsA("TextLabel")
 end
 
-local function findTowerDoors()
+-- Never Workspace:GetDescendants — by floor ~200 the map has every past room and that hitch freezes the bot.
+local function findTowerDoors(relaxLit)
     local doors = {}
-    for _, d in ipairs(Workspace:GetDescendants()) do
-        if isSelectableTowerDoor(d) then
-            local touch = d.Touch
-            local screen = d.Screen
-            local gui = screen:FindFirstChildWhichIsA("SurfaceGui") or screen:FindFirstChild("SurfaceGui")
-            local nameLabel = gui:FindFirstChild("RoomName") or gui:FindFirstChild("RoomName", true)
-            local xpLabel = gui:FindFirstChild("RoomXP") or gui:FindFirstChild("RoomXP", true)
-            local rt = normalizeRoomType(nameLabel.Text, xpLabel and xpLabel.Text)
-            doors[#doors + 1] = { model = d, touch = touch, roomType = rt, label = nameLabel.Text }
+    local map = Workspace:FindFirstChild("Map")
+    if not map then return doors end
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    local floor = info and info:GetAttribute("CurrentRoomNum")
+    local rooms = {}
+    if floor ~= nil then
+        local named = map:FindFirstChild(tostring(floor))
+        if named then rooms[#rooms + 1] = named end
+    end
+    if #rooms == 0 then
+        for _, ch in ipairs(map:GetChildren()) do
+            rooms[#rooms + 1] = ch
+        end
+    end
+    local function consider(d)
+        if not isSelectableTowerDoor(d, relaxLit) then return end
+        local screen = d.Screen
+        local gui = screen:FindFirstChildWhichIsA("SurfaceGui") or screen:FindFirstChild("SurfaceGui")
+        local nameLabel = gui:FindFirstChild("RoomName") or gui:FindFirstChild("RoomName", true)
+        local xpLabel = gui:FindFirstChild("RoomXP") or gui:FindFirstChild("RoomXP", true)
+        local rt = normalizeRoomType(nameLabel.Text, xpLabel and xpLabel.Text)
+        doors[#doors + 1] = { model = d, touch = d.Touch, roomType = rt, label = nameLabel.Text }
+    end
+    for _, room in ipairs(rooms) do
+        if room.Name == "ExitDoor" then
+            consider(room)
+        else
+            for _, ch in ipairs(room:GetChildren()) do
+                if ch.Name == "ExitDoor" then consider(ch) end
+            end
         end
     end
     return doors
@@ -1625,11 +1653,10 @@ end
 local function pickBestDoor(doors)
     local best, bestScore
     for _, door in ipairs(doors) do
-        if door.roomType ~= "Merchant" then
-            local score = roomPriority(door.roomType)
-            if not best or score < bestScore then
-                best, bestScore = door, score
-            end
+        if door.roomType == "Merchant" and F.towerEnterMerchant == false then continue end
+        local score = roomPriority(door.roomType)
+        if not best or score < bestScore then
+            best, bestScore = door, score
         end
     end
     return best
@@ -1650,27 +1677,157 @@ end
 local function pickRecruitPrompt()
     local mode = tostring(F.towerRecruitMode or "Rarity")
     local best, bestScore, bestPrompt
-    for _, d in ipairs(Workspace:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and d.ActionText == "Recruit" and d.Enabled then
-            local unitId = d.ObjectText
-            local id = unitId
-            if UNIT_DATA then
-                for k, v in pairs(UNIT_DATA) do
-                    if v.DisplayName == unitId or k == unitId then id = k break end
-                end
+    local function consider(prompt)
+        if not (prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled) then return end
+        local action = tostring(prompt.ActionText or "")
+        if action ~= "Recruit" then return end
+        local unitId = prompt.ObjectText
+        local id = unitId
+        if UNIT_DATA then
+            for k, v in pairs(UNIT_DATA) do
+                if v.DisplayName == unitId or k == unitId then id = k break end
             end
-            local score
-            if mode == "Ranged" then
-                score = unitRangedScore(id) * 10 + unitRarityScore(id)
-            else
-                score = unitRarityScore(id) * 100 + unitRangedScore(id)
-            end
-            if not best or score > bestScore then
-                best, bestScore, bestPrompt = id, score, d
+        end
+        local score
+        if mode == "Ranged" then
+            score = unitRangedScore(id) * 10 + unitRarityScore(id)
+        else
+            score = unitRarityScore(id) * 100 + unitRangedScore(id)
+        end
+        if not best or score > bestScore then
+            best, bestScore, bestPrompt = id, score, prompt
+        end
+    end
+    local folder = unitsFolder()
+    if folder then
+        for _, m in ipairs(folder:GetChildren()) do
+            for _, d in ipairs(m:GetDescendants()) do
+                if d:IsA("ProximityPrompt") then consider(d) end
             end
         end
     end
+    if bestPrompt then return bestPrompt end
+    local map = Workspace:FindFirstChild("Map")
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    local floor = info and info:GetAttribute("CurrentRoomNum")
+    local room = map and floor ~= nil and map:FindFirstChild(tostring(floor))
+    if room then
+        for _, d in ipairs(room:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then consider(d) end
+        end
+    end
     return bestPrompt
+end
+
+local function shopGuiFromPrompt(prompt)
+    local inst = prompt
+    for _ = 1, 14 do
+        if not inst then break end
+        local gui = inst:FindFirstChild("Gui", true)
+        if gui and (gui:FindFirstChild("Primary") or gui:FindFirstChild("RarityLabel")) then
+            return gui
+        end
+        inst = inst.Parent
+    end
+    return nil
+end
+
+local function shopOptionScore(desc, rarity)
+    desc = tostring(desc or ""):lower()
+    if desc == "" then return nil end
+    local isHeal = desc:find("heal", 1, true) ~= nil and desc:find("unit", 1, true) ~= nil
+        or desc:find("heal ", 1, true) ~= nil
+        or desc:find("of each unit", 1, true) ~= nil
+    local isRevive = desc:find("revive", 1, true) ~= nil or desc:find("respawn", 1, true) ~= nil
+    if isHeal and F.towerSkipShopHeal ~= false then return nil end
+    if isRevive and F.towerSkipShopRevive ~= false then return nil end
+    local combat = 0
+    local cfg
+    pcall(function() cfg = require(ReplicatedStorage.WorldModules.TowerConfig) end)
+    local opt
+    if cfg and cfg.ShopOptions then
+        for _, v in pairs(cfg.ShopOptions) do
+            if type(v) == "table" and tostring(v.Desc or ""):lower() == desc then
+                opt = v
+                break
+            end
+        end
+    end
+    rarity = tonumber(rarity) or (opt and tonumber(opt.Rarity)) or 1
+    local sc = opt and opt.StatChange
+    if sc then
+        combat = (sc.Attack or 0) * 100
+            + (sc.AtkSpd or 0) * 80
+            + (sc.CritRate or 0) * 90
+            + (sc.CritDmg or 0) * 70
+            + (sc.BossAttack or 0) * 90
+            + (sc.EliteAttack or 0) * 90
+            + (sc.Speed or 0) * 40
+            + (sc.Health or 0) * 25
+            + (sc.Evasion or 0) * 20
+    else
+        if desc:find("atk spd", 1, true) then combat = combat + 80
+        elseif desc:find("atk to elite", 1, true) or desc:find("bosses", 1, true) then combat = combat + 90
+        elseif desc:find("atk", 1, true) then combat = combat + 100
+        end
+        if desc:find("crit", 1, true) then combat = combat + 80 end
+        if desc:find("spd boost", 1, true) then combat = combat + 40 end
+        if desc:find("hp boost", 1, true) then combat = combat + 25 end
+    end
+    local prefer = tostring(F.towerShopPrefer or "Combat")
+    if prefer == "Rarity" then
+        return rarity * 10000 + combat
+    end
+    return combat * 100 + rarity * 10
+end
+
+local function pickMerchantBuy()
+    local coins = tonumber(getCurrency("Coins")) or 0
+    local keep = tonumber(F.towerShopMinCoins) or 0
+    local map = Workspace:FindFirstChild("Map")
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    local floor = info and info:GetAttribute("CurrentRoomNum")
+    local room = map and floor ~= nil and map:FindFirstChild(tostring(floor))
+    if not room then return nil end
+    local bestPrompt, bestPart, bestScore
+    for _, d in ipairs(room:GetDescendants()) do
+        if not (d:IsA("ProximityPrompt") and d.Enabled and d.ActionText == "Buy") then continue end
+        local gui = shopGuiFromPrompt(d)
+        local desc = gui and gui:FindFirstChild("Primary") and gui.Primary.Text
+        local rarityTxt = gui and gui:FindFirstChild("RarityLabel") and gui.RarityLabel.Text
+        local rarity
+        do
+            local t = tostring(rarityTxt or ""):lower()
+            if t:find("secret", 1, true) or t:find("mythic", 1, true) then rarity = 6
+            elseif t:find("legendary", 1, true) then rarity = 5
+            elseif t:find("epic", 1, true) then rarity = 4
+            elseif t:find("rare", 1, true) then rarity = 3
+            elseif t:find("uncommon", 1, true) then rarity = 2
+            elseif t:find("common", 1, true) then rarity = 1
+            end
+        end
+        local price = 0
+        local priceGui = gui and gui:FindFirstChild("Price")
+        local priceLabel = priceGui and (priceGui:FindFirstChild("Label") or priceGui:FindFirstChildWhichIsA("TextLabel", true))
+        if priceLabel and priceLabel:IsA("TextLabel") then
+            price = tonumber((tostring(priceLabel.Text):gsub(",", ""):gsub("%s", ""))) or 0
+        end
+        if price <= 0 then
+            local prices = { [1] = 100, [3] = 250, [4] = 500, [5] = 1000, [6] = 5000 }
+            price = prices[rarity or 0] or 0
+        end
+        if price > 0 and coins - price < keep then continue end
+        local score = shopOptionScore(desc, rarity)
+        if not score then continue end
+        if not bestPrompt or score > bestScore then
+            local part = d.Parent
+            if part and part:IsA("Attachment") then part = part.Parent end
+            if part and part:IsA("BasePart") then
+                bestPrompt, bestPart, bestScore = d, part, score
+            end
+        end
+    end
+    return bestPrompt, bestPart
 end
 
 local function safeTp(pos)
@@ -1682,15 +1839,16 @@ local function safeTp(pos)
     return true
 end
 
--- One TP per phase. No step-walking (that yeeted people into the void).
+-- Retry every tick while the phase is open. One-shot TP missed thin doors / HoldDuration=1 prompts.
 local towerBot = {
-    choiceDone = false,
-    recruitDone = false,
+    lastDoorTp = 0,
+    lastRecruitFire = 0,
+    lastShopFire = 0,
 }
 
 local function towerBotTick()
     if not F.towerBot then
-        towerBot.choiceDone, towerBot.recruitDone = false, false
+        towerBot.lastDoorTp, towerBot.lastRecruitFire, towerBot.lastShopFire = 0, 0, 0
         return
     end
     if isLobby() or isPvpWorld() then return end
@@ -1698,39 +1856,56 @@ local function towerBotTick()
     if not info then return end
 
     local choosing = info:GetAttribute("RoomChoice") == true
-    if not choosing then
-        towerBot.choiceDone = false
-    end
     local recruitLeft = tonumber(info:GetAttribute("RecruitTimer")) or 0
-    if recruitLeft <= 0 then
-        towerBot.recruitDone = false
+    local shopLeft = tonumber(info:GetAttribute("PurchaseTimer")) or 0
+
+    local function standOn(part)
+        if not (part and part:IsA("BasePart") and part.Parent) then return false end
+        if not safeTp(part.Position) then return false end
+        local r = hrp()
+        if r and firetouchinterest then
+            pcall(firetouchinterest, part, r, 1)
+            pcall(firetouchinterest, r, part, 1)
+            task.defer(function()
+                pcall(firetouchinterest, part, r, 0)
+                pcall(firetouchinterest, r, part, 0)
+            end)
+        end
+        return true
     end
 
-    -- Room choice: one teleport onto the best lit door Touch
     if choosing then
-        if towerBot.choiceDone then return end
-        local best = pickBestDoor(findTowerDoors())
-        if not (best and best.touch and best.touch.Parent) then return end
-        if safeTp(best.touch.Position) then
-            towerBot.choiceDone = true
+        local best = pickBestDoor(findTowerDoors(false))
+        if not (best and best.touch and best.touch.Parent) then
+            best = pickBestDoor(findTowerDoors(true))
         end
+        if not (best and best.touch and best.touch.Parent) then return end
+        if tick() - towerBot.lastDoorTp < 0.2 then return end
+        towerBot.lastDoorTp = tick()
+        standOn(best.touch)
         return
     end
 
-    -- Recruit: one TP + fire prompt
     if recruitLeft > 0 then
-        if towerBot.recruitDone then return end
         local prompt = pickRecruitPrompt()
         if not prompt then return end
         local part = prompt.Parent
         if part and part:IsA("Attachment") then part = part.Parent end
         if not (part and part:IsA("BasePart")) then return end
-        if safeTp(part.Position) then
-            towerBot.recruitDone = true
-            task.defer(function()
-                firePrompt(prompt)
-            end)
-        end
+        if tick() - towerBot.lastRecruitFire < 0.25 then return end
+        towerBot.lastRecruitFire = tick()
+        standOn(part)
+        firePrompt(prompt)
+        return
+    end
+
+    if shopLeft > 0 and F.towerEnterMerchant ~= false then
+        local prompt, part = pickMerchantBuy()
+        if not (prompt and part) then return end
+        if tick() - towerBot.lastShopFire < 0.25 then return end
+        towerBot.lastShopFire = tick()
+        standOn(part)
+        firePrompt(prompt)
     end
 end
 
@@ -2892,7 +3067,15 @@ loop(function() return F.autoQueueEndless == true end, function()
     end
 end, 1.2)
 
-loop(function() return F.towerBot == true end, towerBotTick, 0.5)
+loop(function() return F.towerBot == true end, towerBotTick, function()
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    if info and (info:GetAttribute("RoomChoice") == true
+        or (tonumber(info:GetAttribute("RecruitTimer")) or 0) > 0
+        or (tonumber(info:GetAttribute("PurchaseTimer")) or 0) > 0) then
+        return 0.15
+    end
+    return 0.5
+end)
 
 -- Keep teleport queue armed once (identical URL — never re-queue / never stack)
 -- (periodic re-arm removed: executors append queue_on_teleport)
@@ -5072,7 +5255,7 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     slider(tw, "Queue interval", "towerQueueInterval", 4, 20, 6, 0)
     slider(tw, "Difficulty index", "towerDifficulty", 1, 4, 1, 0)
     togBind(tw, "Tower Bot", "towerBot", false, "T", "medium")
-    tw:label("In Tower match: picks doors by priority (Merchant never). Always Retry on end. Bind toggles On/Off.")
+    tw:label("In Tower match: picks doors by priority. Merchant shops buy combat bonuses. Always Retry on end.")
     tw:button("Queue Tower Now", function()
         local ok2, err = queueTower()
         notify("Tower", ok2 and "OK" or tostring(err), ok2 and "check" or "alert-triangle")
@@ -5093,11 +5276,11 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
 
     local pri = tFarm:sub("Tower Bot")
     local pc = pri:card({ title = "Door priority", icon = "list", column = "left" })
-    pc:label("Best first. Merchant never. Change a slot — duplicates swap places.")
-    win:flag("towerDoorOrder", { "Elite", "Chest", "Healing", "Mystery", "Recruit", "Combat" })
-    getDoorOrder() -- migrate old slider config once
-    local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick" }
-    for slot = 1, 6 do
+    pc:label("Best first. Merchant is a shop room. Change a slot — duplicates swap places.")
+    win:flag("towerDoorOrder", { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" })
+    getDoorOrder() -- migrate old slider / 6-slot configs
+    local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick", "7th pick" }
+    for slot = 1, 7 do
         pc:dropdown(slotNames[slot], DOOR_ORDER_OPTIONS, function()
             local o = getDoorOrder()
             return DOOR_ORDER_LABEL[o[slot]] or DOOR_ORDER_OPTIONS[slot]
@@ -5108,7 +5291,7 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
         end)
     end
     pc:button("Reset default order", function()
-        F.towerDoorOrder = { "Elite", "Chest", "Healing", "Mystery", "Recruit", "Combat" }
+        F.towerDoorOrder = { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" }
         win:markDirty()
         win:refreshAll()
         notify("Tower Bot", "Priority reset", "list")
@@ -5117,6 +5300,15 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     local rg, rs = win:flag("towerRecruitMode", "Rarity")
     rc:dropdown("Prefer", { "Rarity", "Ranged" }, rg, rs)
     rc:label("Rarity = highest rarity. Ranged = highest AttackRange.")
+
+    local mc = pri:card({ title = "Merchant shop", icon = "sparkles-2", column = "right" })
+    tog(mc, "Enter Merchant doors", "towerEnterMerchant", true)
+    tog(mc, "Skip unit heal", "towerSkipShopHeal", true)
+    tog(mc, "Skip revive / respawn", "towerSkipShopRevive", true)
+    local sg, ss = win:flag("towerShopPrefer", "Combat")
+    mc:dropdown("Buy prefer", { "Combat", "Rarity" }, sg, ss)
+    slider(mc, "Keep at least coins", "towerShopMinCoins", 0, 20000, 0, 0)
+    mc:label("Buys ATK / Crit / Boss / SPD. Never Heal or Revive unless you turn those skips off. HP% boost is a stat, not heal.")
 
     local sRoll = tFarm:sub("Stat Reroll")
     local rollCard = sRoll:card({ title = "Auto lock to letter", icon = "sparkles-2", column = "left" })
