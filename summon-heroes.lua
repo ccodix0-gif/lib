@@ -2591,9 +2591,20 @@ local function beginEndVote(mode, delaySec)
     if not mode or mode == "None" then return end
     pendingVote = mode
     votedThisEnd = false
-    delaySec = tonumber(delaySec) or tonumber(F.voteDelayAfterEnd) or 2
+    if delaySec == nil then
+        if F.soloFastMatch then
+            delaySec = 0.45
+        else
+            delaySec = tonumber(F.voteDelayAfterEnd) or 2
+        end
+    else
+        delaySec = tonumber(delaySec) or 2
+    end
+    if F.soloFastMatch then
+        delaySec = math.min(delaySec, 0.45)
+    end
     task.spawn(function()
-        task.wait(math.max(0.5, delaySec))
+        task.wait(math.max(0.15, delaySec))
         for _ = 1, 60 do
             if isLobby() then return end
             if pendingVote ~= mode then return end
@@ -2606,7 +2617,7 @@ local function beginEndVote(mode, delaySec)
                     return
                 end
             end
-            task.wait(0.35)
+            task.wait(0.25)
         end
     end)
 end
@@ -3016,7 +3027,474 @@ loop(function() return F.syncAutoGearSell == true end, function()
     fire("SetConfig", "AutoGearSell_Rarity4", F.autoGearSellR4 == true)
 end, 2)
 
--- ============================================================ CLAIMS
+-- ============================================================ QUICK GEAR RECYCLE (RecycleGear RF, max 18 / call)
+local GEAR_ITEM_DATA = nil
+local GEAR_RANK_ORD = { D = 1, C = 2, B = 3, A = 4, S = 5, X = 6 }
+-- Index S/A names — never junk-recycle unless user disables keep
+local GEAR_KEEP_NAMED = {
+    PactboundToken = true,
+    HeartOfTheColossus = true,
+    RendsBlade = true,
+    HertzsWildcard = true,
+    TheSleeplessEye = true,
+    DeadeyeFang = true,
+    FoxfireCharm = true,
+}
+local gearRecycleBusy = false
+
+local function getGearItemData(name)
+    if not GEAR_ITEM_DATA then
+        pcall(function()
+            GEAR_ITEM_DATA = require(ReplicatedStorage.WorldModules.ItemData.Gear)
+        end)
+        if type(GEAR_ITEM_DATA) ~= "table" then GEAR_ITEM_DATA = {} end
+    end
+    return GEAR_ITEM_DATA[name]
+end
+
+local function getGearInventoryFolder()
+    local p = getProfile()
+    local inv = p and p:FindFirstChild("Inventory")
+    return inv and inv:FindFirstChild("Gear")
+end
+
+local function gearShouldRecycle(inst)
+    if not inst or inst:GetAttribute("Locked") then return false end
+    local data = getGearItemData(inst.Name)
+    local rarity = data and tonumber(data.Rarity) or 1
+    local maxR = tonumber(F.recycleMaxRarity) or 4 -- default Epic
+    if rarity > maxR then return false end
+    if F.recycleKeepNamed ~= false and GEAR_KEEP_NAMED[inst.Name] then return false end
+    local rank = tostring(inst:GetAttribute("Rank") or "D")
+    local keepRank = tostring(F.recycleKeepMinRank or "A")
+    if keepRank ~= "Z" and keepRank ~= "None" then
+        if (GEAR_RANK_ORD[rank] or 0) >= (GEAR_RANK_ORD[keepRank] or 4) then return false end
+    end
+    local lv = tonumber(inst:GetAttribute("Level")) or 1
+    if F.recycleKeepLeveled ~= false and lv > 1 then return false end
+    return true
+end
+
+local function recycleGearInvoke(batch)
+    if type(batch) ~= "table" or #batch == 0 then return false, 0 end
+    local r1, r2
+    local called = pcall(function()
+        local Gear = require(ReplicatedStorage.Systems.Gear)
+        if Gear and Gear.RecycleGear then
+            r1, r2 = Gear:RecycleGear(LP, batch)
+        end
+    end)
+    if called then
+        if r1 == true then return true, tonumber(r2) or 0 end
+        if type(r1) == "number" then return true, r1 end
+        if r1 == false then return false, 0 end
+    end
+    local ok2, dust = invoke("RecycleGear", batch)
+    if ok2 then return true, tonumber(dust) or 0 end
+    return false, 0
+end
+
+local function countRecycleCandidates()
+    local folder = getGearInventoryFolder()
+    if not folder then return 0 end
+    local n = 0
+    for _, g in ipairs(folder:GetChildren()) do
+        if gearShouldRecycle(g) then n += 1 end
+    end
+    return n
+end
+
+local function quickRecycleGear()
+    if gearRecycleBusy then
+        notify("Recycle", "Already running…", "trash")
+        return
+    end
+    gearRecycleBusy = true
+    task.spawn(function()
+        local folder = getGearInventoryFolder()
+        if not folder then
+            notify("Recycle", "No gear inventory", "alert-triangle")
+            gearRecycleBusy = false
+            return
+        end
+        local list = {}
+        for _, g in ipairs(folder:GetChildren()) do
+            if gearShouldRecycle(g) then
+                list[#list + 1] = g
+            end
+        end
+        if #list == 0 then
+            notify("Recycle", "Nothing to recycle (filters)", "trash")
+            gearRecycleBusy = false
+            return
+        end
+        local recycled, dustTotal = 0, 0
+        for i = 1, #list, 18 do
+            local batch = {}
+            for j = i, math.min(i + 17, #list) do
+                local g = list[j]
+                if g and g.Parent == folder then
+                    batch[#batch + 1] = g
+                end
+            end
+            if #batch > 0 then
+                local ok, dust = recycleGearInvoke(batch)
+                if ok then
+                    recycled += #batch
+                    dustTotal += tonumber(dust) or 0
+                else
+                    notify("Recycle", "Batch failed at " .. tostring(recycled), "alert-triangle")
+                    break
+                end
+                task.wait(0.25)
+            end
+        end
+        notify("Recycle", string.format("Recycled %d · +%d Dust", recycled, math.floor(dustTotal)), "trash")
+        gearRecycleBusy = false
+    end)
+end
+
+-- Optional auto junk recycle in lobby
+local lastAutoRecycleAt = 0
+loop(function() return F.autoRecycleGear == true end, function()
+    if not isLobby() then return end
+    if gearRecycleBusy then return end
+    if tick() - lastAutoRecycleAt < (tonumber(F.autoRecycleInterval) or 20) then return end
+    if countRecycleCandidates() < (tonumber(F.autoRecycleMinCount) or 6) then return end
+    lastAutoRecycleAt = tick()
+    quickRecycleGear()
+end, 3)
+
+-- ============================================================ STAT REROLL BOT (own register pool — keeps __SH_BOOT__ under 200 locals)
+local STATR = (function()
+local STAT_LETTER_ORD = { D = 1, C = 2, B = 3, A = 4, S = 5, X = 6 }
+local STAT_REROLL_KEYS = { "Attack", "Health", "Speed", "Cooldown" }
+local STAT_REROLL_LABEL = { Attack = "ATK", Health = "HP", Speed = "SPD", Cooldown = "CD" }
+local statRerollBusy = false
+local statRerollStop = false
+
+local function letterMeets(letter, target)
+    return (STAT_LETTER_ORD[tostring(letter)] or 0) >= (STAT_LETTER_ORD[tostring(target)] or 6)
+end
+
+local function getUnitUpgradesMod()
+    local ok, mod = pcall(function()
+        return require(ReplicatedStorage.Systems.UnitUpgrades)
+    end)
+    return ok and mod or nil
+end
+
+local function listRerollUnits()
+    local p = getProfile()
+    if not p then return {} end
+    local out, seen = {}, {}
+    local function add(folder)
+        if not folder then return end
+        for _, u in ipairs(folder:GetChildren()) do
+            if not seen[u] then
+                seen[u] = true
+                out[#out + 1] = u
+            end
+        end
+    end
+    add(p:FindFirstChild("Equipped"))
+    local inv = p:FindFirstChild("Inventory")
+    add(inv and inv:FindFirstChild("Units"))
+    table.sort(out, function(a, b)
+        local la = tonumber(a:GetAttribute("Level")) or 0
+        local lb = tonumber(b:GetAttribute("Level")) or 0
+        if la ~= lb then return la > lb end
+        return a.Name < b.Name
+    end)
+    return out
+end
+
+local function unitRerollLabel(u, idx)
+    if not u then return "?" end
+    local data = UNIT_DATA and UNIT_DATA[u.Name]
+    local dn = data and data.DisplayName or u.Name
+    local lv = tonumber(u:GetAttribute("Level")) or 1
+    local eq = u.Parent and u.Parent.Name == "Equipped" and "★" or ""
+    local n = idx or 0
+    if n <= 0 then
+        for i, x in ipairs(listRerollUnits()) do
+            if x == u then n = i break end
+        end
+    end
+    return string.format("#%d %s%s Lv.%d", n, eq, dn, lv)
+end
+
+local function findUnitByRerollLabel(label)
+    local units = listRerollUnits()
+    for i, u in ipairs(units) do
+        if unitRerollLabel(u, i) == label then return u end
+    end
+    -- fallback: match without # if list shifted
+    for i, u in ipairs(units) do
+        if label and label:find(unitRerollLabel(u, i), 1, true) then return u end
+    end
+    return nil
+end
+
+local function readUnitLetters(unit)
+    local t = {}
+    for _, k in ipairs(STAT_REROLL_KEYS) do
+        t[k] = unit:GetAttribute(k) or "D"
+    end
+    return t
+end
+
+local function formatUnitLetters(unit)
+    local parts = {}
+    for _, k in ipairs(STAT_REROLL_KEYS) do
+        parts[#parts + 1] = STAT_REROLL_LABEL[k] .. "=" .. tostring(unit:GetAttribute(k) or "?")
+    end
+    return table.concat(parts, " ")
+end
+
+local function buildLockedFromUnit(unit, target)
+    local locked = {}
+    for _, k in ipairs(STAT_REROLL_KEYS) do
+        if letterMeets(unit:GetAttribute(k), target) then
+            locked[#locked + 1] = k
+        end
+    end
+    return locked
+end
+
+local function tableHas(t, v)
+    for _, x in ipairs(t) do
+        if x == v then return true end
+    end
+    return false
+end
+
+-- Skip RerollSequence cinematic when enabled (manual Reroll! also benefits)
+local statRerollSeqHooked = false
+local function fireRerollClosed(seq)
+    pcall(function()
+        local ev = seq:GetClosedSignal()
+        if getconnections and ev then
+            for _, c in ipairs(getconnections(ev)) do
+                if c.Function then pcall(c.Function) end
+            end
+        end
+    end)
+end
+local function restoreRerollStatsUi(Gui)
+    pcall(function()
+        if Gui and Gui.SetFullscreenLock then
+            Gui:SetFullscreenLock("RerollStats", false)
+        end
+    end)
+    pcall(function()
+        local pg = LP:FindFirstChild("PlayerGui")
+        if not pg then return end
+        for _, g in ipairs(pg:GetDescendants()) do
+            if g:IsA("ScreenGui") and (g.Name == "RerollStats" or g.Name:find("RerollStats")) then
+                g.Enabled = true
+            end
+        end
+    end)
+end
+local function hookStatRerollSkip()
+    if statRerollSeqHooked then return true end
+    local ok, Gui = pcall(function() return require(ReplicatedStorage.Systems.Gui) end)
+    if not ok or type(Gui) ~= "table" or type(Gui.Get) ~= "function" then return false end
+    local seq = Gui:Get("RerollSequence")
+    if type(seq) ~= "table" or type(seq.Open) ~= "function" then return false end
+    statRerollSeqHooked = true
+    local oldOpen = seq.Open
+    seq.Open = function(self, unit, newStats, locked)
+        if F.statRerollSkip == false then
+            return oldOpen(self, unit, newStats, locked)
+        end
+        -- Instant accept — RerollStats registers GetClosedSignal:Once AFTER Open returns
+        local UU = getUnitUpgradesMod()
+        if UU and UU.RerollAction then
+            pcall(function() UU:RerollAction(LP, "UseNew") end)
+        else
+            invoke("RerollAction", "UseNew")
+        end
+        task.defer(function()
+            fireRerollClosed(seq)
+            pcall(function()
+                if seq.Close then seq:Close() end
+            end)
+            restoreRerollStatsUi(Gui)
+        end)
+        return
+    end
+    return true
+end
+pcall(hookStatRerollSkip)
+task.defer(function()
+    for _ = 1, 15 do
+        if hookStatRerollSkip() then break end
+        task.wait(0.5)
+    end
+end)
+
+local function applyStatReroll(unit, locked)
+    local UU = getUnitUpgradesMod()
+    local newStats
+    if UU and UU.BuyStatReroll then
+        local ok, res = pcall(function()
+            return UU:BuyStatReroll(LP, unit, locked)
+        end)
+        if ok then newStats = res end
+    end
+    if type(newStats) ~= "table" then
+        local ok2, res2 = invoke("BuyStatReroll", unit, locked)
+        if ok2 then newStats = res2 end
+    end
+    if type(newStats) ~= "table" then return nil end
+    -- Skip sequence: accept immediately
+    if UU and UU.RerollAction then
+        pcall(function() UU:RerollAction(LP, "UseNew") end)
+    else
+        invoke("RerollAction", "UseNew")
+    end
+    return newStats
+end
+
+local function runStatRerollBot()
+    if statRerollBusy then
+        notify("Stat Reroll", "Already running — Stop first", "alert-triangle")
+        return
+    end
+    local label = F.statRerollUnitLabel
+    local unit = findUnitByRerollLabel(label)
+    if not unit then
+        -- fallback: first equipped
+        local p = getProfile()
+        local eq = p and p:FindFirstChild("Equipped")
+        unit = eq and eq:GetChildren()[1]
+    end
+    if not unit then
+        notify("Stat Reroll", "No unit selected", "alert-triangle")
+        return
+    end
+    local target = F.statRerollTarget or "X"
+    local maxRolls = math.max(1, math.floor(tonumber(F.statRerollMax) or 400))
+    local delaySec = math.max(0.05, tonumber(F.statRerollDelay) or 0.12)
+    local only = {
+        Attack = F.statRerollAtk ~= false,
+        Health = F.statRerollHp ~= false,
+        Speed = F.statRerollSpd ~= false,
+        Cooldown = F.statRerollCd ~= false,
+    }
+
+    statRerollBusy = true
+    statRerollStop = false
+    pcall(hookStatRerollSkip)
+
+    task.spawn(function()
+        local UU = getUnitUpgradesMod()
+        local locked = {}
+        -- Pre-lock stats already at target OR user doesn't want to roll them
+        for _, k in ipairs(STAT_REROLL_KEYS) do
+            if not only[k] or letterMeets(unit:GetAttribute(k), target) then
+                if not tableHas(locked, k) then locked[#locked + 1] = k end
+            end
+        end
+
+        local function needCount()
+            local n = 0
+            for _, k in ipairs(STAT_REROLL_KEYS) do
+                if only[k] then n += 1 end
+            end
+            return n
+        end
+        local function lockedWanted()
+            local n = 0
+            for _, k in ipairs(locked) do
+                if only[k] then n += 1 end
+            end
+            return n
+        end
+
+        if lockedWanted() >= needCount() then
+            notify("Stat Reroll", "Already done: " .. formatUnitLetters(unit), "check")
+            statRerollBusy = false
+            return
+        end
+
+        notify("Stat Reroll", "Start " .. unitRerollLabel(unit) .. " → " .. target, "sparkles-2")
+        local rolls = 0
+        while rolls < maxRolls and not statRerollStop do
+            if lockedWanted() >= needCount() then break end
+            if #locked >= #STAT_REROLL_KEYS then break end
+
+            local can, why = true, nil
+            if UU and UU.CanReroll then
+                local okc, a, b = pcall(function()
+                    return UU:CanReroll(LP, unit, locked)
+                end)
+                if okc then
+                    can, why = a, b
+                end
+            end
+            if not can then
+                notify("Stat Reroll", tostring(why or "Can't reroll"), "alert-triangle")
+                break
+            end
+
+            local newStats = applyStatReroll(unit, locked)
+            rolls += 1
+            if not newStats then
+                notify("Stat Reroll", "BuyStatReroll failed", "alert-triangle")
+                break
+            end
+
+            task.wait(delaySec)
+            -- Prefer pending roll letters (server applied via UseNew)
+            local letters = readUnitLetters(unit)
+            if type(newStats) == "table" then
+                for _, k in ipairs(STAT_REROLL_KEYS) do
+                    local v = newStats[k]
+                    if type(v) == "string" then
+                        letters[k] = v
+                    end
+                end
+            end
+
+            local newly = {}
+            for _, k in ipairs(STAT_REROLL_KEYS) do
+                if only[k] and not tableHas(locked, k) and letterMeets(letters[k], target) then
+                    locked[#locked + 1] = k
+                    newly[#newly + 1] = STAT_REROLL_LABEL[k] .. "=" .. tostring(letters[k])
+                end
+            end
+            if #newly > 0 then
+                notify("Stat Reroll", "Locked " .. table.concat(newly, " · ") .. " | " .. formatUnitLetters(unit), "check")
+            elseif rolls % 25 == 0 then
+                notify("Stat Reroll", string.format("#%d %s", rolls, formatUnitLetters(unit)), "sparkles-2")
+            end
+        end
+
+        local msg = statRerollStop and "Stopped" or "Done"
+        notify("Stat Reroll", string.format("%s · %d rolls · %s", msg, rolls, formatUnitLetters(unit)), "check")
+        statRerollBusy = false
+        statRerollStop = false
+    end)
+end
+
+return {
+    listRerollUnits = listRerollUnits,
+    unitRerollLabel = unitRerollLabel,
+    findUnitByRerollLabel = findUnitByRerollLabel,
+    formatUnitLetters = formatUnitLetters,
+    hookStatRerollSkip = hookStatRerollSkip,
+    runStatRerollBot = runStatRerollBot,
+    stop = function()
+        statRerollStop = true
+    end,
+}
+end)()
+
+-- ============================================================ CLAIMS (own register pool)
+local CLAIM = (function()
 local function invokeQuick(name, ...)
     local n = rem(name)
     if not n then
@@ -3267,6 +3745,20 @@ local function offlineEnd()
     local ok2, a1 = invoke("EndMission")
     notify("Offline", ok2 and "Claimed" or tostring(a1 or "fail"), "clock")
 end
+
+return {
+    claimAll = claimAll,
+    claimQuestsAll = claimQuestsAll,
+    claimBattlepass = claimBattlepass,
+    claimRewards = claimRewards,
+    claimUnitRewards = claimUnitRewards,
+    claimWeeklyRunes = claimWeeklyRunes,
+    claimCodes = claimCodes,
+    codesStatusText = codesStatusText,
+    offlineStart = offlineStart,
+    offlineEnd = offlineEnd,
+}
+end)()
 
 -- ============================================================ LOADOUT + PVP HOP (own register pool)
 local LOAD = (function()
@@ -3596,7 +4088,8 @@ return {
 }
 end)()
 
--- ============================================================ MOVEMENT / FREECAM / ANTI AFK
+-- ============================================================ MOVEMENT / FREECAM / CHESTS (own register pool)
+local MOVE = (function()
 local flyBV, flyBG
 local function stopFly()
     if flyBV then flyBV:Destroy(); flyBV = nil end
@@ -3879,6 +4372,118 @@ local function trySpawnItem(name)
     fire("SpawnItem", name)
     notify("SpawnItem", name .. " (needs Admin)", "alert-triangle")
 end
+
+return {
+    tpChestsAndOpen = tpChestsAndOpen,
+    trySpawnItem = trySpawnItem,
+}
+end)()
+
+-- ============================================================ SOLO FAST (auto special + sweep — own register pool)
+local FAST = (function()
+local function setAutoOnModel(model, on)
+    if not model then return end
+    pcall(function() model:SetAttribute("AutoSpecial", on == true) end)
+    fire("SetUnitAutoMode", model, on == true)
+    pcall(function()
+        require(ReplicatedStorage.Systems.Profile):SetUnitAutoMode(LP, model, on == true)
+    end)
+end
+
+local function forceAutoSpecialTick()
+    if F.forceAutoSpecial == false then return end
+    -- Lobby: persist on equipped data
+    if isLobby() then
+        local p = getProfile()
+        local eq = p and p:FindFirstChild("Equipped")
+        if eq then
+            for _, u in ipairs(eq:GetChildren()) do
+                if u:GetAttribute("AutoSpecial") ~= true then
+                    pcall(function() u:SetAttribute("AutoSpecial", true) end)
+                end
+            end
+        end
+        return
+    end
+    local folder = unitsFolder()
+    if not folder then return end
+    for _, m in ipairs(folder:GetChildren()) do
+        if isOwnUnit(m) and m:GetAttribute("Summon") ~= true then
+            if m:GetAttribute("AutoSpecial") ~= true then
+                setAutoOnModel(m, true)
+            end
+        end
+    end
+end
+
+local function spamSpecialTick()
+    if F.spamSpecial ~= true then return end
+    if isLobby() or isPvpWorld() then return end
+    local folder = unitsFolder()
+    if not folder then return end
+    local Units
+    pcall(function() Units = require(ReplicatedStorage.Systems.Units) end)
+    for _, m in ipairs(folder:GetChildren()) do
+        if not isOwnUnit(m) then continue end
+        if m:GetAttribute("Summon") == true then continue end
+        local ready = specialReady(m)
+        if not ready then continue end
+        if Units and Units.RequestSpecialAttack then
+            pcall(function() Units:RequestSpecialAttack(LP, m) end)
+        else
+            invoke("RequestSpecialAttack", m)
+        end
+    end
+end
+
+local function sweepsLeft()
+    local p = getProfile()
+    local s = p and p:FindFirstChild("Sweeps")
+    return s and tonumber(s.Value) or 0
+end
+
+local function doSweep(count)
+    count = math.max(1, math.floor(tonumber(count) or 1))
+    local left = sweepsLeft()
+    if left < 1 then
+        notify("Sweep", "No sweeps left today", "alert-triangle")
+        return false
+    end
+    count = math.min(count, left)
+    local mapKey, stage = resolveStoryQueue()
+    stage = math.floor(tonumber(stage) or 1)
+    local okCall, xpOrErr, rewards = pcall(function()
+        local Sweeps = require(ReplicatedStorage.Systems.Sweeps)
+        return Sweeps:SweepWave(LP, mapKey, stage, count)
+    end)
+    if not okCall or xpOrErr == nil then
+        local ok2, a1, a2 = invoke("SweepWave", mapKey, stage, count)
+        okCall, xpOrErr, rewards = ok2, a1, a2
+    end
+    if okCall and type(xpOrErr) == "number" then
+        local coins = type(rewards) == "table" and rewards.Coins or "?"
+        local gems = type(rewards) == "table" and rewards.Gems or "?"
+        notify("Sweep", string.format("%s S%d ×%d · XP %s · coins %s · gems %s · left %d",
+            tostring(mapKey), stage, count, tostring(xpOrErr), tostring(coins), tostring(gems), sweepsLeft()), "bolt")
+        return true
+    end
+    notify("Sweep", "Failed (need cleared stage Lv≥8, sweeps left)", "alert-triangle")
+    return false
+end
+
+loop(function() return F.forceAutoSpecial ~= false end, forceAutoSpecialTick, 1.2)
+loop(function() return F.spamSpecial == true and not isLobby() end, spamSpecialTick, 0.35)
+loop(function() return F.soloFastMatch == true and (F.autoReady or F.fullAfkStory or F.autoQueueStory) end, function()
+    -- Snappier ready in solo fast mode
+    doReady()
+end, 0.45)
+
+return {
+    forceAutoSpecialTick = forceAutoSpecialTick,
+    doSweep = doSweep,
+    sweepsLeft = sweepsLeft,
+}
+end)()
 
 -- ============================================================ INDEX (own register pool — __SH_BOOT__ was at 200 locals)
 local IDX = (function()
@@ -4407,6 +5012,21 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     tog(sc, "Enabled", "skipCutscene", true)
     sc:label("Clicks to skip cutscenes + dialogue. Does not press Space (no jump).")
 
+    local sf = s:card({ title = "Solo Fast", icon = "bolt", column = "left" })
+    tog(sf, "Solo Fast Match", "soloFastMatch", true)
+    tog(sf, "Force Auto Special", "forceAutoSpecial", true)
+    tog(sf, "Spam Special (when ready)", "spamSpecial", false, "medium")
+    sf:label("Can't speed server waves. This: auto special + faster Ready/Vote. Sweep skips cleared stages.")
+    slider(sf, "Sweep count", "sweepCount", 1, 10, 1, 0)
+    sf:button("Sweep story target now", function()
+        task.spawn(function()
+            FAST.doSweep(F.sweepCount or 1)
+        end)
+    end)
+    sf:button("Show sweeps left", function()
+        notify("Sweep", "Left today: " .. tostring(FAST.sweepsLeft()), "list")
+    end)
+
     local sVote = tFarm:sub("Vote")
     local vc = sVote:card({ title = "Auto Vote", icon = "check", column = "left" })
     tog(vc, "Vote Retry", "autoVoteRetry", false)
@@ -4498,6 +5118,54 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     rc:dropdown("Prefer", { "Rarity", "Ranged" }, rg, rs)
     rc:label("Rarity = highest rarity. Ranged = highest AttackRange.")
 
+    local sRoll = tFarm:sub("Stat Reroll")
+    local rollCard = sRoll:card({ title = "Auto lock to letter", icon = "sparkles-2", column = "left" })
+    do
+        local labels = {}
+        local units = STATR.listRerollUnits()
+        for i, u in ipairs(units) do
+            labels[#labels + 1] = STATR.unitRerollLabel(u, i)
+        end
+        if #labels == 0 then labels[1] = "(no units)" end
+        local ug, us = win:flag("statRerollUnitLabel", labels[1])
+        rollCard:dropdown("Unit", labels, ug, function(v)
+            us(v)
+            F.statRerollUnitLabel = v
+            win:markDirty()
+        end)
+        rollCard:label("Re-exec script to refresh unit dropdown after inventory changes.")
+    end
+    local tg, ts = win:flag("statRerollTarget", "X")
+    rollCard:dropdown("Lock when ≥", { "X", "S", "A", "B" }, tg, function(v)
+        ts(v)
+        F.statRerollTarget = v
+        win:markDirty()
+    end)
+    tog(rollCard, "Skip roll animation", "statRerollSkip", true)
+    tog(rollCard, "Roll ATK", "statRerollAtk", true)
+    tog(rollCard, "Roll HP", "statRerollHp", true)
+    tog(rollCard, "Roll SPD", "statRerollSpd", true)
+    tog(rollCard, "Roll CD", "statRerollCd", true)
+    slider(rollCard, "Max rolls", "statRerollMax", 50, 2000, 400, 0)
+    slider(rollCard, "Delay (s)", "statRerollDelay", 0.05, 0.5, 0.12, 2)
+    rollCard:label("Rerolls → UseNew (no cinematic) → locks each hit. Cost 100+300×locks.")
+    rollCard:button("Start auto reroll", function()
+        pcall(STATR.hookStatRerollSkip)
+        STATR.runStatRerollBot()
+    end)
+    rollCard:button("Stop", function()
+        STATR.stop()
+        notify("Stat Reroll", "Stopping…", "alert-triangle")
+    end)
+    rollCard:button("Show current letters", function()
+        local u = STATR.findUnitByRerollLabel(F.statRerollUnitLabel)
+        if not u then
+            notify("Stat Reroll", "Pick a unit", "alert-triangle")
+            return
+        end
+        notify("Stat Reroll", STATR.unitRerollLabel(u) .. " · " .. STATR.formatUnitLetters(u), "list")
+    end)
+
     local fc = s2:card({ title = "Full AFK Story Clear", icon = "puzzle", column = "left" })
     tog(fc, "Enabled", "fullAfkStory", false, "medium")
     fc:label("Ready + skip cutscenes + vote (win→Next, loss→Retry) + adaptive re-queue.")
@@ -4562,12 +5230,46 @@ local tGear = win:tab({ name = "Gear", icon = "diamond", group = "Main", subtitl
     tog(g2, "Sell Uncommon", "autoGearSellR2", false)
     tog(g2, "Sell Rare", "autoGearSellR3", false)
     tog(g2, "Sell Epic", "autoGearSellR4", false)
-    g2:label("Same as in-game Auto Gear Sell rarity toggles.")
+    g2:label("Same as in-game Auto Gear Sell rarity toggles (on summon).")
     g2:button("Apply once", function()
         fire("SetConfig", "AutoGearSell_Rarity2", F.autoGearSellR2 == true)
         fire("SetConfig", "AutoGearSell_Rarity3", F.autoGearSellR3 == true)
         fire("SetConfig", "AutoGearSell_Rarity4", F.autoGearSellR4 == true)
         notify("Gear", "AutoGearSell synced", "check")
+    end)
+
+    local gRec = s:card({ title = "Quick Recycle", icon = "trash", column = "left" })
+    win:flag("recycleMaxRarity", 4)
+    local rg, rs = win:flag("recycleMaxRarityLabel", "Epic (4)")
+    gRec:dropdown("Max rarity to junk", {
+        "Common (1)", "Uncommon (2)", "Rare (3)", "Epic (4)", "Legendary (5)",
+    }, rg, function(v)
+        rs(v)
+        local n = tonumber(tostring(v):match("%((%d+)%)")) or 4
+        F.recycleMaxRarity = n
+        win:flag("recycleMaxRarity", n)
+        win:markDirty()
+    end)
+    win:flag("recycleKeepMinRank", "A")
+    local kg, ks = win:flag("recycleKeepMinRankLabel", "A+")
+    gRec:dropdown("Keep rank ≥", { "B+", "A+", "S+", "X only", "None" }, kg, function(v)
+        ks(v)
+        local map = { ["B+"] = "B", ["A+"] = "A", ["S+"] = "S", ["X only"] = "X", None = "Z" }
+        F.recycleKeepMinRank = map[v] or "A"
+        win:markDirty()
+    end)
+    tog(gRec, "Keep leveled (Lv>1)", "recycleKeepLeveled", true)
+    tog(gRec, "Keep Index S/A names", "recycleKeepNamed", true)
+    tog(gRec, "Auto recycle in lobby", "autoRecycleGear", false)
+    slider(gRec, "Auto min count", "autoRecycleMinCount", 1, 18, 6, 0)
+    slider(gRec, "Auto interval (s)", "autoRecycleInterval", 10, 120, 20, 0)
+    gRec:label("One click — skips BiS names, high ranks, leveled. Batches of 18.")
+    gRec:button("Recycle junk now", function()
+        notify("Recycle", "Candidates: " .. tostring(countRecycleCandidates()), "trash")
+        quickRecycleGear()
+    end)
+    gRec:button("Count only", function()
+        notify("Recycle", "Would recycle: " .. tostring(countRecycleCandidates()), "list")
     end)
 
     local sPvp = tGear:sub("PvP Shop")
@@ -4604,36 +5306,36 @@ do -- Claims
 local tClaim = win:tab({ name = "Claims", icon = "trophy", group = "Main", subtitle = "Quests, BP, codes" })
     local s = tClaim:sub("Claims")
     local c = s:card({ title = "One-click", icon = "sparkles-2", column = "left" })
-    c:button("Claim All", claimAll)
+    c:button("Claim All", CLAIM.claimAll)
     c:button("Claim Quests", function()
         task.spawn(function()
-            notify("Quests", tostring(claimQuestsAll()), "sparkles-2")
+            notify("Quests", tostring(CLAIM.claimQuestsAll()), "sparkles-2")
         end)
     end)
-    c:button("Battlepass Claim", claimBattlepass)
-    c:button("Claim Rewards", claimRewards)
-    c:button("Claim Unit Dex", claimUnitRewards)
-    c:button("Weekly Rune Rewards", claimWeeklyRunes)
+    c:button("Battlepass Claim", CLAIM.claimBattlepass)
+    c:button("Claim Rewards", CLAIM.claimRewards)
+    c:button("Claim Unit Dex", CLAIM.claimUnitRewards)
+    c:button("Weekly Rune Rewards", CLAIM.claimWeeklyRunes)
     tog(c, "Auto Claim All (loop)", "autoClaimAll", false)
     slider(c, "Claim Interval (s)", "claimInterval", 30, 300, 90, 0)
 
     local c2 = s:card({ title = "Codes / Offline", icon = "ticket", column = "right" })
-    c2:label(codesStatusText())
+    c2:label(CLAIM.codesStatusText())
     c2:button("Refresh Code List", function()
-        notify("Codes", codesStatusText(), "ticket")
+        notify("Codes", CLAIM.codesStatusText(), "ticket")
     end)
     c2:button("Claim All Active Codes", function()
         task.spawn(function()
-            local n, list = claimCodes()
+            local n, list = CLAIM.claimCodes()
             notify("Codes", "Sent " .. tostring(n) .. " / " .. tostring(list and #list or 0), "ticket")
-            notify("Codes", codesStatusText(), "ticket")
+            notify("Codes", CLAIM.codesStatusText(), "ticket")
         end)
     end)
     win:flag("codeList", "")
     c2:input("Extra codes (optional)", "CODE1,CODE2", function() return F.codeList or "" end, function(v) F.codeList = v; win:markDirty() end)
     c2:label("Claims unclaimed known codes (~2s each — server lock). Extra field optional.")
-    c2:button("Offline Training Start", offlineStart)
-    c2:button("Offline Training End", offlineEnd)
+    c2:button("Offline Training Start", CLAIM.offlineStart)
+    c2:button("Offline Training End", CLAIM.offlineEnd)
 end
 
 do -- Index isolated (register budget + must not kill the rest of the UI)
@@ -4840,14 +5542,14 @@ local tWorld = win:tab({ name = "World", icon = "map-pin", group = "Player", sub
         multi = true, listName = "TP Chests",
         callback = function()
             task.spawn(function()
-                local n = tpChestsAndOpen(false)
+                local n = MOVE.tpChestsAndOpen(false)
                 notify("Chests", "Opened " .. tostring(n), "archive")
             end)
         end,
     })
     c:button("TP + Open Now", function()
         task.spawn(function()
-            local n = tpChestsAndOpen(false)
+            local n = MOVE.tpChestsAndOpen(false)
             notify("Chests", "Opened " .. tostring(n), "archive")
         end)
     end)
@@ -4869,7 +5571,7 @@ local tWorld = win:tab({ name = "World", icon = "map-pin", group = "Player", sub
     local sp = s:card({ title = "SpawnItem", icon = "alert-triangle", column = "right" })
     win:flag("spawnItemName", "Coin")
     sp:input("Item Name", "Coin", function() return F.spawnItemName or "Coin" end, function(v) F.spawnItemName = v; win:markDirty() end)
-    sp:button("Spawn (needs Admin)", function() trySpawnItem(F.spawnItemName or "Coin") end)
+    sp:button("Spawn (needs Admin)", function() MOVE.trySpawnItem(F.spawnItemName or "Coin") end)
     sp:label("Without Admin perms this does nothing.")
 end
 
