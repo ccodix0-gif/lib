@@ -90,6 +90,7 @@ local function wipeShGuis()
     end)
 end
 
+local BOOT_TOKEN = nil
 do
     local fromTp = genv.SH_FromTeleport == true
     genv.SH_FromTeleport = nil
@@ -102,10 +103,9 @@ do
     end
 
     local token = tostring(os.clock()) .. "_" .. tostring(math.random(1, 1e9))
-    local now = os.clock()
     genv.SH_BootClaim = token
     genv.SH_Booting = true
-    genv.SH_LoadLock = now
+    genv.SH_LoadLock = os.clock()
     genv.SH_BootPlace = game.PlaceId
     task.wait(0.08)
     if genv.SH_BootClaim ~= token then
@@ -122,9 +122,18 @@ do
     genv.SH_TeleportArmed = nil
     genv.SH_ArmedUrl = nil
 
+    BOOT_TOKEN = token
     genv.SH_Session = token
     genv.SH_BootAt = os.clock()
     genv.SH_Alive = false
+end
+
+if type(BOOT_TOKEN) ~= "string" then
+    return
+end
+
+local function stillThisBoot()
+    return genv.SH_BootClaim == BOOT_TOKEN
 end
 
 -- The library has a file name of its own so this cannot accidentally download one of the
@@ -161,6 +170,9 @@ local function loadLibrary()
 end
 
 local UI, loadErr = loadLibrary()
+if not stillThisBoot() then
+    return
+end
 if not UI then
     genv.SH_LoadLock = nil
     genv.SH_Booting = false
@@ -200,8 +212,21 @@ local ESP_FONT = Font.new("rbxasset://fonts/families/Arial.json", Enum.FontWeigh
 
 -- Kill leftover GUIs / highlights from a previous stacked run
 pcall(wipeShGuis)
+if not stillThisBoot() then
+    return
+end
 
 local win = UI.new({ icon = "logo", toggleKey = Enum.KeyCode.RightShift })
+if not stillThisBoot() then
+    pcall(function()
+        if win and win.unload then
+            win:unload()
+        elseif win and win.screen then
+            win.screen:Destroy()
+        end
+    end)
+    return
+end
 pcall(function()
     if win and win.screen then
         win.screen:SetAttribute("SH_UI", true)
@@ -245,7 +270,7 @@ end)
 
 -- ============================================================ PERSIST / TELEPORT RELOAD
 -- URL only on disk (Luarmor-safe). Never write script source.
-local SESSION = genv.SH_Session
+local SESSION = BOOT_TOKEN
 local teleportArmed = false
 local LOADER_DIR = "NewReality/SummonHeroes"
 local LOADER_PATH = LOADER_DIR .. "/loader-url.txt"
@@ -571,9 +596,7 @@ pcall(armTeleportReload)
 -- Unload hook so a re-exec kills the previous instance instead of stacking
 genv.SH_Unload = function()
     genv.SH_Alive = false
-    genv.SH_BootPlace = nil
-    genv.SH_BootAt = nil
-    -- Keep SH_TeleportArmed / SH_ArmedUrl — queue already set for next hop
+    -- Do not clear BootClaim / Booting / BootPlace / Session — a newer boot owns those.
     pcall(flushFarmDisk)
     pcall(function()
         if win and win.unload then
@@ -584,12 +607,13 @@ genv.SH_Unload = function()
     end)
     pcall(function() if espGui then espGui:Destroy() end end)
     pcall(function() if hudGui then hudGui:Destroy() end end)
-    pcall(wipeShGuis)
+    -- Not wipeShGuis — that would destroy a newer boot's window.
     pcall(function() RunService:UnbindFromRenderStep("SH_Camera") end)
 end
 
 -- Luau limit: 200 locals per function. Keep setup thin; body runs in nested scopes.
 local function __SH_BOOT__()
+if not stillThisBoot() then return end
 
 -- ============================================================ HELPERS
 local remoteCache = {}
@@ -5137,7 +5161,25 @@ end)()
 -- ============================================================ UI
 -- Separate proto so tab builders don't compete with helper locals for registers.
 local function __SH_UI__()
+if not stillThisBoot() then return end
+-- One failed tab must not abort the rest (re-exec used to leave a half-empty window).
+local function tabOk(name, fn)
+    local ok, err = pcall(fn)
+    if not ok then
+        warn("[SH] UI " .. name .. ": " .. tostring(err))
+        pcall(function()
+            win:notify({
+                title = "UI " .. name,
+                text = tostring(err):sub(1, 140),
+                icon = "alert-triangle",
+                duration = 8,
+            })
+        end)
+    end
+    return ok
+end
 -- Icons must exist in the library's ICON_DATA. Missing names = blank icon.
+tabOk("Visuals", function()
 local tVis = win:tab({ name = "Visuals", icon = "eye", group = "Main", subtitle = "ESP and world" })
 do
     local s = tVis:sub("ESP")
@@ -5181,8 +5223,9 @@ do
     slider(wc, "Dmg Scale", "dmgScale", 1, 4, 1.8, 1)
     tog(wc, "Dmg Bold", "dmgBold", true)
 end
+end)
 
-do -- Farm tab (own block to recycle registers)
+tabOk("Farm", function()
 local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle = "Ready, vote, AFK, queue" })
     local s = tFarm:sub("Match")
     local rc = s:card({ title = "Auto Ready", icon = "player-play", column = "left" })
@@ -5407,9 +5450,9 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
         flushFarmDisk()
         notify("Farm", "Stats reset", "adjustments")
     end)
-end
+end)
 
-do -- Gear / Shop
+tabOk("Gear", function()
 local tGear = win:tab({ name = "Gear", icon = "diamond", group = "Main", subtitle = "Gear sell + PvP shop" })
     local s = tGear:sub("Gear")
     local gFast = s:card({ title = "Gear Machine", icon = "zap", column = "right" })
@@ -5497,9 +5540,9 @@ local tGear = win:tab({ name = "Gear", icon = "diamond", group = "Main", subtitl
     end)
     -- Static text only — never call getRotatingShops/require while building UI (yield → Plugin error).
     pc:label("Max 3 buys / pass · poll 5s. Buy all stock spreads across passes.")
-end
+end)
 
-do -- Claims
+tabOk("Claims", function()
 local tClaim = win:tab({ name = "Claims", icon = "trophy", group = "Main", subtitle = "Quests, BP, codes" })
     local s = tClaim:sub("Claims")
     local c = s:card({ title = "One-click", icon = "sparkles-2", column = "left" })
@@ -5533,10 +5576,9 @@ local tClaim = win:tab({ name = "Claims", icon = "trophy", group = "Main", subti
     c2:label("Claims unclaimed known codes (~2s each — server lock). Extra field optional.")
     c2:button("Offline Training Start", CLAIM.offlineStart)
     c2:button("Offline Training End", CLAIM.offlineEnd)
-end
+end)
 
-do -- Index isolated (register budget + must not kill the rest of the UI)
-local okIdx, errIdx = pcall(function()
+tabOk("Index", function()
 local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle = "All units, gear, runes" })
     local rarityName = IDX.rarityName
     local buildUnitIndex = IDX.buildUnitIndex
@@ -5734,12 +5776,8 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
     end)
     tc:label("S = chase · A = keep · B = mid · C = reroll. Affects live GetUnitPower.")
 end)
-if not okIdx then
-    notify("Index", "Tab failed: " .. tostring(errIdx):sub(1, 120), "alert-triangle")
-end
-end
 
-do -- World
+tabOk("World", function()
 local tWorld = win:tab({ name = "World", icon = "map-pin", group = "Player", subtitle = "Chests, spawn, PvP hop" })
     local s = tWorld:sub("Chests")
     local c = s:card({ title = "Auto Chests", icon = "archive", column = "left" })
@@ -5787,9 +5825,9 @@ local tWorld = win:tab({ name = "World", icon = "map-pin", group = "Player", sub
     sp:input("Item Name", "Coin", function() return F.spawnItemName or "Coin" end, function(v) F.spawnItemName = v; win:markDirty() end)
     sp:button("Spawn (needs Admin)", function() MOVE.trySpawnItem(F.spawnItemName or "Coin") end)
     sp:label("Without Admin perms this does nothing.")
-end
+end)
 
-do -- Movement
+tabOk("Movement", function()
 local tMov = win:tab({ name = "Movement", icon = "user", group = "Player", subtitle = "Speed, fly, freecam" })
     local s = tMov:sub("Move")
     local c = s:card({ title = "Movement", icon = "gauge", column = "left" })
@@ -5800,9 +5838,9 @@ local tMov = win:tab({ name = "Movement", icon = "user", group = "Player", subti
     togBind(c, "Freecam", "freecamOn", false, "G")
     slider(c, "Freecam Speed", "freecamSpeed", 20, 250, 80, 0)
     tog(c, "Anti-AFK", "antiAfk", true)
-end
+end)
 
-do -- Settings (library page + script-only Teleport Reload)
+tabOk("Settings", function()
 local _, settingsPage = win:settingsTab({
     subtitle = "Window, panels, theme, type, configs",
 })
@@ -5873,7 +5911,7 @@ do
         end
     end)
 end
-end
+end)
 
 -- ============================================================ FINALIZE
 -- 1) loadConfig once → flags + _overlayPos
@@ -5888,6 +5926,7 @@ local function trimAutoName(s)
 end
 
 local autoName = trimAutoName(win:getAutoLoad()) or "default"
+tabOk("HUD", function()
 pcall(function()
     win:loadConfig(autoName)
 end)
@@ -6190,8 +6229,9 @@ win:notify({
     icon = "logo",
     duration = 5,
 })
+end)
 end -- __SH_UI__
-do
+if stillThisBoot() then
     local okUi, errUi = pcall(__SH_UI__)
     if not okUi then
         pcall(function()
@@ -6208,6 +6248,7 @@ do
             end
         end)
         pcall(function()
+            if not stillThisBoot() then return end
             local t = win:tab({ name = "Recover", icon = "alert-triangle", group = "Main", subtitle = "UI error" })
             local c = t:sub("Error"):card({ title = "UI build failed", icon = "alert-triangle", column = "left" })
             c:label(tostring(errUi):sub(1, 240))
@@ -6216,10 +6257,41 @@ do
     end
 end
 
-genv.SH_Alive = true
-genv.SH_BootPlace = game.PlaceId
-genv.SH_BootAt = os.clock()
-genv.SH_Booting = false
-genv.SH_LoadLock = nil
+if stillThisBoot() then
+    genv.SH_Alive = true
+    genv.SH_BootPlace = game.PlaceId
+    genv.SH_BootAt = os.clock()
+    genv.SH_Booting = false
+    genv.SH_LoadLock = nil
+end
 end -- __SH_BOOT__
-__SH_BOOT__()
+do
+    local okBoot, errBoot = pcall(__SH_BOOT__)
+    if stillThisBoot() then
+        genv.SH_Booting = false
+        genv.SH_LoadLock = nil
+        if not okBoot then
+            warn("[SH] boot failed: " .. tostring(errBoot))
+            pcall(function()
+                if win and win.notify then
+                    win:notify({
+                        title = "Boot failed",
+                        text = tostring(errBoot):sub(1, 180),
+                        icon = "alert-triangle",
+                        duration = 12,
+                    })
+                end
+            end)
+        end
+        genv.SH_Alive = true
+        genv.SH_BootPlace = game.PlaceId
+    elseif not stillThisBoot() then
+        pcall(function()
+            if win and win.unload then
+                win:unload()
+            elseif win and win.screen then
+                win.screen:Destroy()
+            end
+        end)
+    end
+end
