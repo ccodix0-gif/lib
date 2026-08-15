@@ -218,8 +218,16 @@ espGui.ResetOnSpawn = false
 espGui.IgnoreGuiInset = true
 pcall(function() espGui:SetAttribute("SH_UI", true) end)
 pcall(function() espGui.DisplayOrder = 20 end)
-pcall(function() espGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
-if not espGui.Parent then espGui.Parent = LP:WaitForChild("PlayerGui") end
+-- Never WaitForChild on this thread — a yield before win:tab strips Plugin and leaves an empty window.
+local function parentShGui(gui)
+    local pg = LP and LP:FindFirstChild("PlayerGui")
+    if pg then
+        gui.Parent = pg
+        return
+    end
+    pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+end
+parentShGui(espGui)
 
 local hudGui = Instance.new("ScreenGui")
 hudGui.Name = "SH_HUD"
@@ -229,16 +237,11 @@ hudGui.Enabled = true
 pcall(function() hudGui:SetAttribute("SH_UI", true) end)
 pcall(function() hudGui.DisplayOrder = 1e9 end)
 pcall(function() hudGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
--- PlayerGui first — most reliable for on-screen HUD
-pcall(function()
-    hudGui.Parent = LP:WaitForChild("PlayerGui", 5)
+parentShGui(hudGui)
+task.defer(function()
+    if not hudGui or hudGui.Parent then return end
+    parentShGui(hudGui)
 end)
-if not hudGui.Parent then
-    pcall(function() hudGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
-end
-if not hudGui.Parent then
-    hudGui.Parent = LP:WaitForChild("PlayerGui")
-end
 
 -- ============================================================ PERSIST / TELEPORT RELOAD
 -- URL only on disk (Luarmor-safe). Never write script source.
@@ -815,16 +818,6 @@ local function applyCurrencyDelta(kind, newVal)
             farm.essenceEarned = (farm.essenceEarned or 0) + d
         end
         farm.lastEssence = newVal
-    elseif kind == "EssenceDust" then
-        if farm.lastEssenceDust == nil then
-            farm.lastEssenceDust = newVal
-            return
-        end
-        local d = newVal - farm.lastEssenceDust
-        if d > 0 and d < 5e6 then
-            farm.essenceDustEarned = (farm.essenceDustEarned or 0) + d
-        end
-        farm.lastEssenceDust = newVal
     elseif kind == "PVPTokens" then
         if farm.lastPvpTokens == nil then
             farm.lastPvpTokens = newVal
@@ -844,17 +837,14 @@ local function rebaselineCurrency()
     local coins = getCurrency("Coins")
     local gems = getCurrency("Gems")
     local essence = getCurrency("Essence")
-    local dust = getCurrency("EssenceDust")
     local pvpTok = getCurrency("PVPTokens")
     if coins ~= nil then applyCurrencyDelta("Coins", coins) end
     if gems ~= nil then applyCurrencyDelta("Gems", gems) end
     if essence ~= nil then applyCurrencyDelta("Essence", essence) end
-    if dust ~= nil then applyCurrencyDelta("EssenceDust", dust) end
     if pvpTok ~= nil then applyCurrencyDelta("PVPTokens", pvpTok) end
     if coins ~= nil then farm.lastCoins = coins end
     if gems ~= nil then farm.lastGems = gems end
     if essence ~= nil then farm.lastEssence = essence end
-    if dust ~= nil then farm.lastEssenceDust = dust end
     if pvpTok ~= nil then farm.lastPvpTokens = pvpTok end
 end
 
@@ -866,7 +856,7 @@ local function hookCurrencyValues()
     local p = getProfile()
     local cur = p and p:FindFirstChild("Currencies")
     if not cur then return end
-    for _, name in ipairs({ "Coins", "Gems", "Essence", "EssenceDust", "PVPTokens" }) do
+    for _, name in ipairs({ "Coins", "Gems", "Essence", "PVPTokens" }) do
         local v = cur:FindFirstChild(name)
         if isCurrencyValue(v) and not currencyHooks[v] then
             currencyHooks[v] = true
@@ -885,12 +875,10 @@ local function updateFarmStats()
     local coins = getCurrency("Coins")
     local gems = getCurrency("Gems")
     local essence = getCurrency("Essence")
-    local dust = getCurrency("EssenceDust")
     local pvpTok = getCurrency("PVPTokens")
     if coins ~= nil then applyCurrencyDelta("Coins", coins) end
     if gems ~= nil then applyCurrencyDelta("Gems", gems) end
     if essence ~= nil then applyCurrencyDelta("Essence", essence) end
-    if dust ~= nil then applyCurrencyDelta("EssenceDust", dust) end
     if pvpTok ~= nil then applyCurrencyDelta("PVPTokens", pvpTok) end
     if tick() - lastFarmSaveAt >= 5 then
         flushFarmDisk()
@@ -1488,8 +1476,18 @@ local function queueEndlessCircus()
 end
 
 -- ============================================================ ENDLESS TOWER BOT (Infinite Tower rooms)
+-- Do not require() on the boot thread — ModuleScript yield kills win:tab (empty NewReality).
 local UNIT_DATA
-pcall(function() UNIT_DATA = require(ReplicatedStorage.WorldModules.ItemData.Units) end)
+local function loadUnitData()
+    if type(UNIT_DATA) == "table" then return UNIT_DATA end
+    pcall(function()
+        local wm = ReplicatedStorage:FindFirstChild("WorldModules")
+        local folder = wm and wm:FindFirstChild("ItemData")
+        local mod = folder and folder:FindFirstChild("Units")
+        if mod then UNIT_DATA = require(mod) end
+    end)
+    return UNIT_DATA
+end
 
 local ROOM_ALIASES = {
     Elite = "Elite", Chest = "Chest", Healing = "Healing", Heal = "Healing",
@@ -1675,6 +1673,7 @@ local function unitRarityScore(unitId)
 end
 
 local function pickRecruitPrompt()
+    if type(UNIT_DATA) ~= "table" then loadUnitData() end
     local mode = tostring(F.towerRecruitMode or "Rarity")
     local best, bestScore, bestPrompt
     local function consider(prompt)
@@ -1839,11 +1838,65 @@ local function safeTp(pos)
     return true
 end
 
+local function standOnTowerPart(part)
+    if not (part and part:IsA("BasePart") and part.Parent) then return false end
+    if not safeTp(part.Position) then return false end
+    local r = hrp()
+    if r and firetouchinterest then
+        pcall(firetouchinterest, part, r, 1)
+        pcall(firetouchinterest, r, part, 1)
+        task.defer(function()
+            pcall(firetouchinterest, part, r, 0)
+            pcall(firetouchinterest, r, part, 0)
+        end)
+    end
+    return true
+end
+
+local function findSkipDoor()
+    local doors = findTowerDoors(false)
+    if #doors == 0 then doors = findTowerDoors(true) end
+    for _, d in ipairs(doors) do
+        if d.roomType == "Skip" and d.touch and d.touch.Parent then
+            return d
+        end
+    end
+    return nil
+end
+
+local function takeSkipDoorNow()
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    if not info then return false, "Not in Tower" end
+    towerBot.forceSkip = true
+    local skip = findSkipDoor()
+    if not skip then
+        if info:GetAttribute("RoomChoice") ~= true then
+            return false, "Wait for door choice"
+        end
+        return false, "No Skip door this floor"
+    end
+    if not standOnTowerPart(skip.touch) then
+        return false, "TP failed"
+    end
+    for _ = 1, 8 do
+        task.wait(0.15)
+        info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+        if not info or info:GetAttribute("RoomChoice") ~= true then
+            return true, "Entered Skip"
+        end
+        skip = findSkipDoor()
+        if not skip then return true, "Entered Skip" end
+        standOnTowerPart(skip.touch)
+    end
+    return true, "Skip — keep standing"
+end
+
 -- Retry every tick while the phase is open. One-shot TP missed thin doors / HoldDuration=1 prompts.
 local towerBot = {
     lastDoorTp = 0,
     lastRecruitFire = 0,
     lastShopFire = 0,
+    forceSkip = false,
 }
 
 local function towerBotTick()
@@ -1859,30 +1912,25 @@ local function towerBotTick()
     local recruitLeft = tonumber(info:GetAttribute("RecruitTimer")) or 0
     local shopLeft = tonumber(info:GetAttribute("PurchaseTimer")) or 0
 
-    local function standOn(part)
-        if not (part and part:IsA("BasePart") and part.Parent) then return false end
-        if not safeTp(part.Position) then return false end
-        local r = hrp()
-        if r and firetouchinterest then
-            pcall(firetouchinterest, part, r, 1)
-            pcall(firetouchinterest, r, part, 1)
-            task.defer(function()
-                pcall(firetouchinterest, part, r, 0)
-                pcall(firetouchinterest, r, part, 0)
-            end)
-        end
-        return true
+    if not choosing then
+        towerBot.forceSkip = false
     end
 
     if choosing then
-        local best = pickBestDoor(findTowerDoors(false))
+        local best
+        if towerBot.forceSkip then
+            best = findSkipDoor()
+        end
+        if not (best and best.touch and best.touch.Parent) then
+            best = pickBestDoor(findTowerDoors(false))
+        end
         if not (best and best.touch and best.touch.Parent) then
             best = pickBestDoor(findTowerDoors(true))
         end
         if not (best and best.touch and best.touch.Parent) then return end
         if tick() - towerBot.lastDoorTp < 0.2 then return end
         towerBot.lastDoorTp = tick()
-        standOn(best.touch)
+        standOnTowerPart(best.touch)
         return
     end
 
@@ -1894,7 +1942,7 @@ local function towerBotTick()
         if not (part and part:IsA("BasePart")) then return end
         if tick() - towerBot.lastRecruitFire < 0.25 then return end
         towerBot.lastRecruitFire = tick()
-        standOn(part)
+        standOnTowerPart(part)
         firePrompt(prompt)
         return
     end
@@ -1904,7 +1952,7 @@ local function towerBotTick()
         if not (prompt and part) then return end
         if tick() - towerBot.lastShopFire < 0.25 then return end
         towerBot.lastShopFire = tick()
-        standOn(part)
+        standOnTowerPart(part)
         firePrompt(prompt)
     end
 end
@@ -2206,7 +2254,7 @@ local function hookFastGearSummon()
     end
     return true
 end
-pcall(hookFastGearSummon)
+-- Defer: require(Gui) yields. Immediate call here used to blank the window.
 task.defer(function()
     for _ = 1, 20 do
         if hookFastGearSummon() then break end
@@ -3510,7 +3558,6 @@ local function hookStatRerollSkip()
     end
     return true
 end
-pcall(hookStatRerollSkip)
 task.defer(function()
     for _ = 1, 15 do
         if hookStatRerollSkip() then break end
@@ -4960,10 +5007,7 @@ local INDEX_TRAITS = {
 
 local function buildUnitIndex()
     local src = UNIT_DATA
-    if type(src) ~= "table" then
-        pcall(function() src = require(ReplicatedStorage.WorldModules.ItemData.Units) end)
-        UNIT_DATA = src
-    end
+    if type(src) ~= "table" then return {} end
     local list = {}
     if type(src) ~= "table" then return list end
     -- Same set as in-game UnitDex: every Unlockable unit (Limited / SecretForged included).
@@ -5105,14 +5149,8 @@ local function annotateOwned(list)
     return list
 end
 
-local function itemIcon(folder, id, fallback)
-    local src
-    pcall(function()
-        src = require(ReplicatedStorage.WorldModules.ItemData[folder])
-    end)
-    if type(src) == "table" and type(src[id]) == "table" and type(src[id].Icon) == "string" and src[id].Icon ~= "" then
-        return src[id].Icon
-    end
+local function itemIcon(_folder, _id, fallback)
+    -- Never require() while the window is building (yield → empty sidebar).
     return fallback or "diamond"
 end
 
@@ -5227,8 +5265,8 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     tog(qc, "Auto Launch", "autoQueueLaunch", true)
     tog(qc, "Use Current Progress", "storyAdaptive", true)
     qc:label("Lobby queue + RoundEnd: loss→Retry Stage, win→Next. Then re-queue adaptive.")
-    local maps = mapList()
-    if #maps == 0 then maps = MAP_KEYS end
+    -- MAP_KEYS only — mapList() requires WaveData and yields mid-tab (empty window).
+    local maps = MAP_KEYS
     local mapg, maps_ = win:flag("storyMap", maps[1] or "RookieIsland")
     qc:dropdown("Manual Map", maps, mapg, maps_, { search = true })
     local stg, sts = win:flag("storyStage", 1)
@@ -5260,6 +5298,13 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
         local ok2, err = queueTower()
         notify("Tower", ok2 and "OK" or tostring(err), ok2 and "check" or "alert-triangle")
     end)
+    tw:button("Take Skip door", function()
+        task.spawn(function()
+            local ok2, msg = takeSkipDoorNow()
+            notify("Skip", msg, ok2 and "bolt" or "alert-triangle")
+        end)
+    end)
+    tw:label("Skip is the floor-jump door (usually floor 1, center). Press during door choice.")
 
     local en = s2:card({ title = "Endless Circus", icon = "bolt", column = "right" })
     tog(en, "Auto Queue Endless", "autoQueueEndless", false, "medium")
@@ -5296,6 +5341,13 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
         win:refreshAll()
         notify("Tower Bot", "Priority reset", "list")
     end)
+    pc:button("Take Skip door", function()
+        task.spawn(function()
+            local ok2, msg = takeSkipDoorNow()
+            notify("Skip", msg, ok2 and "bolt" or "alert-triangle")
+        end)
+    end)
+    pc:label("Skip jumps from floor 1 toward your unit level. Button works even if bot would pick Elite.")
     local rc = pri:card({ title = "Recruit pick", icon = "user", column = "right" })
     local rg, rs = win:flag("towerRecruitMode", "Rarity")
     rc:dropdown("Prefer", { "Rarity", "Ranged" }, rg, rs)
@@ -5389,14 +5441,14 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
         task.spawn(LOAD.equipStrongestUnits)
     end)
     fh:button("Reset Farm Stats", function()
-        farm.coinsEarned, farm.gemsEarned, farm.essenceEarned, farm.essenceDustEarned = 0, 0, 0, 0
+        farm.coinsEarned, farm.gemsEarned, farm.essenceEarned = 0, 0, 0
         farm.pvpTokensEarned = 0
         farm.runs, farm.chestsOpened = 0, 0
         farm.chestCoins, farm.chestGems = 0, 0
         farm.pendingChestCoins, farm.pendingChestGems = 0, 0
         farm.startedAt = os.time()
         farm.lastCoins, farm.lastGems = getCurrency("Coins"), getCurrency("Gems")
-        farm.lastEssence, farm.lastEssenceDust = getCurrency("Essence"), getCurrency("EssenceDust")
+        farm.lastEssence = getCurrency("Essence")
         farm.lastPvpTokens = getCurrency("PVPTokens")
         genv.SH_Farm = farm
         flushFarmDisk()
@@ -5576,6 +5628,22 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
         unitList = (okAll and allOrErr) or {}
     end
     rebuildUnitPickLists(unitList)
+    task.defer(function()
+        if genv.SH_Session ~= SESSION then return end
+        pcall(function()
+            loadUnitData()
+            unitList = annotateOwned(buildUnitIndex()) or {}
+            rebuildUnitPickLists(unitList)
+            if setRankList then setRankList(formatUnitRankList(unitList, true, 20)) end
+            if setCount then setCount(string.format("%d units · clear score @ Lv200", #unitList)) end
+            local pick = unitNames[#unitNames] or unitNames[1]
+            if us then us(pick) end
+            local e = unitByLabel[pick]
+            if setUnitInfo then
+                setUnitInfo(formatUnitDetail(e, e and e._rank or 0, #unitList))
+            end
+        end)
+    end)
 
     local sU = tIdx:sub("Units")
     local rankCard = sU:card({ title = "Clear top · kit score", icon = "list", column = "left" })
@@ -5585,6 +5653,7 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
         setRankList = set
     end
     rankCard:button("Refresh owned tags", function()
+        pcall(loadUnitData)
         unitList = annotateOwned(buildUnitIndex())
         rebuildUnitPickLists(unitList)
         if setRankList then setRankList(formatUnitRankList(unitList, true, 20)) end
@@ -5884,8 +5953,8 @@ kb = win:keybindList({ showInactive = true, width = 168, title = "Binds" })
 sessionHud = win:hud({
     title = "Session",
     icon = "gauge",
-    width = 230,
-    position = UDim2.new(1, -246, 0, 80),
+    width = 248,
+    position = UDim2.new(1, -264, 0, 80),
     id = "session",
     interval = 0.35,
     visible = F.farmHud ~= false,
@@ -5903,10 +5972,6 @@ sessionHud:row({ icon = "sparkles-2", label = "Essence", value = function()
     local v = getCurrency("Essence")
     return v ~= nil and fmtNum(v) or "-"
 end })
-sessionHud:row({ icon = "star", label = "Essence Dust", value = function()
-    local v = getCurrency("EssenceDust")
-    return v ~= nil and fmtNum(v) or "-"
-end })
 sessionHud:row({ icon = "ticket", label = "PvP Coins", value = function()
     local v = getCurrency("PVPTokens")
     return v ~= nil and fmtNum(v) or "-"
@@ -5915,25 +5980,22 @@ sessionHud:section("Session +")
 sessionHud:row({ icon = "coin-pound", label = "Coins +", value = function()
     local elapsed = math.max(1, os.time() - (farm.startedAt or os.time()))
     local n = farm.coinsEarned or 0
-    return string.format("%s (%s)", fmtNum(n), fmtRate(n / (elapsed / 3600)))
+    return fmtNum(n) .. " · " .. fmtRate(n / (elapsed / 3600))
 end })
 sessionHud:row({ icon = "diamond", label = "Gems +", value = function()
     local elapsed = math.max(1, os.time() - (farm.startedAt or os.time()))
     local n = farm.gemsEarned or 0
-    return string.format("%s (%s)", fmtNum(n), fmtRate(n / (elapsed / 3600)))
+    return fmtNum(n) .. " · " .. fmtRate(n / (elapsed / 3600))
 end })
 sessionHud:row({ icon = "sparkles-2", label = "Essence +", value = function()
     local elapsed = math.max(1, os.time() - (farm.startedAt or os.time()))
     local n = farm.essenceEarned or 0
-    return string.format("%s (%s)", fmtNum(n), fmtRate(n / (elapsed / 3600)))
-end })
-sessionHud:row({ icon = "star", label = "Dust +", value = function()
-    return fmtNum(farm.essenceDustEarned or 0)
+    return fmtNum(n) .. " · " .. fmtRate(n / (elapsed / 3600))
 end })
 sessionHud:row({ icon = "ticket", label = "PvP Coins +", value = function()
     local elapsed = math.max(1, os.time() - (farm.startedAt or os.time()))
     local n = farm.pvpTokensEarned or 0
-    return string.format("%s (%s)", fmtNum(n), fmtRate(n / (elapsed / 3600)))
+    return fmtNum(n) .. " · " .. fmtRate(n / (elapsed / 3600))
 end })
 sessionHud:section("Farm")
 sessionHud:row({ icon = "bolt", label = "Runs", value = function() return farm.runs or 0 end })
@@ -6019,9 +6081,11 @@ matchHud:row({
 -- Index HUD: top units only (gear/runes/traits live in Index tab — fewer GuiObjects = less lag)
 do
     local unitList = {}
-    pcall(function()
-        unitList = IDX.annotateOwned(IDX.buildUnitIndex()) or {}
-    end)
+    if type(UNIT_DATA) == "table" then
+        pcall(function()
+            unitList = IDX.annotateOwned(IDX.buildUnitIndex()) or {}
+        end)
+    end
     local rarityName = IDX.rarityName
     local topN = math.clamp(math.floor(tonumber(F.indexHudTopN) or 6), 4, 10)
 
@@ -6157,8 +6221,8 @@ task.spawn(function()
     farm.lastCoins = getCurrency("Coins")
     farm.lastGems = getCurrency("Gems")
     farm.lastEssence = getCurrency("Essence")
-    farm.lastEssenceDust = getCurrency("EssenceDust")
     farm.lastPvpTokens = getCurrency("PVPTokens")
+    pcall(loadUnitData)
     if not farm.startedAt then farm.startedAt = os.time() end
     genv.SH_Farm = farm
     flushFarmDisk()
@@ -6177,11 +6241,6 @@ end -- __SH_UI__
 do
     local okUi, errUi = pcall(__SH_UI__)
     if not okUi then
-        genv.SH_Booting = false
-        genv.SH_LoadLock = nil
-        genv.SH_Alive = false
-        genv.SH_BootPlace = nil
-        -- warn may be muted by game noise filter — always toast too
         pcall(function()
             warn("[SH] UI build failed: " .. tostring(errUi))
         end)
@@ -6195,7 +6254,12 @@ do
                 })
             end
         end)
-        return
+        pcall(function()
+            local t = win:tab({ name = "Recover", icon = "alert-triangle", group = "Main", subtitle = "UI error" })
+            local c = t:sub("Error"):card({ title = "UI build failed", icon = "alert-triangle", column = "left" })
+            c:label(tostring(errUi):sub(1, 240))
+            c:label("Re-execute the script. Farm still runs.")
+        end)
     end
 end
 
