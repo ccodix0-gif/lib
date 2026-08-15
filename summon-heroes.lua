@@ -5194,6 +5194,10 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     tog(sc, "Enabled", "skipCutscene", true)
     sc:label("Clicks to skip cutscenes + dialogue. Does not press Space (no jump).")
 
+    local sk = s:card({ title = "Tower Skip doors", icon = "gauge", column = "right" })
+    tog(sk, "Take Skip doors", "towerPreferSkip", true)
+    sk:label("Infinite Tower: if a Skip door appears, the bot enters it (floor jump). Off = ignore that door.")
+
     local sf = s:card({ title = "Solo Fast", icon = "bolt", column = "left" })
     tog(sf, "Solo Fast Match", "soloFastMatch", true)
     tog(sf, "Force Auto Special", "forceAutoSpecial", true)
@@ -5250,12 +5254,12 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     ac:label("No stage levels in AFK Waves — just start + vote.")
 
     local tw = s2:card({ title = "Infinite Tower", icon = "gauge", column = "left" })
+    tog(tw, "Take Skip doors", "towerPreferSkip", true)
     tog(tw, "Auto Queue Tower", "autoQueueTower", false, "medium")
     slider(tw, "Queue interval", "towerQueueInterval", 4, 20, 6, 0)
     slider(tw, "Difficulty index", "towerDifficulty", 1, 4, 1, 0)
     togBind(tw, "Tower Bot", "towerBot", false, "T", "medium")
-    tog(tw, "Always take Skip doors", "towerPreferSkip", true)
-    tw:label("Skip door jumps you near your usual floor (−10). Bot takes it whenever it appears. Off = ignore Skip.")
+    tw:label("Skip door = floor jump. On = bot always enters it. Merchant shops still follow Tower Bot settings.")
     tw:button("Queue Tower Now", function()
         local ok2, err = queueTower()
         notify("Tower", ok2 and "OK" or tostring(err), ok2 and "check" or "alert-triangle")
@@ -5276,8 +5280,8 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
 
     local pri = tFarm:sub("Tower Bot")
     local pc = pri:card({ title = "Door priority", icon = "list", column = "left" })
-    tog(pc, "Always take Skip doors", "towerPreferSkip", true)
-    pc:label("Skip = level jump (not cutscene). On = enter Skip if that door is up. Then the list below.")
+    tog(pc, "Take Skip doors", "towerPreferSkip", true)
+    pc:label("If a Skip door is up, take it first. Then Elite/Chest/… from the list.")
     win:flag("towerDoorOrder", { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" })
     getDoorOrder() -- migrate old slider / 6-slot configs
     local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick", "7th pick" }
