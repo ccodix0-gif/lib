@@ -1610,8 +1610,9 @@ local ROOM_ALIASES = {
     Boss = "Elite", Merchant = "Merchant", Skip = "Skip",
 }
 
-local DOOR_ORDER_KEYS = { "Elite", "Chest", "Healing", "Mystery", "Recruit", "Combat", "Merchant" }
+local DOOR_ORDER_KEYS = { "Skip", "Elite", "Chest", "Healing", "Mystery", "Recruit", "Combat", "Merchant" }
 local DOOR_ORDER_LABEL = {
+    Skip = "Skip (floor jump)",
     Elite = "Elite / Boss",
     Chest = "Chest",
     Healing = "Healing",
@@ -1620,6 +1621,7 @@ local DOOR_ORDER_LABEL = {
     Combat = "Combat",
     Merchant = "Merchant shop",
 }
+local DEFAULT_DOOR_ORDER = { "Skip", "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" }
 local DOOR_LABEL_TO_KEY = {}
 for k, v in pairs(DOOR_ORDER_LABEL) do DOOR_LABEL_TO_KEY[v] = k end
 local DOOR_ORDER_OPTIONS = {}
@@ -1651,9 +1653,28 @@ local function doorOrderValid(o, n)
     return true
 end
 
+local function insertSkipSlot(order)
+    local new = table.clone(order)
+    for _, k in ipairs(new) do
+        if k == "Skip" then return new end
+    end
+    -- Old toggle defaulted on = Skip was always first. Off = last (only if nothing else).
+    if F.towerPreferSkip == false then
+        table.insert(new, "Skip")
+    else
+        table.insert(new, 1, "Skip")
+    end
+    return new
+end
+
 local function getDoorOrder()
     local o = F.towerDoorOrder
-    if doorOrderValid(o, 7) then return o end
+    if doorOrderValid(o, 8) then return o end
+    if doorOrderValid(o, 7) then
+        local new = insertSkipSlot(o)
+        F.towerDoorOrder = new
+        return new
+    end
     if doorOrderValid(o, 6) then
         local new = table.clone(o)
         local at = #new + 1
@@ -1664,10 +1685,11 @@ local function getDoorOrder()
             end
         end
         table.insert(new, at, "Merchant")
+        new = insertSkipSlot(new)
         F.towerDoorOrder = new
         return new
     end
-    local order = { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" }
+    local order = table.clone(DEFAULT_DOOR_ORDER)
     F.towerDoorOrder = order
     return order
 end
@@ -1690,11 +1712,6 @@ end
 
 local function roomPriority(roomType)
     if roomType == "Merchant" and F.towerEnterMerchant == false then return 999 end
-    -- Skip door: jumps floor to ~your usual tower level −10. Toggle = always take it.
-    if roomType == "Skip" then
-        if F.towerPreferSkip ~= false then return -1 end
-        return 80
-    end
     local order = getDoorOrder()
     for i, k in ipairs(order) do
         if k == roomType then return i end
@@ -1768,15 +1785,9 @@ local function findTowerDoors(relaxLit)
 end
 
 local function pickBestDoor(doors)
-    if F.towerPreferSkip ~= false then
-        for _, door in ipairs(doors) do
-            if door.roomType == "Skip" then return door end
-        end
-    end
     local best, bestScore
     for _, door in ipairs(doors) do
         if door.roomType == "Merchant" and F.towerEnterMerchant == false then continue end
-        if door.roomType == "Skip" and F.towerPreferSkip == false then continue end
         local score = roomPriority(door.roomType)
         if not best or score < bestScore then
             best, bestScore = door, score
@@ -5334,10 +5345,6 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     tog(sc, "Enabled", "skipCutscene", true)
     sc:label("Clicks to skip cutscenes + dialogue. Does not press Space (no jump).")
 
-    local sk = s:card({ title = "Tower Skip doors", icon = "gauge", column = "right" })
-    tog(sk, "Take Skip doors", "towerPreferSkip", true)
-    sk:label("Infinite Tower: if a Skip door appears, the bot enters it (floor jump). Off = ignore that door.")
-
     local sf = s:card({ title = "Solo Fast", icon = "bolt", column = "left" })
     tog(sf, "Solo Fast Match", "soloFastMatch", true)
     tog(sf, "Force Auto Special", "forceAutoSpecial", true)
@@ -5394,12 +5401,11 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     ac:label("No stage levels in AFK Waves — just start + vote.")
 
     local tw = s2:card({ title = "Infinite Tower", icon = "gauge", column = "left" })
-    tog(tw, "Take Skip doors", "towerPreferSkip", true)
     tog(tw, "Auto Queue Tower", "autoQueueTower", false, "medium")
     slider(tw, "Queue interval", "towerQueueInterval", 4, 20, 6, 0)
     slider(tw, "Difficulty index", "towerDifficulty", 1, 4, 1, 0)
     togBind(tw, "Tower Bot", "towerBot", false, "T", "medium")
-    tw:label("Skip door = floor jump. On = bot always enters it. Merchant shops still follow Tower Bot settings.")
+    tw:label("Door order is Farm → Tower Bot → Door priority (Skip is a slot there). Merchant shop still has its own card.")
     tw:button("Queue Tower Now", function()
         local ok2, err = queueTower()
         notify("Tower", ok2 and "OK" or tostring(err), ok2 and "check" or "alert-triangle")
@@ -5420,12 +5426,11 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
 
     local pri = tFarm:sub("Tower Bot")
     local pc = pri:card({ title = "Door priority", icon = "list", column = "left" })
-    tog(pc, "Take Skip doors", "towerPreferSkip", true)
-    pc:label("If a Skip door is up, take it first. Then Elite/Chest/… from the list.")
-    win:flag("towerDoorOrder", { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" })
-    getDoorOrder() -- migrate old slider / 6-slot configs
-    local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick", "7th pick" }
-    for slot = 1, 7 do
+    pc:label("Best first. Skip = floor jump. Merchant is a shop. Change a slot — duplicates swap places.")
+    win:flag("towerDoorOrder", table.clone(DEFAULT_DOOR_ORDER))
+    getDoorOrder() -- migrate old 6/7-slot configs (adds Skip)
+    local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick", "7th pick", "8th pick" }
+    for slot = 1, 8 do
         pc:dropdown(slotNames[slot], DOOR_ORDER_OPTIONS, function()
             local o = getDoorOrder()
             return DOOR_ORDER_LABEL[o[slot]] or DOOR_ORDER_OPTIONS[slot]
@@ -5436,7 +5441,7 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
         end)
     end
     pc:button("Reset default order", function()
-        F.towerDoorOrder = { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" }
+        F.towerDoorOrder = table.clone(DEFAULT_DOOR_ORDER)
         win:markDirty()
         win:refreshAll()
         notify("Tower Bot", "Priority reset", "list")
@@ -6027,6 +6032,7 @@ tabOk("HUD", function()
 pcall(function()
     win:loadConfig(autoName)
 end)
+pcall(getDoorOrder) -- 7-slot saves become 8 (Skip in the list)
 -- Keep lib overlay positions from config; also F.hudLayout from flags.
 -- Do NOT wipe _overlayPos — that killed restores.
 if F.farmHud == nil then F.farmHud = true end
