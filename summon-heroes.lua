@@ -1575,7 +1575,11 @@ end
 
 local function roomPriority(roomType)
     if roomType == "Merchant" and F.towerEnterMerchant == false then return 999 end
-    if roomType == "Skip" then return 1.5 end -- level jump, keep strong
+    -- Skip door: jumps floor to ~your usual tower level −10. Toggle = always take it.
+    if roomType == "Skip" then
+        if F.towerPreferSkip ~= false then return -1 end
+        return 80
+    end
     local order = getDoorOrder()
     for i, k in ipairs(order) do
         if k == roomType then return i end
@@ -1649,9 +1653,15 @@ local function findTowerDoors(relaxLit)
 end
 
 local function pickBestDoor(doors)
+    if F.towerPreferSkip ~= false then
+        for _, door in ipairs(doors) do
+            if door.roomType == "Skip" then return door end
+        end
+    end
     local best, bestScore
     for _, door in ipairs(doors) do
         if door.roomType == "Merchant" and F.towerEnterMerchant == false then continue end
+        if door.roomType == "Skip" and F.towerPreferSkip == false then continue end
         local score = roomPriority(door.roomType)
         if not best or score < bestScore then
             best, bestScore = door, score
@@ -1838,65 +1848,11 @@ local function safeTp(pos)
     return true
 end
 
-local function standOnTowerPart(part)
-    if not (part and part:IsA("BasePart") and part.Parent) then return false end
-    if not safeTp(part.Position) then return false end
-    local r = hrp()
-    if r and firetouchinterest then
-        pcall(firetouchinterest, part, r, 1)
-        pcall(firetouchinterest, r, part, 1)
-        task.defer(function()
-            pcall(firetouchinterest, part, r, 0)
-            pcall(firetouchinterest, r, part, 0)
-        end)
-    end
-    return true
-end
-
-local function findSkipDoor()
-    local doors = findTowerDoors(false)
-    if #doors == 0 then doors = findTowerDoors(true) end
-    for _, d in ipairs(doors) do
-        if d.roomType == "Skip" and d.touch and d.touch.Parent then
-            return d
-        end
-    end
-    return nil
-end
-
-local function takeSkipDoorNow()
-    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
-    if not info then return false, "Not in Tower" end
-    towerBot.forceSkip = true
-    local skip = findSkipDoor()
-    if not skip then
-        if info:GetAttribute("RoomChoice") ~= true then
-            return false, "Wait for door choice"
-        end
-        return false, "No Skip door this floor"
-    end
-    if not standOnTowerPart(skip.touch) then
-        return false, "TP failed"
-    end
-    for _ = 1, 8 do
-        task.wait(0.15)
-        info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
-        if not info or info:GetAttribute("RoomChoice") ~= true then
-            return true, "Entered Skip"
-        end
-        skip = findSkipDoor()
-        if not skip then return true, "Entered Skip" end
-        standOnTowerPart(skip.touch)
-    end
-    return true, "Skip — keep standing"
-end
-
 -- Retry every tick while the phase is open. One-shot TP missed thin doors / HoldDuration=1 prompts.
 local towerBot = {
     lastDoorTp = 0,
     lastRecruitFire = 0,
     lastShopFire = 0,
-    forceSkip = false,
 }
 
 local function towerBotTick()
@@ -1912,25 +1868,30 @@ local function towerBotTick()
     local recruitLeft = tonumber(info:GetAttribute("RecruitTimer")) or 0
     local shopLeft = tonumber(info:GetAttribute("PurchaseTimer")) or 0
 
-    if not choosing then
-        towerBot.forceSkip = false
+    local function standOn(part)
+        if not (part and part:IsA("BasePart") and part.Parent) then return false end
+        if not safeTp(part.Position) then return false end
+        local r = hrp()
+        if r and firetouchinterest then
+            pcall(firetouchinterest, part, r, 1)
+            pcall(firetouchinterest, r, part, 1)
+            task.defer(function()
+                pcall(firetouchinterest, part, r, 0)
+                pcall(firetouchinterest, r, part, 0)
+            end)
+        end
+        return true
     end
 
     if choosing then
-        local best
-        if towerBot.forceSkip then
-            best = findSkipDoor()
-        end
-        if not (best and best.touch and best.touch.Parent) then
-            best = pickBestDoor(findTowerDoors(false))
-        end
+        local best = pickBestDoor(findTowerDoors(false))
         if not (best and best.touch and best.touch.Parent) then
             best = pickBestDoor(findTowerDoors(true))
         end
         if not (best and best.touch and best.touch.Parent) then return end
         if tick() - towerBot.lastDoorTp < 0.2 then return end
         towerBot.lastDoorTp = tick()
-        standOnTowerPart(best.touch)
+        standOn(best.touch)
         return
     end
 
@@ -1942,7 +1903,7 @@ local function towerBotTick()
         if not (part and part:IsA("BasePart")) then return end
         if tick() - towerBot.lastRecruitFire < 0.25 then return end
         towerBot.lastRecruitFire = tick()
-        standOnTowerPart(part)
+        standOn(part)
         firePrompt(prompt)
         return
     end
@@ -1952,7 +1913,7 @@ local function towerBotTick()
         if not (prompt and part) then return end
         if tick() - towerBot.lastShopFire < 0.25 then return end
         towerBot.lastShopFire = tick()
-        standOnTowerPart(part)
+        standOn(part)
         firePrompt(prompt)
     end
 end
@@ -5293,18 +5254,12 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     slider(tw, "Queue interval", "towerQueueInterval", 4, 20, 6, 0)
     slider(tw, "Difficulty index", "towerDifficulty", 1, 4, 1, 0)
     togBind(tw, "Tower Bot", "towerBot", false, "T", "medium")
-    tw:label("In Tower match: picks doors by priority. Merchant shops buy combat bonuses. Always Retry on end.")
+    tog(tw, "Always take Skip doors", "towerPreferSkip", true)
+    tw:label("Skip door jumps you near your usual floor (−10). Bot takes it whenever it appears. Off = ignore Skip.")
     tw:button("Queue Tower Now", function()
         local ok2, err = queueTower()
         notify("Tower", ok2 and "OK" or tostring(err), ok2 and "check" or "alert-triangle")
     end)
-    tw:button("Take Skip door", function()
-        task.spawn(function()
-            local ok2, msg = takeSkipDoorNow()
-            notify("Skip", msg, ok2 and "bolt" or "alert-triangle")
-        end)
-    end)
-    tw:label("Skip is the floor-jump door (usually floor 1, center). Press during door choice.")
 
     local en = s2:card({ title = "Endless Circus", icon = "bolt", column = "right" })
     tog(en, "Auto Queue Endless", "autoQueueEndless", false, "medium")
@@ -5321,7 +5276,8 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
 
     local pri = tFarm:sub("Tower Bot")
     local pc = pri:card({ title = "Door priority", icon = "list", column = "left" })
-    pc:label("Best first. Merchant is a shop room. Change a slot — duplicates swap places.")
+    tog(pc, "Always take Skip doors", "towerPreferSkip", true)
+    pc:label("Skip = level jump (not cutscene). On = enter Skip if that door is up. Then the list below.")
     win:flag("towerDoorOrder", { "Elite", "Chest", "Merchant", "Healing", "Mystery", "Recruit", "Combat" })
     getDoorOrder() -- migrate old slider / 6-slot configs
     local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick", "7th pick" }
@@ -5341,13 +5297,6 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
         win:refreshAll()
         notify("Tower Bot", "Priority reset", "list")
     end)
-    pc:button("Take Skip door", function()
-        task.spawn(function()
-            local ok2, msg = takeSkipDoorNow()
-            notify("Skip", msg, ok2 and "bolt" or "alert-triangle")
-        end)
-    end)
-    pc:label("Skip jumps from floor 1 toward your unit level. Button works even if bot would pick Elite.")
     local rc = pri:card({ title = "Recruit pick", icon = "user", column = "right" })
     local rg, rs = win:flag("towerRecruitMode", "Rarity")
     rc:dropdown("Prefer", { "Rarity", "Ranged" }, rg, rs)
