@@ -2,7 +2,8 @@
 -- Lobby placeId 117381420723145 | Waves placeId 80877167393789 | gameId 9802644580
 -- Disk: settings/configs only. No script copy / farm.json on PC (Luarmor-ready).
 -- Event currency HUD = Essence (Infinite Tower / Gear). Legacy Seashells/Event removed from UI.
--- Reminder: re-upload src/lib/interface.luau as interface.lua for the lib to update.
+-- Reminder: re-upload src/lib/interface.luau as interface.lua for the lib to update
+-- (version 2026.08.15.01: opts.open=false so the shell stays hidden until tabs exist).
 
 _G.NewRealityShowcase = false
 
@@ -96,10 +97,19 @@ do
     genv.SH_FromTeleport = nil
 
     -- Already running / mid-boot on this place (stacked queue copies).
+    -- genv flags survive teleport; the ScreenGui does not. Skip only if a live window exists.
     if fromTp and genv.SH_BootPlace == game.PlaceId then
-        if genv.SH_Alive == true or genv.SH_Booting == true then
+        local live = false
+        pcall(function()
+            for _, s in ipairs(genv.SH_Screens or {}) do
+                if s and s.Parent then live = true end
+            end
+        end)
+        if live and (genv.SH_Alive == true or genv.SH_Booting == true) then
             return
         end
+        genv.SH_Alive = false
+        genv.SH_Booting = false
     end
 
     local token = tostring(os.clock()) .. "_" .. tostring(math.random(1, 1e9))
@@ -169,6 +179,39 @@ local function loadLibrary()
     return nil, "no library found, tried " .. table.concat(notes, "; ")
 end
 
+-- Autoexec / queue_on_teleport run on the loading screen. The UI library captures
+-- Players.LocalPlayer at chunk load; UI.new there paints an empty NewReality that
+-- never gets tabs (Plugin dies on the next yield). Wait before both.
+local Players = game:GetService("Players")
+local function waitPlaceReady(sec)
+    local t0 = os.clock()
+    while os.clock() - t0 < (sec or 30) do
+        if not stillThisBoot() then return false end
+        local loaded = false
+        pcall(function() loaded = game:IsLoaded() end)
+        local lp = Players.LocalPlayer
+        if loaded and lp and lp:FindFirstChild("PlayerGui") then
+            task.wait(0.5)
+            return stillThisBoot()
+        end
+        task.wait(0.12)
+    end
+    return Players.LocalPlayer ~= nil
+end
+if not waitPlaceReady(30) then
+    if not stillThisBoot() then return end
+end
+if not stillThisBoot() then
+    return
+end
+if not Players.LocalPlayer then
+    genv.SH_Booting = false
+    genv.SH_LoadLock = nil
+    genv.SH_Alive = false
+    warn("[SH] LocalPlayer missing")
+    return
+end
+
 local UI, loadErr = loadLibrary()
 if not stillThisBoot() then
     return
@@ -182,7 +225,6 @@ if not UI then
 end
 
 -- ============================================================ SERVICES
-local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
@@ -193,9 +235,17 @@ local HttpService = game:GetService("HttpService")
 local TweenService = game:GetService("TweenService")
 
 local LP = Players.LocalPlayer
+if not LP then
+    genv.SH_Booting = false
+    genv.SH_LoadLock = nil
+    warn("[SH] LocalPlayer missing")
+    return
+end
 local Camera = Workspace.CurrentCamera
-Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-    if Workspace.CurrentCamera then Camera = Workspace.CurrentCamera end
+pcall(function()
+    Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        if Workspace.CurrentCamera then Camera = Workspace.CurrentCamera end
+    end)
 end)
 
 local PLACE_LOBBY = 117381420723145
@@ -208,7 +258,11 @@ local PLACE_PVP = {
     [80728320154598] = true,
 }
 -- Settings/configs live under NewReality (UI lib). Loader URL may be cached on disk; never script source.
-local ESP_FONT = Font.new("rbxasset://fonts/families/Arial.json", Enum.FontWeight.Heavy, Enum.FontStyle.Normal)
+local ESP_FONT
+do
+    local ok, font = pcall(Font.new, "rbxasset://fonts/families/Arial.json", Enum.FontWeight.Heavy, Enum.FontStyle.Normal)
+    if ok then ESP_FONT = font end
+end
 
 -- Kill leftover GUIs / highlights from a previous stacked run
 pcall(wipeShGuis)
@@ -216,33 +270,13 @@ if not stillThisBoot() then
     return
 end
 
-local win = UI.new({ icon = "logo", toggleKey = Enum.KeyCode.RightShift })
-if not stillThisBoot() then
-    pcall(function()
-        if win and win.unload then
-            win:unload()
-        elseif win and win.screen then
-            win.screen:Destroy()
-        end
-    end)
-    return
-end
-pcall(function()
-    if win and win.screen then
-        win.screen:SetAttribute("SH_UI", true)
-        genv.SH_Screens = genv.SH_Screens or {}
-        table.insert(genv.SH_Screens, win.screen)
-    end
-end)
+-- Window is created immediately before tabs. UI.new on this thread *before* the
+-- helper IIFEs used to flash an empty NewReality (chrome, no sidebar) because
+-- the next yield killed Plugin and win:tab never ran.
+local win
+local F = {}
 local wm, kb
-local F = win.flags
-
-local espGui = Instance.new("ScreenGui")
-espGui.Name = "SH_ESP"
-espGui.ResetOnSpawn = false
-espGui.IgnoreGuiInset = true
-pcall(function() espGui:SetAttribute("SH_UI", true) end)
-pcall(function() espGui.DisplayOrder = 20 end)
+local espGui, hudGui
 -- Never WaitForChild on this thread — a yield before win:tab strips Plugin and leaves an empty window.
 local function parentShGui(gui)
     local pg = LP and LP:FindFirstChild("PlayerGui")
@@ -252,21 +286,73 @@ local function parentShGui(gui)
     end
     pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
 end
-parentShGui(espGui)
+local function ensureEspHud()
+    if not (espGui and espGui.Parent) then
+        local g = Instance.new("ScreenGui")
+        g.Name = "SH_ESP"
+        g.ResetOnSpawn = false
+        g.IgnoreGuiInset = true
+        pcall(function() g:SetAttribute("SH_UI", true) end)
+        pcall(function() g.DisplayOrder = 20 end)
+        parentShGui(g)
+        espGui = g
+    end
+    if not (hudGui and hudGui.Parent) then
+        local g = Instance.new("ScreenGui")
+        g.Name = "SH_HUD"
+        g.ResetOnSpawn = false
+        g.IgnoreGuiInset = true
+        g.Enabled = true
+        pcall(function() g:SetAttribute("SH_UI", true) end)
+        pcall(function() g.DisplayOrder = 1e9 end)
+        pcall(function() g.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
+        parentShGui(g)
+        hudGui = g
+    end
+end
 
-local hudGui = Instance.new("ScreenGui")
-hudGui.Name = "SH_HUD"
-hudGui.ResetOnSpawn = false
-hudGui.IgnoreGuiInset = true
-hudGui.Enabled = true
-pcall(function() hudGui:SetAttribute("SH_UI", true) end)
-pcall(function() hudGui.DisplayOrder = 1e9 end)
-pcall(function() hudGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
-parentShGui(hudGui)
-task.defer(function()
-    if not hudGui or hudGui.Parent then return end
-    parentShGui(hudGui)
-end)
+local function createWindow()
+    if win then return true end
+    if not stillThisBoot() then return false end
+    pcall(wipeShGuis)
+    local okNew, result = pcall(function()
+        return UI.new({
+            icon = "logo",
+            toggleKey = Enum.KeyCode.RightShift,
+            entrance = false,
+            open = false,
+        })
+    end)
+    if not okNew or type(result) ~= "table" or type(result.tab) ~= "function" then
+        warn("[SH] UI.new failed: " .. tostring(result))
+        return false
+    end
+    win = result
+    if type(win.flags) == "table" and win.flags ~= F then
+        for k, v in pairs(win.flags) do
+            if F[k] == nil then F[k] = v end
+        end
+    end
+    win.flags = F
+    pcall(function()
+        if win._open then
+            win:toggle(false)
+        end
+        if win.window then
+            win.window.Visible = false
+            win._open = false
+        end
+    end)
+    pcall(function()
+        if win.screen then
+            win.screen:SetAttribute("SH_UI", true)
+            genv.SH_Screens = genv.SH_Screens or {}
+            table.insert(genv.SH_Screens, win.screen)
+        end
+    end)
+    pcall(ensureEspHud)
+    return true
+end
 
 -- ============================================================ PERSIST / TELEPORT RELOAD
 -- URL only on disk (Luarmor-safe). Never write script source.
@@ -591,7 +677,12 @@ local function flushFarmDisk()
     lastFarmSaveAt = tick()
 end
 
-pcall(armTeleportReload)
+-- After tabs exist. queue_on_teleport / writefile can yield and used to blank the window.
+task.defer(function()
+    if stillThisBoot() then
+        pcall(armTeleportReload)
+    end
+end)
 
 -- Unload hook so a re-exec kills the previous instance instead of stacking
 genv.SH_Unload = function()
@@ -2286,6 +2377,8 @@ local function destroyDraw(d)
     end
 end
 local function makeLabel()
+    if not (espGui and espGui.Parent) then pcall(ensureEspHud) end
+    if not espGui then return nil end
     local f = Instance.new("Frame")
     f.BackgroundTransparency = 1
     f.AutomaticSize = Enum.AutomaticSize.XY
@@ -2541,6 +2634,7 @@ local function updateChestEsp()
         seen[key] = true
         local d = chestDraw[key]
         if not d then d = makeLabel(); chestDraw[key] = d end
+        if not d then continue end
         local col = colOf("chestEspColor", 255, 210, 90)
         local vis = chestVisual(part)
         local anchor = part
@@ -5162,6 +5256,9 @@ end)()
 -- Separate proto so tab builders don't compete with helper locals for registers.
 local function __SH_UI__()
 if not stillThisBoot() then return end
+if not createWindow() then
+    error("UI.new failed")
+end
 -- One failed tab must not abort the rest (re-exec used to leave a half-empty window).
 local function tabOk(name, fn)
     local ok, err = pcall(fn)
@@ -6285,6 +6382,11 @@ do
         end
         genv.SH_Alive = true
         genv.SH_BootPlace = game.PlaceId
+        pcall(function()
+            if win and win.window and not win._open then
+                win:toggle(true)
+            end
+        end)
     elseif not stillThisBoot() then
         pcall(function()
             if win and win.unload then
