@@ -117,10 +117,8 @@ do
     genv.SH_Booting = true
     genv.SH_LoadLock = os.clock()
     genv.SH_BootPlace = game.PlaceId
-    task.wait(0.08)
-    if genv.SH_BootClaim ~= token then
-        return
-    end
+    -- Do NOT task.wait here. Autoexec + wait = Plugin gone, UI.new paints an empty
+    -- NewReality (search bar, no tabs). HttpGet below is the race window.
 
     -- Manual re-exec / hop: tear down leftovers so UIs never stack.
     if genv.SH_Unload then
@@ -179,46 +177,12 @@ local function loadLibrary()
     return nil, "no library found, tried " .. table.concat(notes, "; ")
 end
 
--- Autoexec / queue_on_teleport run on the loading screen. The UI library captures
--- Players.LocalPlayer at chunk load; UI.new there paints an empty NewReality that
--- never gets tabs (Plugin dies on the next yield). Wait before both.
-local Players = game:GetService("Players")
-local function waitPlaceReady(sec)
-    local t0 = os.clock()
-    while os.clock() - t0 < (sec or 30) do
-        if not stillThisBoot() then return false end
-        local loaded = false
-        pcall(function() loaded = game:IsLoaded() end)
-        local lp = Players.LocalPlayer
-        if loaded and lp and lp:FindFirstChild("PlayerGui") then
-            -- Game client prints "Game fully loaded" after IsLoaded. ClientLoaded /
-            -- character exist only then — UI.new before that = empty NewReality.
-            local clientOk = lp:GetAttribute("ClientLoaded")
-            local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-            if root and (clientOk == true or os.clock() - t0 > 8) then
-                task.wait(0.4)
-                return stillThisBoot()
-            end
-        end
-        task.wait(0.12)
-    end
-    return Players.LocalPlayer ~= nil
-end
-if not waitPlaceReady(30) then
-    if not stillThisBoot() then return end
-end
-if not stillThisBoot() then
-    return
-end
-if not Players.LocalPlayer then
-    genv.SH_Booting = false
-    genv.SH_LoadLock = nil
-    genv.SH_Alive = false
-    warn("[SH] LocalPlayer missing")
-    return
-end
-
+-- Kit first, then the window. Any task.wait before UI.new (autoexec waiting for
+-- character / ClientLoaded) is what left NewReality empty: chrome + search, no tabs.
 local UI, loadErr = loadLibrary()
+if genv.SH_BootClaim ~= BOOT_TOKEN then
+    return
+end
 if not stillThisBoot() then
     return
 end
@@ -230,7 +194,7 @@ if not UI then
     return
 end
 
--- ============================================================ SERVICES
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
@@ -241,12 +205,8 @@ local HttpService = game:GetService("HttpService")
 local TweenService = game:GetService("TweenService")
 
 local LP = Players.LocalPlayer
-if not LP then
-    genv.SH_Booting = false
-    genv.SH_LoadLock = nil
-    warn("[SH] LocalPlayer missing")
-    return
-end
+-- Autoexec can run before LocalPlayer. Do not Wait() — that blanks the window.
+-- Bots read LP later; after tabs we assign it if it showed up.
 local Camera = Workspace.CurrentCamera
 pcall(function()
     Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
@@ -264,11 +224,6 @@ local PLACE_PVP = {
     [80728320154598] = true,
 }
 -- Settings/configs live under NewReality (UI lib). Loader URL may be cached on disk; never script source.
-local ESP_FONT
-do
-    local ok, font = pcall(Font.new, "rbxasset://fonts/families/Arial.json", Enum.FontWeight.Heavy, Enum.FontStyle.Normal)
-    if ok then ESP_FONT = font end
-end
 
 -- Kill leftover GUIs / highlights from a previous stacked run
 pcall(wipeShGuis)
@@ -520,8 +475,9 @@ local function writeLoaderUrlDisk(url)
     return ok == true
 end
 
--- Boot: restore URL from disk if genv/config empty
-do
+-- Boot: restore URL from disk AFTER the window exists (readfile yields).
+task.defer(function()
+    if not stillThisBoot() then return end
     local disk = readLoaderUrlDisk()
     if disk then
         if type(genv.SH_ScriptUrl) ~= "string" or #genv.SH_ScriptUrl < 9 then
@@ -531,7 +487,7 @@ do
             F.scriptUrl = disk
         end
     end
-end
+end)
 
 local function resolveScriptUrl()
     local u = F.scriptUrl or genv.SH_ScriptUrl or genv.SH_HttpUrl or readLoaderUrlDisk()
@@ -6145,12 +6101,10 @@ local function trimAutoName(s)
     return s
 end
 
-local autoName = trimAutoName(win:getAutoLoad()) or "default"
+-- Do not getAutoLoad/loadConfig on this thread — readfile yields and used to
+-- blank the window on autoexec. Tabs first, config in task.defer below.
+local autoName = "default"
 tabOk("HUD", function()
-pcall(function()
-    win:loadConfig(autoName)
-end)
-pcall(getDoorOrder) -- 7-slot saves become 8 (Skip in the list)
 -- Keep lib overlay positions from config; also F.hudLayout from flags.
 -- Do NOT wipe _overlayPos — that killed restores.
 if F.farmHud == nil then F.farmHud = true end
@@ -6410,12 +6364,22 @@ do
 end
 
 -- Restore HUD positions from hud-layout.json (manual Save only — no drag hooks / no autosave).
-pcall(function()
-    genv.SH_ApplyHudLayout()
+-- File I/O after tabs exist.
+task.defer(function()
+    if genv.SH_Session ~= SESSION or not stillThisBoot() then return end
+    if not LP then LP = Players.LocalPlayer end
+    autoName = trimAutoName(win:getAutoLoad()) or autoName or "default"
+    pcall(function() win:loadConfig(autoName) end)
+    pcall(getDoorOrder)
+    pcall(function() genv.SH_ApplyHudLayout() end)
+    pcall(function()
+        win:setAutoLoad(autoName)
+        win:setAutoSave(autoName)
+        win:refreshAll()
+        win._dirty = false
+    end)
 end)
 
-win:setAutoLoad(autoName)
-win:setAutoSave(autoName)
 win:refreshAll()
 pcall(function() win._dirty = false end)
 
