@@ -191,8 +191,14 @@ local function waitPlaceReady(sec)
         pcall(function() loaded = game:IsLoaded() end)
         local lp = Players.LocalPlayer
         if loaded and lp and lp:FindFirstChild("PlayerGui") then
-            task.wait(0.5)
-            return stillThisBoot()
+            -- Game client prints "Game fully loaded" after IsLoaded. ClientLoaded /
+            -- character exist only then — UI.new before that = empty NewReality.
+            local clientOk = lp:GetAttribute("ClientLoaded")
+            local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+            if root and (clientOk == true or os.clock() - t0 > 8) then
+                task.wait(0.4)
+                return stillThisBoot()
+            end
         end
         task.wait(0.12)
     end
@@ -773,6 +779,24 @@ local function isPvpWorld()
         end
     end
     return false
+end
+
+-- Live Endless Circus folder (not the Gui template under Systems.Gui.Interface).
+local function isEndlessMatch()
+    local wi = ReplicatedStorage:FindFirstChild("EndlessWaveInfo")
+    if not (wi and wi:IsA("Folder")) then return false end
+    return wi:GetAttribute("Intermission") ~= nil
+        or wi:GetAttribute("EndTime") ~= nil
+        or wi:GetAttribute("Points") ~= nil
+end
+
+local function isTowerMatch()
+    if isEndlessMatch() then return false end
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    if not (info and info:IsA("Folder")) then return false end
+    return info:GetAttribute("CurrentRoomNum") ~= nil
+        or info:GetAttribute("RoomChoice") ~= nil
+        or info:GetAttribute("FloorCleared") ~= nil
 end
 
 local function char() return LP.Character end
@@ -1707,7 +1731,9 @@ local function setDoorOrderSlot(slot, key)
     end
     order[slot] = key
     F.towerDoorOrder = order
-    win:markDirty()
+    pcall(function()
+        if win and win.markDirty then win:markDirty() end
+    end)
 end
 
 local function roomPriority(roomType)
@@ -1719,19 +1745,80 @@ local function roomPriority(roomType)
     return 50
 end
 
--- Prefer lit ExitDoors (Ring beams). Later themes sometimes have no beams — then Screen+Touch is enough.
+-- Live choice doors keep Ring. After a pick the game destroys Ring (and Screen on losers).
+-- Never scan the whole Map: CurrentRoomNum is often the NEXT room that does not exist yet,
+-- and leftover Skip doors from floor 1 still have Touch.
+local function currentTowerRoom()
+    local map = Workspace:FindFirstChild("Map")
+    if not map then return nil end
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    local function named(n)
+        n = tonumber(n)
+        if not n then return nil end
+        return map:FindFirstChild(tostring(n))
+    end
+    if info then
+        local cur = named(info:GetAttribute("CurrentRoomNum"))
+        if cur then return cur end
+        local cleared = tonumber(info:GetAttribute("FloorCleared"))
+        local prev = named(cleared) or named((tonumber(info:GetAttribute("CurrentRoomNum")) or 0) - 1)
+        if prev then return prev end
+        local lvl = named(info:GetAttribute("CurrentLevel"))
+        if lvl then return lvl end
+    end
+    local best, bestN = nil, -1
+    for _, ch in ipairs(map:GetChildren()) do
+        local n = tonumber(ch.Name)
+        if n and n > bestN then
+            bestN, best = n, ch
+        end
+    end
+    return best
+end
+
+-- Game only spawns Skip on room 1 of a tower run (u35 == 1). Later Skip models are leftovers.
+-- Endless Circus has no tower doors at all.
+local function skipDoorsAllowed()
+    if isEndlessMatch() then return false end
+    if not isTowerMatch() then return false end
+    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
+    if not info then return false end
+    local cleared = tonumber(info:GetAttribute("FloorCleared")) or 0
+    local cur = tonumber(info:GetAttribute("CurrentRoomNum")) or 0
+    return cleared <= 1 and cur <= 2
+end
+
+local function doorRoomType(model)
+    local screen = model:FindFirstChild("Screen")
+    local gui = screen and (screen:FindFirstChildWhichIsA("SurfaceGui") or screen:FindFirstChild("SurfaceGui"))
+    local nameLabel = gui and (gui:FindFirstChild("RoomName") or gui:FindFirstChild("RoomName", true))
+    local xpLabel = gui and (gui:FindFirstChild("RoomXP") or gui:FindFirstChild("RoomXP", true))
+    local text = nameLabel and nameLabel:IsA("TextLabel") and nameLabel.Text or ""
+    if text ~= "" then
+        return normalizeRoomType(text, xpLabel and xpLabel.Text), text
+    end
+    local icon = model:FindFirstChild("Icon")
+    if icon then
+        if icon:FindFirstChild("Skip") then return "Skip", "Skip" end
+        if ROOM_ALIASES[icon.Name] then return ROOM_ALIASES[icon.Name], icon.Name end
+        for _, ch in ipairs(icon:GetChildren()) do
+            if ROOM_ALIASES[ch.Name] then return ROOM_ALIASES[ch.Name], ch.Name end
+        end
+    end
+    return nil, nil
+end
+
 local function isSelectableTowerDoor(model, relaxLit)
     if not (model and model:IsA("Model") and model.Name == "ExitDoor" and model.Parent) then
         return false
     end
     local touch = model:FindFirstChild("Touch")
-    local screen = model:FindFirstChild("Screen")
-    if not (touch and touch:IsA("BasePart") and screen) then return false end
+    if not (touch and touch:IsA("BasePart")) then return false end
     local ring = model:FindFirstChild("Ring")
-    if ring and ring:IsA("BasePart") and ring.Transparency >= 0.95 and not relaxLit then
-        return false
-    end
-    if ring and not relaxLit then
+    -- No Ring = already chosen / leftover from an old floor. Never walk there.
+    if not (ring and ring:IsA("BasePart")) then return false end
+    if not relaxLit then
+        if ring.Transparency >= 0.95 then return false end
         local lit = false
         for _, d in ipairs(ring:GetDescendants()) do
             if (d:IsA("Beam") or d:IsA("ParticleEmitter")) and d.Enabled then
@@ -1741,44 +1828,26 @@ local function isSelectableTowerDoor(model, relaxLit)
         end
         if not lit then return false end
     end
-    local gui = screen:FindFirstChildWhichIsA("SurfaceGui") or screen:FindFirstChild("SurfaceGui")
-    local nameLabel = gui and (gui:FindFirstChild("RoomName") or gui:FindFirstChild("RoomName", true))
-    return nameLabel and nameLabel:IsA("TextLabel")
+    local rt = doorRoomType(model)
+    return rt ~= nil
 end
 
--- Never Workspace:GetDescendants — by floor ~200 the map has every past room and that hitch freezes the bot.
 local function findTowerDoors(relaxLit)
     local doors = {}
-    local map = Workspace:FindFirstChild("Map")
-    if not map then return doors end
-    local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
-    local floor = info and info:GetAttribute("CurrentRoomNum")
-    local rooms = {}
-    if floor ~= nil then
-        local named = map:FindFirstChild(tostring(floor))
-        if named then rooms[#rooms + 1] = named end
-    end
-    if #rooms == 0 then
-        for _, ch in ipairs(map:GetChildren()) do
-            rooms[#rooms + 1] = ch
-        end
-    end
+    local room = currentTowerRoom()
+    if not room then return doors end
     local function consider(d)
         if not isSelectableTowerDoor(d, relaxLit) then return end
-        local screen = d.Screen
-        local gui = screen:FindFirstChildWhichIsA("SurfaceGui") or screen:FindFirstChild("SurfaceGui")
-        local nameLabel = gui:FindFirstChild("RoomName") or gui:FindFirstChild("RoomName", true)
-        local xpLabel = gui:FindFirstChild("RoomXP") or gui:FindFirstChild("RoomXP", true)
-        local rt = normalizeRoomType(nameLabel.Text, xpLabel and xpLabel.Text)
-        doors[#doors + 1] = { model = d, touch = d.Touch, roomType = rt, label = nameLabel.Text }
+        local rt, label = doorRoomType(d)
+        if not rt then return end
+        if rt == "Skip" and not skipDoorsAllowed() then return end
+        doors[#doors + 1] = { model = d, touch = d.Touch, roomType = rt, label = label or rt }
     end
-    for _, room in ipairs(rooms) do
-        if room.Name == "ExitDoor" then
-            consider(room)
-        else
-            for _, ch in ipairs(room:GetChildren()) do
-                if ch.Name == "ExitDoor" then consider(ch) end
-            end
+    if room.Name == "ExitDoor" then
+        consider(room)
+    else
+        for _, ch in ipairs(room:GetChildren()) do
+            if ch.Name == "ExitDoor" then consider(ch) end
         end
     end
     return doors
@@ -1787,6 +1856,7 @@ end
 local function pickBestDoor(doors)
     local best, bestScore
     for _, door in ipairs(doors) do
+        if door.roomType == "Skip" and not skipDoorsAllowed() then continue end
         if door.roomType == "Merchant" and F.towerEnterMerchant == false then continue end
         local score = roomPriority(door.roomType)
         if not best or score < bestScore then
@@ -1979,14 +2049,38 @@ local towerBot = {
     lastDoorTp = 0,
     lastRecruitFire = 0,
     lastShopFire = 0,
+    doorSince = 0,
+    doorId = nil,
+    skipDoor = {},
 }
+
+local function pulseDoorTouch(part)
+    local r = hrp()
+    if not (part and part:IsA("BasePart") and r) then return end
+    pcall(function()
+        part.CanTouch = true
+        part.CanQuery = true
+    end)
+    if not firetouchinterest then return end
+    -- Already overlapping: 1-only does nothing. Drop then re-enter.
+    pcall(firetouchinterest, part, r, 0)
+    pcall(firetouchinterest, r, part, 0)
+    pcall(firetouchinterest, part, r, 1)
+    pcall(firetouchinterest, r, part, 1)
+    task.delay(0.08, function()
+        pcall(firetouchinterest, part, r, 0)
+        pcall(firetouchinterest, r, part, 0)
+    end)
+end
 
 local function towerBotTick()
     if not F.towerBot then
         towerBot.lastDoorTp, towerBot.lastRecruitFire, towerBot.lastShopFire = 0, 0, 0
+        towerBot.doorSince, towerBot.doorId = 0, nil
+        table.clear(towerBot.skipDoor)
         return
     end
-    if isLobby() or isPvpWorld() then return end
+    if isLobby() or isPvpWorld() or isEndlessMatch() or not isTowerMatch() then return end
     local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
     if not info then return end
 
@@ -1996,30 +2090,45 @@ local function towerBotTick()
 
     local function standOn(part)
         if not (part and part:IsA("BasePart") and part.Parent) then return false end
-        if not safeTp(part.Position) then return false end
-        local r = hrp()
-        if r and firetouchinterest then
-            pcall(firetouchinterest, part, r, 1)
-            pcall(firetouchinterest, r, part, 1)
-            task.defer(function()
-                pcall(firetouchinterest, part, r, 0)
-                pcall(firetouchinterest, r, part, 0)
-            end)
-        end
+        if not safeTp(part.Position + Vector3.new(0, 2.2, 0)) then return false end
+        pulseDoorTouch(part)
         return true
     end
 
     if choosing then
-        local best = pickBestDoor(findTowerDoors(false))
+        local function collect(relax)
+            local list = {}
+            for _, d in ipairs(findTowerDoors(relax)) do
+                local id = d.model and d.model:GetFullName()
+                if id and not towerBot.skipDoor[id] then
+                    list[#list + 1] = d
+                end
+            end
+            return list
+        end
+        local best = pickBestDoor(collect(false))
         if not (best and best.touch and best.touch.Parent) then
-            best = pickBestDoor(findTowerDoors(true))
+            best = pickBestDoor(collect(true))
         end
         if not (best and best.touch and best.touch.Parent) then return end
-        if tick() - towerBot.lastDoorTp < 0.2 then return end
+        local id = best.model and best.model:GetFullName()
+        if id ~= towerBot.doorId then
+            towerBot.doorId = id
+            towerBot.doorSince = tick()
+        elseif tick() - towerBot.doorSince > 2.2 then
+            -- This door is not accepting Touched (stale Skip, closed portal). Try the next.
+            if id then towerBot.skipDoor[id] = true end
+            towerBot.doorId, towerBot.doorSince = nil, 0
+            return
+        end
+        if tick() - towerBot.lastDoorTp < 0.18 then return end
         towerBot.lastDoorTp = tick()
         standOn(best.touch)
         return
     end
+
+    towerBot.doorId, towerBot.doorSince = nil, 0
+    table.clear(towerBot.skipDoor)
 
     if recruitLeft > 0 then
         local prompt = pickRecruitPrompt()
@@ -2874,7 +2983,15 @@ local lastAfkStart = 0
 local lastSkipAt = 0
 
 local function pickVote()
-    if F.towerBot or F.autoQueueTower then
+    if isEndlessMatch() and F.autoQueueEndless then
+        local mode = F.endlessVoteMode or "Retry"
+        if mode == "None" then return nil end
+        if mode == "Retry" and not endlessRetryAvailable() then
+            return "Lobby"
+        end
+        return mode
+    end
+    if (F.towerBot or F.autoQueueTower) and not isEndlessMatch() then
         return "Retry" -- win or loss: Replay Tower
     end
     if F.chestRetryFarm then return "Retry" end
@@ -3205,7 +3322,7 @@ loop(function() return F.autoQueueEndless == true end, function()
     end
 end, 1.2)
 
-loop(function() return F.towerBot == true end, towerBotTick, function()
+loop(function() return F.towerBot == true and isTowerMatch() end, towerBotTick, function()
     local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
     if info and (info:GetAttribute("RoomChoice") == true
         or (tonumber(info:GetAttribute("RecruitTimer")) or 0) > 0
@@ -4574,7 +4691,7 @@ RunService.RenderStepped:Connect(function(dt)
     end
 end)
 LP.CharacterAdded:Connect(function() freecam.controls = nil end)
-win:flag("freecamSensitivity", 0.45)
+if F.freecamSensitivity == nil then F.freecamSensitivity = 0.45 end
 
 -- Anti AFK
 local vu
@@ -5405,7 +5522,7 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
     slider(tw, "Queue interval", "towerQueueInterval", 4, 20, 6, 0)
     slider(tw, "Difficulty index", "towerDifficulty", 1, 4, 1, 0)
     togBind(tw, "Tower Bot", "towerBot", false, "T", "medium")
-    tw:label("Door order is Farm → Tower Bot → Door priority (Skip is a slot there). Merchant shop still has its own card.")
+    tw:label("Tower Bot only runs in Infinite Tower. Endless Circus has no Skip doors — the bot will not walk to them.")
     tw:button("Queue Tower Now", function()
         local ok2, err = queueTower()
         notify("Tower", ok2 and "OK" or tostring(err), ok2 and "check" or "alert-triangle")
@@ -5426,7 +5543,7 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
 
     local pri = tFarm:sub("Tower Bot")
     local pc = pri:card({ title = "Door priority", icon = "list", column = "left" })
-    pc:label("Best first. Skip = floor jump. Merchant is a shop. Change a slot — duplicates swap places.")
+    pc:label("Best first. Skip = floor jump, only on tower room 1 — never in Endless Circus. Merchant is a shop. Change a slot — duplicates swap.")
     win:flag("towerDoorOrder", table.clone(DEFAULT_DOOR_ORDER))
     getDoorOrder() -- migrate old 6/7-slot configs (adds Skip)
     local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick", "7th pick", "8th pick" }
@@ -5939,6 +6056,7 @@ local tMov = win:tab({ name = "Movement", icon = "user", group = "Player", subti
     slider(c, "Fly Speed", "flySpeed", 20, 200, 60, 0)
     togBind(c, "Freecam", "freecamOn", false, "G")
     slider(c, "Freecam Speed", "freecamSpeed", 20, 250, 80, 0)
+    slider(c, "Freecam Sensitivity", "freecamSensitivity", 0.1, 1.2, 0.45, 2)
     tog(c, "Anti-AFK", "antiAfk", true)
 end)
 
