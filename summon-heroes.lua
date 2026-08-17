@@ -1735,6 +1735,7 @@ end
 -- Game only spawns Skip on room 1 of a tower run (u35 == 1). Later Skip models are leftovers.
 -- Endless Circus has no tower doors at all.
 local function skipDoorsAllowed()
+    if F.towerIgnoreSkip == true then return false end
     if isEndlessMatch() then return false end
     if not isTowerMatch() then return false end
     local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
@@ -2352,10 +2353,29 @@ local function skipCutscenes()
     clickScreenSkip()
 end
 
--- Gear machine: skip LobbyMap gauge anim (GearSummonNew no-ops if gauge missing).
+-- Gear machine: Sequence.Open always runs GearSummonNew (long stick/gauge tween)
+-- then RewardsObtained. Unparenting the gauge still left flash + reward popup.
 local gearSummonHooked = false
+local gearSeqOrigOpen
+local gearDumpActive = false
+local gearDumpBusy = false
+
+local function skipGearCinematicNow()
+    return F.fastGearSummon ~= false or gearDumpActive
+end
+
+local function skipGearRewardsNow()
+    return F.fastGearRewards == true or gearDumpActive
+end
+
+local function restoreGearCamera()
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        if cam then cam.CameraType = Enum.CameraType.Custom end
+    end)
+end
+
 local function hookFastGearSummon()
-    if gearSummonHooked then return true end
     local Gui
     local ok = pcall(function()
         Gui = require(ReplicatedStorage.Systems.Gui)
@@ -2363,48 +2383,133 @@ local function hookFastGearSummon()
     if not ok or type(Gui) ~= "table" or type(Gui.Get) ~= "function" then return false end
     local seq = Gui:Get("GearSummonSequence")
     if type(seq) ~= "table" or type(seq.Open) ~= "function" then return false end
+    if not gearSeqOrigOpen then
+        gearSeqOrigOpen = seq.Open
+    end
     gearSummonHooked = true
-    local oldOpen = seq.Open
     seq.Open = function(self, items, rarity)
-        if F.fastGearSummon == false then
-            return oldOpen(self, items, rarity)
+        if not skipGearCinematicNow() then
+            return gearSeqOrigOpen(self, items, rarity)
         end
-        local gauge, gParent, gName
+        restoreGearCamera()
         pcall(function()
-            local lobby = Workspace:FindFirstChild("LobbyMap")
-            gauge = lobby and lobby:FindFirstChild("GearSummonGauge")
-            if gauge then
-                gParent = gauge.Parent
-                gName = gauge.Name
-                gauge.Parent = nil
+            if type(self.IsOpen) == "function" and self:IsOpen() and type(self.Close) == "function" then
+                self:Close()
             end
         end)
-        local okOpen, a, b, c, d = pcall(oldOpen, self, items, rarity)
-        pcall(function()
-            if gauge and gParent then
-                gauge.Name = gName or "GearSummonGauge"
-                gauge.Parent = gParent
-            end
-        end)
-        if F.fastGearRewards == true then
-            task.defer(function()
-                pcall(function()
-                    local rew = Gui:Get("RewardsObtained")
-                    if not (rew and rew.IsOpen and rew:IsOpen()) then return end
-                    task.wait(0.12)
-                    if rew.IsOpen and rew:IsOpen() and rew.Close then
-                        rew:Close()
-                    end
-                end)
+        if skipGearRewardsNow() then
+            pcall(function()
+                local rew = Gui:Get("RewardsObtained")
+                if rew and rew.IsOpen and rew:IsOpen() and rew.Close then
+                    rew:Close()
+                end
             end)
-        end
-        if not okOpen then
-            warn("[SH] fast gear Open", a)
             return
         end
-        return a, b, c, d
+        pcall(function()
+            local rew = Gui:Get("RewardsObtained")
+            if rew and rew.Open then
+                rew:Open(items)
+            end
+        end)
     end
     return true
+end
+
+local function getGearPackInfo()
+    local name, price, currency = "GearPack1", 25, "Essence"
+    pcall(function()
+        local wm = ReplicatedStorage:FindFirstChild("WorldModules")
+        local folder = wm and wm:FindFirstChild("ItemData")
+        local mod = folder and folder:FindFirstChild("GearSummonPacks")
+        local data = mod and require(mod)
+        if type(data) ~= "table" then return end
+        local bestK, bestOrder
+        for k, v in pairs(data) do
+            if type(v) == "table" and tonumber(v.EssencePrice) then
+                local order = tonumber(v.Order) or 99
+                if not bestK or order < bestOrder then
+                    bestK, bestOrder = k, order
+                    name = k
+                    price = tonumber(v.EssencePrice) or price
+                end
+            end
+        end
+    end)
+    return name, price, currency
+end
+
+local function dumpAllGearPacks()
+    if gearDumpBusy then
+        notify("Gear", "Already opening packs", "zap")
+        return
+    end
+    gearDumpBusy = true
+    gearDumpActive = true
+    hookFastGearSummon()
+    notify("Gear", "Opening all packs…", "zap")
+    local opened, spent = 0, 0
+    local err
+    local okDump, dumpErr = pcall(function()
+        local pack, price, currency = getGearPackInfo()
+        price = math.max(1, tonumber(price) or 25)
+        local ev = rem("GearBuyPack")
+        if not (ev and ev:IsA("RemoteEvent")) then
+            err = "GearBuyPack remote missing"
+            return
+        end
+        local openedEv = rem("GearPackOpened")
+        while true do
+            local bal = tonumber(getCurrency(currency)) or 0
+            local can = math.floor(bal / price)
+            if can < 1 then break end
+            local n = math.min(10, can)
+            local got = false
+            local conn
+            if openedEv and openedEv:IsA("RemoteEvent") then
+                conn = openedEv.OnClientEvent:Connect(function()
+                    got = true
+                end)
+            end
+            local before = bal
+            local fired = fire("GearBuyPack", pack, n, currency)
+            if not fired then
+                if conn then conn:Disconnect() end
+                err = "FireServer failed"
+                break
+            end
+            local t0 = os.clock()
+            while os.clock() - t0 < 6 do
+                if got then break end
+                local now = tonumber(getCurrency(currency)) or before
+                if now < before then break end
+                task.wait(0.05)
+            end
+            if conn then conn:Disconnect() end
+            local after = tonumber(getCurrency(currency))
+            if after == nil then after = before end
+            if after >= before then
+                err = "Server rejected (not enough or busy)"
+                break
+            end
+            local used = before - after
+            spent = spent + used
+            opened = opened + math.max(1, math.floor(used / price + 0.01))
+            task.wait(0.08)
+        end
+    end)
+    gearDumpActive = false
+    gearDumpBusy = false
+    restoreGearCamera()
+    if not okDump then
+        notify("Gear", tostring(dumpErr), "alert-triangle")
+        return
+    end
+    if opened <= 0 then
+        notify("Gear", err or "Not enough Essence (25 each)", "alert-triangle")
+        return
+    end
+    notify("Gear", string.format("Opened %d · spent %d Essence", opened, spent), "check")
 end
 -- Defer: require(Gui) yields. Immediate call here used to blank the window.
 task.defer(function()
@@ -5499,7 +5604,8 @@ local tFarm = win:tab({ name = "Farm", icon = "bolt", group = "Main", subtitle =
 
     local pri = tFarm:sub("Tower Bot")
     local pc = pri:card({ title = "Door priority", icon = "list", column = "left" })
-    pc:label("Best first. Skip = floor jump, only on tower room 1 — never in Endless Circus. Merchant is a shop. Change a slot — duplicates swap.")
+    tog(pc, "Never take Skip (floor jump)", "towerIgnoreSkip", true)
+    pc:label("Skip doors jump ~10 floors (tower room 1 only, never Endless). This toggle is the off switch. Or put Skip last below. Change a slot — duplicates swap.")
     win:flag("towerDoorOrder", table.clone(DEFAULT_DOOR_ORDER))
     getDoorOrder() -- migrate old 6/7-slot configs (adds Skip)
     local slotNames = { "1st pick", "2nd pick", "3rd pick", "4th pick", "5th pick", "6th pick", "7th pick", "8th pick" }
@@ -5631,10 +5737,13 @@ tabOk("Gear", function()
 local tGear = win:tab({ name = "Gear", icon = "diamond", group = "Main", subtitle = "Gear sell + PvP shop" })
     local s = tGear:sub("Gear")
     local gFast = s:card({ title = "Gear Machine", icon = "zap", column = "right" })
-    tog(gFast, "Fast open (skip gauge anim)", "fastGearSummon", true)
-    tog(gFast, "Auto-close rewards popup", "fastGearRewards", false)
-    gFast:label("Skips LobbyMap stick/gauge cinematic. Rewards still grant normally.")
-    gFast:button("Re-hook now", function()
+    tog(gFast, "Skip machine cinematic", "fastGearSummon", true)
+    tog(gFast, "Skip rewards popup", "fastGearRewards", true)
+    gFast:label("Cinematic skip does not use the in-game slider (max 10). Use the button to dump all Essence.")
+    gFast:button("Open all (spend all Essence)", function()
+        task.spawn(dumpAllGearPacks)
+    end)
+    gFast:button("Re-hook cinematic skip", function()
         gearSummonHooked = false
         notify("Gear", hookFastGearSummon() and "Hooked" or "Gui not ready", "zap")
     end)
