@@ -2353,8 +2353,8 @@ local function skipCutscenes()
     clickScreenSkip()
 end
 
--- Gear machine: Sequence.Open always runs GearSummonNew (long stick/gauge tween)
--- then RewardsObtained. Unparenting the gauge still left flash + reward popup.
+-- Gear machine IIFE: own register pool. Boot hits Luau's 200-local cap if these stay in __SH_BOOT__.
+local GEARX = (function()
 local gearSummonHooked = false
 local gearSeqOrigOpen
 local gearDumpActive = false
@@ -2518,6 +2518,14 @@ task.defer(function()
         task.wait(0.5)
     end
 end)
+return {
+    hook = hookFastGearSummon,
+    dump = dumpAllGearPacks,
+    resetHook = function()
+        gearSummonHooked = false
+    end,
+}
+end)()
 
 local function chestDisplayName(part)
     if not part then return "Chest" end
@@ -3526,7 +3534,8 @@ loop(function() return F.syncAutoGearSell == true end, function()
     fire("SetConfig", "AutoGearSell_Rarity4", F.autoGearSellR4 == true)
 end, 2)
 
--- ============================================================ QUICK GEAR RECYCLE (RecycleGear RF, max 18 / call)
+-- ============================================================ QUICK GEAR RECYCLE (own register pool — RecycleGear RF, max 18 / call)
+local GRECYCLE = (function()
 local GEAR_ITEM_DATA = nil
 local GEAR_RANK_ORD = { D = 1, C = 2, B = 3, A = 4, S = 5, X = 6 }
 -- Index S/A names — never junk-recycle unless user disables keep
@@ -3663,6 +3672,11 @@ loop(function() return F.autoRecycleGear == true end, function()
     lastAutoRecycleAt = tick()
     quickRecycleGear()
 end, 3)
+return {
+    count = countRecycleCandidates,
+    run = quickRecycleGear,
+}
+end)()
 
 -- ============================================================ STAT REROLL BOT (own register pool — keeps __SH_BOOT__ under 200 locals)
 local STATR = (function()
@@ -5741,11 +5755,11 @@ local tGear = win:tab({ name = "Gear", icon = "diamond", group = "Main", subtitl
     tog(gFast, "Skip rewards popup", "fastGearRewards", true)
     gFast:label("Cinematic skip does not use the in-game slider (max 10). Use the button to dump all Essence.")
     gFast:button("Open all (spend all Essence)", function()
-        task.spawn(dumpAllGearPacks)
+        task.spawn(GEARX.dump)
     end)
     gFast:button("Re-hook cinematic skip", function()
-        gearSummonHooked = false
-        notify("Gear", hookFastGearSummon() and "Hooked" or "Gui not ready", "zap")
+        GEARX.resetHook()
+        notify("Gear", GEARX.hook() and "Hooked" or "Gui not ready", "zap")
     end)
 
     local g2 = s:card({ title = "Auto Gear Sell", icon = "trash", column = "left" })
@@ -5789,11 +5803,11 @@ local tGear = win:tab({ name = "Gear", icon = "diamond", group = "Main", subtitl
     slider(gRec, "Auto interval (s)", "autoRecycleInterval", 10, 120, 20, 0)
     gRec:label("One click — skips BiS names, high ranks, leveled. Batches of 18.")
     gRec:button("Recycle junk now", function()
-        notify("Recycle", "Candidates: " .. tostring(countRecycleCandidates()), "trash")
-        quickRecycleGear()
+        notify("Recycle", "Candidates: " .. tostring(GRECYCLE.count()), "trash")
+        GRECYCLE.run()
     end)
     gRec:button("Count only", function()
-        notify("Recycle", "Would recycle: " .. tostring(countRecycleCandidates()), "list")
+        notify("Recycle", "Would recycle: " .. tostring(GRECYCLE.count()), "list")
     end)
 
     local sPvp = tGear:sub("PvP Shop")
