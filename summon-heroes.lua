@@ -746,6 +746,12 @@ local function isEndlessMatch()
         or wi:GetAttribute("Points") ~= nil
 end
 
+-- Tower rooms are torn down each floor. Endless Circus stays in one map for hundreds
+-- of waves, so client Effects/Projectiles/damage parts never reset.
+local function wantAntiLag()
+    return F.antiLag ~= false and isEndlessMatch()
+end
+
 local function isTowerMatch()
     if isEndlessMatch() then return false end
     local info = ReplicatedStorage:FindFirstChild("TowerWaveInfo")
@@ -2833,7 +2839,7 @@ local function updateUnitEsp()
         if pvp and F.pvpEspChams ~= true then
             wantChams = false
         end
-        if F.antiLag ~= false then
+        if wantAntiLag() then
             wantChams = false
         end
         if wantChams then
@@ -2886,7 +2892,7 @@ local function updateChestEsp()
             d.frame.Position = UDim2.fromOffset(sp.X, sp.Y)
             d.text.Text = (F.chestEspName ~= false) and chestDisplayName(part) or "Chest"
             d.text.TextColor3 = col
-            if F.chestEspChams and F.antiLag == false then
+            if F.chestEspChams and not wantAntiLag() then
                 -- Only highlight the real Chest model (or the tagged pad) — never random nearby props
                 local host = (typeof(vis) == "Instance" and vis:IsA("Model")) and vis or part
                 if host:IsA("BasePart") or (host:IsA("Model") and (host.Name == "Chest" or host.Name == "BonusChest")) then
@@ -2933,8 +2939,12 @@ RunService.Heartbeat:Connect(function()
         return
     end
     pvpEspCleared = false
+    if wantAntiLag() then
+        if next(drawings) then pcall(clearEsp) end
+        return
+    end
     local now = tick()
-    local iv = (F.antiLag ~= false) and 0.85 or (pvp and 0.5 or 0.2)
+    local iv = pvp and 0.5 or 0.2
     if now - lastEspAt < iv then return end
     lastEspAt = now
     espBusy = true
@@ -3033,17 +3043,28 @@ do
     local rd = rem("RenderDamage")
     if rd and rd:IsA("RemoteEvent") then
         rd.OnClientEvent:Connect(function()
-            if F.antiLag ~= false or not F.dmgEnhance or isPvpWorld() then return end
+            if wantAntiLag() or not F.dmgEnhance or isPvpWorld() then return end
             task.defer(enhanceDamageBillboards)
         end)
     end
 end
-loop(function() return F.dmgEnhance == true and F.antiLag == false and not isPvpWorld() end, enhanceDamageBillboards, 0.75)
+loop(function() return F.dmgEnhance == true and not wantAntiLag() and not isPvpWorld() end, enhanceDamageBillboards, 0.75)
 
 -- Client VFX / quality. Does not change server combat; it keeps Heartbeat close to real time
 -- so 10s intermission is not 40s of frozen frames.
 ;(function()
     local lastApply, lastStrip = 0, 0
+    local applied = false
+    local snap = nil
+    local function readSetting(name)
+        local p = getProfile()
+        local s = p and p:FindFirstChild("Settings")
+        local v = s and s:FindFirstChild(name)
+        if v and (v:IsA("BoolValue") or v:IsA("NumberValue") or v:IsA("IntValue")) then
+            return v.Value
+        end
+        return nil
+    end
     local function setBoolSetting(name, value)
         pcall(function()
             local p = getProfile()
@@ -3053,7 +3074,6 @@ loop(function() return F.dmgEnhance == true and F.antiLag == false and not isPvp
                 v.Value = value
             end
         end)
-        fire("SetConfig", name, value)
     end
     local function setNumSetting(name, value)
         pcall(function()
@@ -3064,7 +3084,58 @@ loop(function() return F.dmgEnhance == true and F.antiLag == false and not isPvp
                 v.Value = value
             end
         end)
-        fire("SetConfig", name, value)
+    end
+    local function capture()
+        local s = {
+            DisplayEffects = readSetting("DisplayEffects"),
+            CameraShake = readSetting("CameraShake"),
+            DamageNumbers = readSetting("DamageNumbers"),
+            UnitsVolume = readSetting("UnitsVolume"),
+            shadows = Lighting.GlobalShadows,
+            fogEnd = Lighting.FogEnd,
+            fx = {},
+        }
+        pcall(function()
+            local ugs = UserSettings():GetService("UserGameSettings")
+            s.quality = ugs.SavedQualityLevel
+        end)
+        for _, fx in ipairs(Lighting:GetChildren()) do
+            if fx:IsA("BloomEffect") or fx:IsA("DepthOfFieldEffect") or fx:IsA("SunRaysEffect")
+                or fx:IsA("ColorCorrectionEffect") or fx:IsA("BlurEffect") then
+                s.fx[fx] = fx.Enabled
+            elseif fx:IsA("Atmosphere") then
+                s.fx[fx] = fx.Density
+            end
+        end
+        snap = s
+    end
+    local function restore()
+        local s = snap
+        snap = nil
+        if not s then return end
+        pcall(function()
+            local ugs = UserSettings():GetService("UserGameSettings")
+            if s.quality ~= nil then
+                ugs.SavedQualityLevel = s.quality
+            end
+        end)
+        pcall(function()
+            Lighting.GlobalShadows = s.shadows
+            Lighting.FogEnd = s.fogEnd
+            for fx, val in pairs(s.fx) do
+                if fx.Parent then
+                    if typeof(val) == "boolean" then
+                        fx.Enabled = val
+                    elseif typeof(val) == "number" and fx:IsA("Atmosphere") then
+                        fx.Density = val
+                    end
+                end
+            end
+        end)
+        if s.DisplayEffects ~= nil then setBoolSetting("DisplayEffects", s.DisplayEffects) end
+        if s.CameraShake ~= nil then setBoolSetting("CameraShake", s.CameraShake) end
+        if s.DamageNumbers ~= nil then setBoolSetting("DamageNumbers", s.DamageNumbers) end
+        if s.UnitsVolume ~= nil then setNumSetting("UnitsVolume", s.UnitsVolume) end
     end
     local function applyGraphics()
         pcall(function()
@@ -3088,6 +3159,7 @@ loop(function() return F.dmgEnhance == true and F.antiLag == false and not isPvp
         end)
         setBoolSetting("DisplayEffects", false)
         setBoolSetting("CameraShake", false)
+        setBoolSetting("DamageNumbers", false)
         setNumSetting("UnitsVolume", 0)
     end
     local function isDoorFx(inst)
@@ -3114,23 +3186,20 @@ loop(function() return F.dmgEnhance == true and F.antiLag == false and not isPvp
         end
         return false
     end
-    local function cullFolder(folder, keep)
+    local function wipeFolder(folder)
         if not folder then return end
-        local ch = folder:GetChildren()
-        local extra = #ch - keep
-        if extra <= 0 then return end
-        for i = 1, extra do
-            pcall(function() ch[i]:Destroy() end)
+        for _, ch in ipairs(folder:GetChildren()) do
+            pcall(function() ch:Destroy() end)
         end
     end
     local function onFx(inst)
-        if F.antiLag == false or isLobby() or isPvpWorld() then return end
+        if not wantAntiLag() then return end
         if isDoorFx(inst) then return end
         killFx(inst)
     end
     Workspace.DescendantAdded:Connect(function(inst)
         if genv.SH_Session ~= SESSION then return end
-        if F.antiLag == false or isLobby() or isPvpWorld() then return end
+        if not wantAntiLag() then return end
         if not (inst:IsA("ParticleEmitter") or inst:IsA("Beam") or inst:IsA("Trail")
             or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles")
             or inst:IsA("PointLight") or inst:IsA("SpotLight") or inst:IsA("SurfaceLight")
@@ -3139,18 +3208,53 @@ loop(function() return F.dmgEnhance == true and F.antiLag == false and not isPvp
         end
         task.defer(onFx, inst)
     end)
-    loop(function() return F.antiLag ~= false and not isLobby() and not isPvpWorld() end, function()
+    loop(function() return wantAntiLag() or applied end, function()
+        if not wantAntiLag() then
+            if applied then
+                restore()
+                applied = false
+            end
+            return
+        end
         local now = tick()
-        if now - lastApply > 4 then
+        if not applied then
+            capture()
+            applied = true
+            lastApply = now
+            applyGraphics()
+        elseif now - lastApply > 8 then
             lastApply = now
             applyGraphics()
         end
-        if now - lastStrip < 1.25 then return end
+        if now - lastStrip < 0.8 then return end
         lastStrip = now
-        cullFolder(Workspace:FindFirstChild("Projectiles"), 8)
-        cullFolder(Workspace:FindFirstChild("Effects"), 16)
-        cullFolder(Workspace:FindFirstChild("Explosions"), 6)
-    end, 1.25)
+        -- DeathEffect keeps particles in workspace.Effects for 20s. Circus never resets the map.
+        wipeFolder(Workspace:FindFirstChild("Effects"))
+        wipeFolder(Workspace:FindFirstChild("Projectiles"))
+        wipeFolder(Workspace:FindFirstChild("Explosions"))
+        wipeFolder(Workspace:FindFirstChild("Lasers"))
+        wipeFolder(Workspace:FindFirstChild("Debris"))
+        local units = unitsFolder()
+        if units then
+            for _, m in ipairs(units:GetChildren()) do
+                if m:GetAttribute("Dead") == true then
+                    pcall(function() m:Destroy() end)
+                end
+            end
+        end
+        -- DamageNumbers parent Parts under Workspace; RenderNumber also yields 0.5s per hit.
+        local n = 0
+        for _, ch in ipairs(Workspace:GetChildren()) do
+            if n > 40 then break end
+            if ch:IsA("BasePart") then
+                local bb = ch:FindFirstChild("BillboardGui")
+                if bb and bb:FindFirstChild("Shadow") then
+                    pcall(function() ch:Destroy() end)
+                    n = n + 1
+                end
+            end
+        end
+    end, 0.8)
 end)()
 
 -- ============================================================ HUD (Session + Match via win:hud)
@@ -5734,7 +5838,7 @@ do
     cc:label("Shows chest / pad name. Distance removed.")
 
     local wc = s2:card({ title = "World / Camera", icon = "world", column = "right" })
-    tog(wc, "Anti lag", "antiLag", true)
+    tog(wc, "Anti lag (Endless)", "antiLag", true)
     tog(wc, "Fullbright", "fullbright", false)
     slider(wc, "Brightness", "fbBrightness", 1, 10, 3, 1)
     tog(wc, "No Fog", "noFog", false)
@@ -5744,7 +5848,7 @@ do
     tog(wc, "Damage Numbers Enhance", "dmgEnhance", false)
     slider(wc, "Dmg Scale", "dmgScale", 1, 4, 1.8, 1)
     tog(wc, "Dmg Bold", "dmgBold", true)
-    wc:label("Anti lag: DisplayEffects off, quality 1, strip VFX. Stops Heartbeat stacking so the bot keeps taking doors when FPS dies.")
+    wc:label("Anti lag is Endless Circus only. Tower rooms already reset; Circus piles VFX/damage parts for hundreds of waves in one map.")
 end
 end)
 
@@ -6673,7 +6777,7 @@ do
             end
         end
         pcall(function()
-            if F.antiLag ~= false then return end
+            if wantAntiLag() then return end
             local root = indexHud and indexHud.frame
             if not root then return end
             for _, d in ipairs(root:GetDescendants()) do
