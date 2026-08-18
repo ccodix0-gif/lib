@@ -5196,21 +5196,29 @@ end
 -- Gear tiers from dump (passives + base stats). Stat % × rank(D–X 1–2) × lvl(1–5 → 1–2.3).
 local INDEX_GEAR = {
     { id = "PactboundToken", n = "Pactbound Token", r = 7, arch = "Universal", tier = "S",
+        icon = "rbxassetid://96059006420952",
         stats = "ATK 6% · HP 6% · EVADE 4% · CR 4% · CDMG 6%",
         pas = "Binding Oath — redirect 30% dmg to higher-HP ally else reflect 5% (L5)" },
     { id = "HeartOfTheColossus", n = "Heart of the Colossus", r = 6, arch = "Ward", tier = "S",
+        icon = "rbxassetid://86575413583457",
         stats = "HP 12%", pas = "Unbreakable — same-enemy hits reduce dmg taken up to 15% (L5)" },
     { id = "RendsBlade", n = "Rending Blade", r = 6, arch = "Talon", tier = "S",
+        icon = "rbxassetid://102567954642908",
         stats = "ATK 12%", pas = "Worldsplitter — +20% vs higher-%HP foes (L5)" },
     { id = "HertzsWildcard", n = "Hertz's Wildcard", r = 5, arch = "Fang", tier = "S",
+        icon = "rbxassetid://111115337030569",
         stats = "ATK 10%", pas = "Wild Draw — 30% chance to cast special twice (L5)" },
     { id = "TheSleeplessEye", n = "The Sleepless Eye", r = 6, arch = "Fang", tier = "A",
+        icon = "rbxassetid://104970108602635",
         stats = "CR 4.8% · CDMG 7.2%", pas = "Vigil — crits mark enemy +7.5% dmg taken 8s (L5)" },
     { id = "DeadeyeFang", n = "Deadeye Fang", r = 5, arch = "Fang", tier = "A",
+        icon = "rbxassetid://110434757458223",
         stats = "CR 4% · CDMG 6%", pas = "Deadeye — first hit always crit; stacks up to +10% CR (L5)" },
     { id = "FoxfireCharm", n = "Foxfire Charm", r = 5, arch = "Ward", tier = "A",
+        icon = "rbxassetid://80900421592435",
         stats = "HP 2.5% · EVADE 7.5%", pas = "Foxfire Veil — after evade, next attack +30% dmg (L5)" },
     { id = "ScrollOfLight", n = "Scroll of Light", r = 5, arch = "Fang", tier = "A",
+        icon = "rbxassetid://95744801030116",
         stats = "EVADE 6% · CR 4%", pas = "Thunder — after 5 evades, lightning hits attacker for 100% ATK (L5, BP wish)" },
     { id = "Scorchknot", n = "Scorchknot", r = 4, arch = "Talon", tier = "C",
         stats = "ATK 6%", pas = "No passive — solid mid ATK filler" },
@@ -5242,21 +5250,26 @@ local INDEX_GEAR = {
 -- S = raw clear speed (DPS). A = strong secondary (sustain / tank / AoE). Heal ≠ kill faster.
 local INDEX_RUNES = {
     { id = "Chrono", n = "Chrono Rune", tier = "S",
+        icon = "rbxassetid://128571963579598",
         desc = "Unit's attacks are sped up (higher attack rate).",
         up = "ATK SPD ×1.3 → ×1.7",
         note = "S DPS: more hits/sec = more damage + more specials. Carry BiS" },
     { id = "Burn", n = "Burn Rune", tier = "S",
+        icon = "rbxassetid://79113116886359",
         desc = "Hits apply abyss burn DoT — enemy takes damage over time each tick.",
         up = "Burn 3s/0.1 → 10s/0.25 (tick every 0.5s)",
         note = "S DoT: free extra damage on every hit. Great on multi-hit / AoE" },
     { id = "Boom", n = "Boom Rune", tier = "A",
+        icon = "rbxassetid://128760869366229",
         desc = "Projectiles create larger explosions.",
         up = "AoE radius ×1.4 → ×1.8", note = "A AoE: bigger splash, not single-target DPS" },
     { id = "Vampiric", n = "Vampiric Rune", tier = "A",
+        icon = "rbxassetid://75247644620855",
         desc = "% of damage dealt returns as healing (lifesteal).",
         up = "Lifesteal 10% → 20%",
         note = "A sustain: keeps unit alive — does NOT raise DPS like Chrono/Burn" },
     { id = "Giant", n = "Giant Rune", tier = "A",
+        icon = "rbxassetid://70718276700993",
         desc = "Makes units larger & have more HP.",
         up = "Scale ×1.2→×1.6 · HP +10%→+50%", note = "A tank HP" },
     { id = "Angelic", n = "Angelic Rune", tier = "B",
@@ -5489,8 +5502,15 @@ local function annotateOwned(list)
     return list
 end
 
-local function itemIcon(_folder, _id, fallback)
-    -- Never require() while the window is building (yield → empty sidebar).
+local function itemIcon(folder, id, fallback)
+    local src = (folder == "Runes") and INDEX_RUNES or INDEX_GEAR
+    if type(id) == "string" then
+        for _, e in ipairs(src) do
+            if e.id == id and type(e.icon) == "string" and e.icon ~= "" then
+                return e.icon
+            end
+        end
+    end
     return fallback or "diamond"
 end
 
@@ -6503,8 +6523,21 @@ do
                 local acShow = math.max(tonumber(e.cd) or 1, 1)
                 indexTopRows[rank]:setLabel(string.format("#%d %s · %s · AC%.2g%s", rank, e.n, rarityShort(e.r), acShow, tags))
                 indexTopRows[rank]:set(fmtNum(e.score or e.pow or 0))
+                if indexTopRows[rank].setIcon then
+                    indexTopRows[rank]:setIcon((type(e.icon) == "string" and e.icon ~= "" and e.icon) or "user")
+                end
             end
         end
+        pcall(function()
+            local root = indexHud and indexHud.frame
+            if not root then return end
+            for _, d in ipairs(root:GetDescendants()) do
+                if d:IsA("ImageLabel") and type(d.Image) == "string" and string.sub(d.Image, 1, 11) == "rbxassetid:" then
+                    d.ImageColor3 = Color3.new(1, 1, 1)
+                    d.ImageTransparency = 0
+                end
+            end
+        end)
     end
     fillIndexHudUnits()
 
@@ -6520,7 +6553,7 @@ do
     for _, g in ipairs(IDX.GEAR or {}) do
         if g.tier == "S" or g.tier == "A" then
             indexHud:row({
-                icon = itemIcon("Gear", g.id, "diamond"),
+                icon = g.icon or itemIcon("Gear", g.id, "diamond"),
                 label = string.format("[%s] %s", g.tier, g.n),
                 value = clip(g.arch or g.stats or "", 18),
                 height = 16,
@@ -6533,7 +6566,7 @@ do
         if r.tier == "S" or r.tier == "A" then
             local short = (r.n or ""):gsub(" Rune$", "")
             indexHud:row({
-                icon = itemIcon("Runes", r.id, "sparkles-2"),
+                icon = r.icon or itemIcon("Runes", r.id, "sparkles-2"),
                 label = string.format("[%s] %s", r.tier, short),
                 value = clip(r.note or r.up or "", 18),
                 height = 16,
