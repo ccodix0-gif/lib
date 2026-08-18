@@ -3547,6 +3547,7 @@ local GEAR_KEEP_NAMED = {
     TheSleeplessEye = true,
     DeadeyeFang = true,
     FoxfireCharm = true,
+    ScrollOfLight = true,
 }
 local gearRecycleBusy = false
 
@@ -5154,6 +5155,8 @@ local INDEX_GEAR = {
         stats = "CR 4% · CDMG 6%", pas = "Deadeye — first hit always crit; stacks up to +10% CR (L5)" },
     { id = "FoxfireCharm", n = "Foxfire Charm", r = 5, arch = "Ward", tier = "A",
         stats = "HP 2.5% · EVADE 7.5%", pas = "Foxfire Veil — after evade, next attack +30% dmg (L5)" },
+    { id = "ScrollOfLight", n = "Scroll of Light", r = 5, arch = "Fang", tier = "A",
+        stats = "EVADE 6% · CR 4%", pas = "Thunder — after 5 evades, lightning hits attacker for 100% ATK (L5, BP wish)" },
     { id = "Scorchknot", n = "Scorchknot", r = 4, arch = "Talon", tier = "C",
         stats = "ATK 6%", pas = "No passive — solid mid ATK filler" },
     { id = "GildedCharm", n = "Gilded Charm", r = 4, arch = "Ward", tier = "C",
@@ -5940,7 +5943,7 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
 
     local sU = tIdx:sub("Units")
     local rankCard = sU:card({ title = "Clear top · kit score", icon = "list", column = "left" })
-    rankCard:label("SCR = clear speed (ATK/AC≥1s + special + soft range). HP light. AC<1s floored (data quirks).")
+    rankCard:label("SCR = clear speed (ATK/AC≥1s + special + soft range). HP light. AC<1s floored (data quirks). Anime Banner + Kaen line load from live Units.")
     do
         local _, set = rankCard:label(formatUnitRankList(unitList, true, 20))
         setRankList = set
@@ -5984,6 +5987,7 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
 
     local tip = sU:card({ title = "How power works", icon = "gauge", column = "right" })
     tip:label("Rank = clear-speed score @ Lv200 (★5/B, Secret forge ★7).")
+    tip:label("Anime Banner: Dojo Student · ZR-9 · Yin Yang · Raiden Vex. Kaen / Kage / Nezu / Cyber Idol are limited too.")
     tip:label("Subs above: Units · Gear · Runes · Traits. HUD mirrors S/A lists.")
     tip:label("ATK/max(AC,1s) + special. HP barely counts. AC<1s floored.")
 
