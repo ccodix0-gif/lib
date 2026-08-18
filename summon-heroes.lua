@@ -1574,13 +1574,33 @@ end
 -- Do not require() on the boot thread — ModuleScript yield kills win:tab (empty NewReality).
 local UNIT_DATA
 local function loadUnitData()
-    if type(UNIT_DATA) == "table" then return UNIT_DATA end
+    if type(UNIT_DATA) == "table" and next(UNIT_DATA) ~= nil then return UNIT_DATA end
+    local function take(data)
+        if type(data) == "table" and next(data) ~= nil then
+            UNIT_DATA = data
+            return true
+        end
+        return false
+    end
     pcall(function()
         local wm = ReplicatedStorage:FindFirstChild("WorldModules")
         local folder = wm and wm:FindFirstChild("ItemData")
         local mod = folder and folder:FindFirstChild("Units")
-        if mod then UNIT_DATA = require(mod) end
+        if mod and mod:IsA("ModuleScript") then
+            take(require(mod))
+        end
     end)
+    if not (type(UNIT_DATA) == "table" and next(UNIT_DATA) ~= nil) then
+        pcall(function()
+            local systems = ReplicatedStorage:FindFirstChild("Systems")
+            local itemsMod = systems and systems:FindFirstChild("Items")
+            if not (itemsMod and itemsMod:IsA("ModuleScript")) then return end
+            local Items = require(itemsMod)
+            if type(Items) == "table" and type(Items.GetCategoryData) == "function" then
+                take(Items:GetCategoryData("Units"))
+            end
+        end)
+    end
     return UNIT_DATA
 end
 
@@ -5052,30 +5072,65 @@ local function computeGamePower(data, level, stars, letter)
     return power, hp, atk, spd, cd
 end
 
--- Clear-speed score: GetUnitPower ignores kit CD/range; raw ATK/AC also lies —
--- some units ship AttackCooldown 0.1 (Tank Commander) = animation quirk, not DPS.
--- Floor AC at 1s, soft-cap long ranges, keep HP light (tanks ≠ practical clear).
+-- Clear-speed: GetUnitPower is HP×Speed and ignores kit. Old formula treated
+-- short SpecialCooldown as DPS and put Puppet (#parked lasers) over summoners.
+-- Real carries: range + pierce/AoE autos + summons (extra body). AC 0.1 is junk data.
+local function kitFlags(data)
+    local desc = string.lower(tostring(data.AttackDesc or "") .. " " .. tostring(data.SpecialDesc or ""))
+    local summon = desc:find("summon", 1, true) ~= nil or desc:find("clone", 1, true) ~= nil
+    local many = desc:find("four", 1, true) ~= nil or desc:find(" 4 ", 1, true) ~= nil
+        or desc:find("five", 1, true) ~= nil or desc:find("5+", 1, true) ~= nil
+    local aoe = desc:find("pierce", 1, true) ~= nil or desc:find("barrage", 1, true) ~= nil
+        or desc:find("rain", 1, true) ~= nil or desc:find("orbital", 1, true) ~= nil
+        or desc:find("meteor", 1, true) ~= nil or desc:find("everything", 1, true) ~= nil
+        or desc:find("all direction", 1, true) ~= nil or desc:find("huge", 1, true) ~= nil
+        or desc:find("inferno", 1, true) ~= nil or desc:find("tornado", 1, true) ~= nil
+        or desc:find("eight", 1, true) ~= nil or desc:find("laser", 1, true) ~= nil
+        or desc:find("explosion", 1, true) ~= nil or desc:find("arc", 1, true) ~= nil
+    local parked = (desc:find("stay", 1, true) ~= nil or desc:find("stays", 1, true) ~= nil)
+        and (desc:find("position", 1, true) ~= nil or desc:find("place", 1, true) ~= nil)
+    local front = desc:find("ahead", 1, true) ~= nil or desc:find("forward", 1, true) ~= nil
+    return summon, many, aoe, parked, front
+end
+
 local function computeCombatScore(data, level, stars, letter)
     local pow, hp, atk, spd = computeGamePower(data, level, stars, letter)
     if not pow or pow <= 0 then return 0, 0, 0, 0 end
     local acRaw = tonumber(data.AttackCooldown) or 2
-    local ac = math.clamp(math.max(acRaw, 1), 1, 6)
+    local ac = acRaw
+    if acRaw < 0.3 then
+        ac = 1.15
+    else
+        ac = math.clamp(acRaw, 0.6, 4)
+    end
     local sc = math.clamp(tonumber(data.SpecialCooldown) or 10, 5, 28)
     local ar = math.clamp(tonumber(data.AttackRange) or 5, 1, 40)
     local sr = math.clamp(tonumber(data.SpecialRange) or 8, 1, 80)
     local flee = math.clamp(tonumber(data.FleeRange) or 0, 0, 30)
     local r = tonumber(data.Rarity) or 1
+    local summon, many, aoe, parked, front = kitFlags(data)
 
-    local auto = atk / ac
-    local srSoft = 1 + math.min(sr, 28) / 55 + math.max(0, sr - 28) / 220
-    local special = (atk * srSoft) / sc
-    local arSoft = 1 + math.min(ar, 20) / 50
-    local move = 1 + math.max(0, ((spd or 10) - 10) / 24) * 0.22
-    local kite = (flee >= 10) and 1.05 or 1
-
-    local offense = (auto * 1.2 + special * 1.6) * arSoft * move * kite
-    local sustain = hp * 0.1
-    local rarityBoost = 1 + math.max(-0.08, (r - 4) * 0.055)
+    -- Hit rate: AC 1 vs 2 is not 2× DPS (anim lock). Soft curve.
+    local auto = atk * (1.2 / (ac + 0.8))
+    local arW = 0.62 + math.min(ar, 32) / 40
+    local specW = 1
+    if summon then
+        specW = specW * 1.9
+        if many then specW = specW * 1.12 end
+        specW = specW * (1 + math.min(sr, 40) / 90)
+    elseif aoe then
+        specW = specW * 1.22
+    end
+    if front then specW = specW * 1.12 end
+    if parked then specW = specW * 0.58 end
+    if ar < 6 and not summon then specW = specW * 0.8 end
+    local scW = 1 + (12 - sc) / 55
+    local fleeW = (flee >= 10) and 1.08 or 1
+    local move = 1 + math.max(0, ((spd or 10) - 10) / 40) * 0.12
+    local kit = arW * specW * scW * fleeW * move
+    local offense = auto * kit
+    local sustain = hp * 0.03
+    local rarityBoost = 1 + math.max(-0.05, (r - 4) * 0.06)
     return (offense + sustain) * rarityBoost, pow, offense, sustain
 end
 
@@ -5119,13 +5174,13 @@ local function formatUnitDetail(e, rank, total)
     local powMax, hpMax, atkMax = computeGamePower(d, 200, 10, "X")
     local _, _, smStar, lmB, rm = unitPowerDetailed(d, 1, stars, "B")
     local tier
-    if score >= 2.2e6 then tier = "S+ kit"
-    elseif score >= 1.6e6 then tier = "S strong"
-    elseif score >= 1.1e6 then tier = "A solid"
-    elseif score >= 0.7e6 then tier = "B mid"
+    if score >= 4.0e5 then tier = "S+ kit"
+    elseif score >= 3.4e5 then tier = "S strong"
+    elseif score >= 2.8e5 then tier = "A solid"
+    elseif score >= 2.2e5 then tier = "B mid"
     else tier = "C weak" end
     return string.format(
-        "#%d/%d %s%s%s%s%s\n%s · Type %s · %s\n—— INDEX SCORE (kit-aware) ——\nCombat %.0f  ← rank uses this\n= auto DPS (ATK/AC) + special (ATK×reach/SC) + HP sustain\nAC %.2g · SC %.2g · AR %s · SR %s · Spd %s%s\nATK: %s\nSP: %s\n—— GAME POWER (GetUnitPower, bare — ignores kit CD/range) ——\n★%d/B: Lv1 %.0f · Lv50 %.0f · Lv100 %.0f · Lv200 %.0f\nMax ★10/X Lv200: %.0f\n@Lv200 ★%d/B: %dHP · %dATK · Spd %.1f\n—— Multipliers ——\nRarity×%.2f · ★%d×%.2f · letter B×%.2f\n—— All ItemData fields ——\n%s",
+        "#%d/%d %s%s%s%s%s\n%s · Type %s · %s\n—— INDEX SCORE (kit-aware) ——\nCombat %.0f  ← rank uses this\n= range + summons/AoE (not raw special CD). Parked lasers downranked.\nAC %.2g · SC %.2g · AR %s · SR %s · Spd %s%s\nATK: %s\nSP: %s\n—— GAME POWER (GetUnitPower, bare — ignores kit CD/range) ——\n★%d/B: Lv1 %.0f · Lv50 %.0f · Lv100 %.0f · Lv200 %.0f\nMax ★10/X Lv200: %.0f\n@Lv200 ★%d/B: %dHP · %dATK · Spd %.1f\n—— Multipliers ——\nRarity×%.2f · ★%d×%.2f · letter B×%.2f\n—— All ItemData fields ——\n%s",
         rank, total, e.n, lim, craft, own, nick,
         rarityName(e.r), e.t, tier,
         score,
@@ -5481,6 +5536,7 @@ local function tabOk(name, fn)
     end
     return ok
 end
+local fillIndexHudUnits
 -- Icons must exist in the library's ICON_DATA. Missing names = blank icon.
 tabOk("Visuals", function()
 local tVis = win:tab({ name = "Visuals", icon = "eye", group = "Main", subtitle = "ESP and world" })
@@ -5938,12 +5994,13 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
             if setUnitInfo then
                 setUnitInfo(formatUnitDetail(e, e and e._rank or 0, #unitList))
             end
+            if fillIndexHudUnits then fillIndexHudUnits() end
         end)
     end)
 
     local sU = tIdx:sub("Units")
     local rankCard = sU:card({ title = "Clear top · kit score", icon = "list", column = "left" })
-    rankCard:label("SCR = clear speed (ATK/AC≥1s + special + soft range). HP light. AC<1s floored (data quirks). Anime Banner + Kaen line load from live Units.")
+    rankCard:label("SCR = range + summons/AoE @ Lv200. Parked lasers (Puppet) downranked. Kage = Masquerade kit.")
     do
         local _, set = rankCard:label(formatUnitRankList(unitList, true, 20))
         setRankList = set
@@ -5962,6 +6019,7 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
         end
         win:refreshAll()
         notify("Index", #unitList .. " units (all unlockable)", "book")
+        if fillIndexHudUnits then fillIndexHudUnits() end
     end)
 
     local uc = sU:card({ title = "Unit detail", icon = "user", column = "left" })
@@ -5986,10 +6044,10 @@ local tIdx = win:tab({ name = "Index", icon = "book", group = "Main", subtitle =
     end, { search = true })
 
     local tip = sU:card({ title = "How power works", icon = "gauge", column = "right" })
-    tip:label("Rank = clear-speed score @ Lv200 (★5/B, Secret forge ★7).")
-    tip:label("Anime Banner: Dojo Student · ZR-9 · Yin Yang · Raiden Vex. Kaen / Kage / Nezu / Cyber Idol are limited too.")
+    tip:label("Rank = kit score @ Lv200 (★5/B, Secret forge ★7). Summons and long range beat parked-laser melee.")
+    tip:label("Anime Banner: Dojo Student · ZR-9 · Yin Yang · Raiden Vex. Kage Masquerade = Masquerade kit (BP paid). Kaen Final = free BP melee.")
     tip:label("Subs above: Units · Gear · Runes · Traits. HUD mirrors S/A lists.")
-    tip:label("ATK/max(AC,1s) + special. HP barely counts. AC<1s floored.")
+    tip:label("GetUnitPower is HP×Speed — it is shown in detail, rank does not use it.")
 
     local load = sU:card({ title = "Loadout", icon = "check", column = "right" })
     load:button("Equip strongest 3", function()
@@ -6374,15 +6432,7 @@ matchHud:row({
 
 -- Index HUD: top units only (gear/runes/traits live in Index tab — fewer GuiObjects = less lag)
 do
-    local unitList = {}
-    if type(UNIT_DATA) == "table" then
-        pcall(function()
-            unitList = IDX.annotateOwned(IDX.buildUnitIndex()) or {}
-        end)
-    end
     local rarityName = IDX.rarityName
-    local topN = math.clamp(math.floor(tonumber(F.indexHudTopN) or 6), 4, 10)
-
     local function rarityShort(r)
         local n = rarityName(r)
         if n == "Legendary" then return "Leg"
@@ -6405,32 +6455,58 @@ do
         padding = 8,
         position = UDim2.new(1, -436, 0, 72),
         id = "index",
-        interval = 30, -- static rows; rare tick is enough
+        interval = 2,
         visible = F.indexHud ~= false,
     })
 
-    indexHud:section(string.format("Clear top (%d)", #unitList))
-    local n = #unitList
-    if n == 0 then
-        indexHud:row({ icon = "user", label = "Units data missing", value = "—", height = 17 })
-    else
-        for rank = 1, math.min(topN, n) do
-            local e = unitList[n - rank + 1]
-            if e then
+    -- require(Units) is deferred (yields). Paint placeholders, fill after load.
+    local indexTopSection = indexHud:section("Clear top (0)")
+    local indexTopRows = {}
+    local maxRows = 10
+    for rank = 1, maxRows do
+        indexTopRows[rank] = indexHud:row({
+            icon = "user",
+            label = rank == 1 and "Units loading…" or "",
+            value = "—",
+            height = 17,
+        })
+        if rank > 1 then indexTopRows[rank]:setVisible(false) end
+    end
+
+    fillIndexHudUnits = function()
+        pcall(loadUnitData)
+        local list = {}
+        pcall(function()
+            list = IDX.annotateOwned(IDX.buildUnitIndex()) or {}
+        end)
+        local n = #list
+        local topN = math.clamp(math.floor(tonumber(F.indexHudTopN) or 6), 4, 10)
+        indexTopSection:setLabel(string.format("Clear top (%d)", n))
+        if n == 0 then
+            indexTopRows[1]:setLabel("Units data missing")
+            indexTopRows[1]:set("—")
+            indexTopRows[1]:setVisible(true)
+            for rank = 2, maxRows do
+                indexTopRows[rank]:setVisible(false)
+            end
+            return
+        end
+        for rank = 1, maxRows do
+            local e = list[n - rank + 1]
+            local show = e ~= nil and rank <= topN
+            indexTopRows[rank]:setVisible(show)
+            if show then
                 local tags = ""
                 if e.owned then tags = tags .. " ·OWN" end
                 if e.craft then tags = tags .. " ·C" end
                 if e.lim then tags = tags .. " ·L" end
                 local acShow = math.max(tonumber(e.cd) or 1, 1)
-                indexHud:row({
-                    icon = e.icon or "user",
-                    label = string.format("#%d %s · %s · AC%.2g%s", rank, e.n, rarityShort(e.r), acShow, tags),
-                    value = fmtNum(e.score or e.pow or 0),
-                    height = 17,
-                })
+                indexTopRows[rank]:setLabel(string.format("#%d %s · %s · AC%.2g%s", rank, e.n, rarityShort(e.r), acShow, tags))
+                indexTopRows[rank]:set(fmtNum(e.score or e.pow or 0))
             end
         end
     end
+    fillIndexHudUnits()
 
     -- Game icons (rbxassetid) like before; untinted in defer below
     local itemIcon = IDX.itemIcon
@@ -6526,7 +6602,14 @@ task.spawn(function()
     farm.lastGems = getCurrency("Gems")
     farm.lastEssence = getCurrency("Essence")
     farm.lastPvpTokens = getCurrency("PVPTokens")
-    pcall(loadUnitData)
+    for _ = 1, 40 do
+        pcall(loadUnitData)
+        if type(UNIT_DATA) == "table" and next(UNIT_DATA) ~= nil then break end
+        task.wait(0.25)
+    end
+    pcall(function()
+        if fillIndexHudUnits then fillIndexHudUnits() end
+    end)
     if not farm.startedAt then farm.startedAt = os.time() end
     genv.SH_Farm = farm
     flushFarmDisk()
