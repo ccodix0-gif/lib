@@ -833,9 +833,13 @@ local function slider(card, label, key, min, max, default, dec)
 end
 local function loop(getEnabled, fn, interval)
     local acc = 0
+    local busy = false
     RunService.Heartbeat:Connect(function(dt)
         if genv.SH_Session ~= SESSION or not genv.SH_Alive then return end
         if not getEnabled() then return end
+        -- Yielding fn used to stack overlapping Heartbeats (queue waits, vote clicks)
+        -- until FPS died and the bot looked frozen.
+        if busy then return end
         local iv = interval
         if type(interval) == "function" then
             iv = interval()
@@ -845,7 +849,12 @@ local function loop(getEnabled, fn, interval)
             if acc < iv then return end
             acc = 0
         end
-        pcall(fn)
+        busy = true
+        local ok, err = pcall(fn)
+        busy = false
+        if not ok then
+            warn("[SH] loop: " .. tostring(err))
+        end
     end)
 end
 local function notify(title, text, icon)
@@ -1240,25 +1249,13 @@ local function isValidUnitModel(model)
         unitValidCache[model] = false
         return false
     end
-    if not (model:FindFirstChild("Collider")
-        or model:FindFirstChildOfClass("Humanoid")
-        or model.PrimaryPart
-        or model:FindFirstChild("HumanoidRootPart")) then
-        unitValidCache[model] = false
-        return false
+    if model:FindFirstChildOfClass("Humanoid") or model:FindFirstChild("Collider")
+        or model.PrimaryPart or model:FindFirstChild("HumanoidRootPart") then
+        unitValidCache[model] = true
+        return true
     end
-    local parts = 0
-    for _, d in ipairs(model:GetDescendants()) do
-        if d:IsA("BasePart") then
-            parts = parts + 1
-            if parts > 100 then
-                unitValidCache[model] = false
-                return false
-            end
-        end
-    end
-    unitValidCache[model] = true
-    return true
+    unitValidCache[model] = false
+    return false
 end
 
 -- ============================================================ CHESTS
@@ -1338,10 +1335,12 @@ local function firePrompt(prompt)
         pcall(fireproximityprompt, prompt, 0)
         return true
     end
-    pcall(function()
-        prompt:InputHoldBegin()
-        task.wait(0.05)
-        prompt:InputHoldEnd()
+    task.spawn(function()
+        pcall(function()
+            prompt:InputHoldBegin()
+            task.wait(0.05)
+            prompt:InputHoldEnd()
+        end)
     end)
     return true
 end
@@ -2087,14 +2086,27 @@ local function towerBotTick()
         if not (best and best.touch and best.touch.Parent) then
             best = pickBestDoor(collect(true))
         end
+        if not (best and best.touch and best.touch.Parent) and next(towerBot.skipDoor) then
+            table.clear(towerBot.skipDoor)
+            best = pickBestDoor(collect(true))
+        end
         if not (best and best.touch and best.touch.Parent) then return end
         local id = best.model and best.model:GetFullName()
         if id ~= towerBot.doorId then
             towerBot.doorId = id
             towerBot.doorSince = tick()
-        elseif tick() - towerBot.doorSince > 2.2 then
-            -- This door is not accepting Touched (stale Skip, closed portal). Try the next.
-            if id then towerBot.skipDoor[id] = true end
+        elseif tick() - towerBot.doorSince > 6 then
+            -- Lagged Heartbeat used to hit this in one tick and blacklist every door.
+            local others = 0
+            for _, d in ipairs(collect(true)) do
+                local oid = d.model and d.model:GetFullName()
+                if oid and oid ~= id then others = others + 1 end
+            end
+            if others > 0 and id then
+                towerBot.skipDoor[id] = true
+            else
+                table.clear(towerBot.skipDoor)
+            end
             towerBot.doorId, towerBot.doorSince = nil, 0
             return
         end
@@ -2144,13 +2156,18 @@ local function doReady()
         if not getconnections then return end
         local pg = LP:FindFirstChild("PlayerGui")
         if not pg then return end
-        for _, d in ipairs(pg:GetDescendants()) do
-            if d:IsA("GuiButton") and d.Visible and d.Name:lower():find("ready") then
-                for _, conn in ipairs(getconnections(d.MouseButton1Click)) do
-                    pcall(function() if conn.Fire then conn:Fire() elseif conn.Function then conn.Function() end end)
-                end
+        local function clickReady(gui)
+            if not gui then return end
+            local btn = gui:FindFirstChild("ReadyButton", true) or gui:FindFirstChild("Ready", true)
+            if not (btn and btn:IsA("GuiButton") and btn.Visible) then return end
+            for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do
+                pcall(function() if conn.Fire then conn:Fire() elseif conn.Function then conn.Function() end end)
             end
         end
+        clickReady(pg:FindFirstChild("EndlessWaveInfo"))
+        clickReady(pg:FindFirstChild("TowerWaveInfo"))
+        clickReady(pg:FindFirstChild("WaveInfo"))
+        clickReady(pg:FindFirstChild("Hotbar"))
     end)
 end
 
@@ -2209,14 +2226,16 @@ local function doVote(kind)
                     if firesignal then firesignal(btn.MouseButton1Click) end
                 end)
                 pcall(function() btn:Activate() end)
-                pcall(function()
-                    local vim = game:GetService("VirtualInputManager")
-                    local abs = btn.AbsolutePosition
-                    local sz = btn.AbsoluteSize
-                    local x, y = abs.X + sz.X * 0.5, abs.Y + sz.Y * 0.5
-                    vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
-                    task.wait()
-                    vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+                task.spawn(function()
+                    pcall(function()
+                        local vim = game:GetService("VirtualInputManager")
+                        local abs = btn.AbsolutePosition
+                        local sz = btn.AbsoluteSize
+                        local x, y = abs.X + sz.X * 0.5, abs.Y + sz.Y * 0.5
+                        vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                        task.wait()
+                        vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+                    end)
                 end)
                 return
             end
@@ -2297,8 +2316,11 @@ local function clickScreenSkip()
         local vp = (Camera and Camera.ViewportSize) or Vector2.new(960, 540)
         local x, y = vp.X * 0.5, vp.Y * 0.55
         vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
-        task.wait()
-        vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        task.defer(function()
+            pcall(function()
+                vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+            end)
+        end)
     end)
     pcall(function()
         if not getconnections then return end
@@ -2811,6 +2833,9 @@ local function updateUnitEsp()
         if pvp and F.pvpEspChams ~= true then
             wantChams = false
         end
+        if F.antiLag ~= false then
+            wantChams = false
+        end
         if wantChams then
             ensureHl(m, col, col)
         else
@@ -2861,7 +2886,7 @@ local function updateChestEsp()
             d.frame.Position = UDim2.fromOffset(sp.X, sp.Y)
             d.text.Text = (F.chestEspName ~= false) and chestDisplayName(part) or "Chest"
             d.text.TextColor3 = col
-            if F.chestEspChams then
+            if F.chestEspChams and F.antiLag == false then
                 -- Only highlight the real Chest model (or the tagged pad) — never random nearby props
                 local host = (typeof(vis) == "Instance" and vis:IsA("Model")) and vis or part
                 if host:IsA("BasePart") or (host:IsA("Model") and (host.Name == "Chest" or host.Name == "BonusChest")) then
@@ -2895,8 +2920,10 @@ end
 
 local lastEspAt = 0
 local pvpEspCleared = false
+local espBusy = false
 RunService.Heartbeat:Connect(function()
     if genv.SH_Session ~= SESSION or not genv.SH_Alive then return end
+    if espBusy then return end
     local pvp = isPvpWorld()
     if pvp and F.pvpEsp ~= true then
         if not pvpEspCleared then
@@ -2907,13 +2934,15 @@ RunService.Heartbeat:Connect(function()
     end
     pvpEspCleared = false
     local now = tick()
-    local iv = pvp and 0.5 or 0.2
+    local iv = (F.antiLag ~= false) and 0.85 or (pvp and 0.5 or 0.2)
     if now - lastEspAt < iv then return end
     lastEspAt = now
+    espBusy = true
     pcall(updateUnitEsp)
     if not pvp then
         pcall(updateChestEsp)
     end
+    espBusy = false
 end)
 
 -- ============================================================ VISUALS WORLD
@@ -3004,12 +3033,125 @@ do
     local rd = rem("RenderDamage")
     if rd and rd:IsA("RemoteEvent") then
         rd.OnClientEvent:Connect(function()
-            if not F.dmgEnhance or isPvpWorld() then return end
+            if F.antiLag ~= false or not F.dmgEnhance or isPvpWorld() then return end
             task.defer(enhanceDamageBillboards)
         end)
     end
 end
-loop(function() return F.dmgEnhance == true and not isPvpWorld() end, enhanceDamageBillboards, 0.75)
+loop(function() return F.dmgEnhance == true and F.antiLag == false and not isPvpWorld() end, enhanceDamageBillboards, 0.75)
+
+-- Client VFX / quality. Does not change server combat; it keeps Heartbeat close to real time
+-- so 10s intermission is not 40s of frozen frames.
+;(function()
+    local lastApply, lastStrip = 0, 0
+    local function setBoolSetting(name, value)
+        pcall(function()
+            local p = getProfile()
+            local s = p and p:FindFirstChild("Settings")
+            local v = s and s:FindFirstChild(name)
+            if v and v:IsA("BoolValue") and v.Value ~= value then
+                v.Value = value
+            end
+        end)
+        fire("SetConfig", name, value)
+    end
+    local function setNumSetting(name, value)
+        pcall(function()
+            local p = getProfile()
+            local s = p and p:FindFirstChild("Settings")
+            local v = s and s:FindFirstChild(name)
+            if v and (v:IsA("NumberValue") or v:IsA("IntValue")) and v.Value ~= value then
+                v.Value = value
+            end
+        end)
+        fire("SetConfig", name, value)
+    end
+    local function applyGraphics()
+        pcall(function()
+            local ugs = UserSettings():GetService("UserGameSettings")
+            ugs.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1
+        end)
+        pcall(function()
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        end)
+        pcall(function()
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 1e9
+            for _, fx in ipairs(Lighting:GetChildren()) do
+                if fx:IsA("BloomEffect") or fx:IsA("DepthOfFieldEffect") or fx:IsA("SunRaysEffect")
+                    or fx:IsA("ColorCorrectionEffect") or fx:IsA("BlurEffect") then
+                    fx.Enabled = false
+                elseif fx:IsA("Atmosphere") then
+                    fx.Density = 0
+                end
+            end
+        end)
+        setBoolSetting("DisplayEffects", false)
+        setBoolSetting("CameraShake", false)
+        setNumSetting("UnitsVolume", 0)
+    end
+    local function isDoorFx(inst)
+        local n = inst
+        while n and n ~= Workspace do
+            if n.Name == "ExitDoor" or n.Name == "Ring" then return true end
+            n = n.Parent
+        end
+        return false
+    end
+    local function killFx(inst)
+        if inst:IsA("ParticleEmitter") or inst:IsA("Beam") or inst:IsA("Trail")
+            or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
+            inst.Enabled = false
+            return true
+        end
+        if inst:IsA("PointLight") or inst:IsA("SpotLight") or inst:IsA("SurfaceLight") then
+            inst.Enabled = false
+            return true
+        end
+        if inst:IsA("Explosion") then
+            pcall(function() inst:Destroy() end)
+            return true
+        end
+        return false
+    end
+    local function cullFolder(folder, keep)
+        if not folder then return end
+        local ch = folder:GetChildren()
+        local extra = #ch - keep
+        if extra <= 0 then return end
+        for i = 1, extra do
+            pcall(function() ch[i]:Destroy() end)
+        end
+    end
+    local function onFx(inst)
+        if F.antiLag == false or isLobby() or isPvpWorld() then return end
+        if isDoorFx(inst) then return end
+        killFx(inst)
+    end
+    Workspace.DescendantAdded:Connect(function(inst)
+        if genv.SH_Session ~= SESSION then return end
+        if F.antiLag == false or isLobby() or isPvpWorld() then return end
+        if not (inst:IsA("ParticleEmitter") or inst:IsA("Beam") or inst:IsA("Trail")
+            or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles")
+            or inst:IsA("PointLight") or inst:IsA("SpotLight") or inst:IsA("SurfaceLight")
+            or inst:IsA("Explosion")) then
+            return
+        end
+        task.defer(onFx, inst)
+    end)
+    loop(function() return F.antiLag ~= false and not isLobby() and not isPvpWorld() end, function()
+        local now = tick()
+        if now - lastApply > 4 then
+            lastApply = now
+            applyGraphics()
+        end
+        if now - lastStrip < 1.25 then return end
+        lastStrip = now
+        cullFolder(Workspace:FindFirstChild("Projectiles"), 8)
+        cullFolder(Workspace:FindFirstChild("Effects"), 16)
+        cullFolder(Workspace:FindFirstChild("Explosions"), 6)
+    end, 1.25)
+end)()
 
 -- ============================================================ HUD (Session + Match via win:hud)
 -- Kill legacy ScreenGui labels — they fought win:hud and caused the "Lobby" stub / jerk.
@@ -5567,7 +5709,7 @@ do
     tog(ec, "Names", "enemyEspName", true)
     tog(ec, "HP", "enemyEspHp", true)
     tog(ec, "Distance", "enemyEspDist", true)
-    tog(ec, "Chams", "enemyEspChams", true)
+    tog(ec, "Chams", "enemyEspChams", false)
     tog(ec, "ESP in PvP arenas", "pvpEsp", false, "high")
     tog(ec, "PvP Chams (very laggy)", "pvpEspChams", false, "high")
     ec:label("PvP arenas: ESP fully off unless enabled. Damage enhance also disabled there.")
@@ -5592,15 +5734,17 @@ do
     cc:label("Shows chest / pad name. Distance removed.")
 
     local wc = s2:card({ title = "World / Camera", icon = "world", column = "right" })
+    tog(wc, "Anti lag", "antiLag", true)
     tog(wc, "Fullbright", "fullbright", false)
     slider(wc, "Brightness", "fbBrightness", 1, 10, 3, 1)
     tog(wc, "No Fog", "noFog", false)
     tog(wc, "No Camera Shake", "noShake", true)
     tog(wc, "FOV Unlock", "fovUnlock", false)
     slider(wc, "FOV", "fovAmt", 60, 120, 90, 0)
-    tog(wc, "Damage Numbers Enhance", "dmgEnhance", true)
+    tog(wc, "Damage Numbers Enhance", "dmgEnhance", false)
     slider(wc, "Dmg Scale", "dmgScale", 1, 4, 1.8, 1)
     tog(wc, "Dmg Bold", "dmgBold", true)
+    wc:label("Anti lag: DisplayEffects off, quality 1, strip VFX. Stops Heartbeat stacking so the bot keeps taking doors when FPS dies.")
 end
 end)
 
@@ -6529,6 +6673,7 @@ do
             end
         end
         pcall(function()
+            if F.antiLag ~= false then return end
             local root = indexHud and indexHud.frame
             if not root then return end
             for _, d in ipairs(root:GetDescendants()) do
